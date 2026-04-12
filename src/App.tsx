@@ -30,15 +30,15 @@ interface ModelInfo {
 }
 
 const MIN_TRANSCRIBE_SAMPLES = 8000;
-const MAX_RECORDING_LOCAL = 60;   // 1 minute for local whisper
-const MAX_RECORDING_API = 300;    // 5 minutes for API
+const MAX_RECORDING_LOCAL = 60;
+const MAX_RECORDING_API = 120; // 2 minutes max for API
 
 let historyIdCounter = 0;
-
 function App() {
   const [status, setStatus] = useState<AppStatus>("idle");
   const [view, setView] = useState<AppView>("main");
   const [transcript, setTranscript] = useState("");
+  const [editableTranscript, setEditableTranscript] = useState("");
   const [history, setHistory] = useState<{ id: number; text: string }[]>([]);
   const [whisperLoaded, setWhisperLoaded] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -92,6 +92,15 @@ function App() {
     }
   }, []);
 
+  // Inject text into the currently-focused text field (focus stays there — window never steals it)
+  const injectText = useCallback(async (text: string) => {
+    try {
+      await invoke("inject_text", { text });
+    } catch {
+      // Injection may fail if no text field is focused
+    }
+  }, []);
+
   const stopAndTranscribe = useCallback(async () => {
     if (statusRef.current !== "recording") return;
 
@@ -109,41 +118,46 @@ function App() {
       const text = await invoke("transcribe", { samples, language: languageRef.current }) as string;
       if (text && text.trim()) {
         setTranscript(text);
+        setEditableTranscript(text);
         setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
-        try {
-          await invoke("inject_text", { text });
-        } catch {
-          // Inject may fail if no text field is focused
-        }
+        // Auto-inject into focused field
+        await injectText(text);
       }
     } catch (e) {
       setError(String(e));
     }
     setStatus("idle");
     setRecordingTime(0);
-  }, [stopVadPolling, stopTimer]);
+  }, [stopVadPolling, stopTimer, injectText]);
 
-  const startVadPolling = useCallback(() => {
-    if (vadPollRef.current) return;
-    vadPollRef.current = window.setInterval(async () => {
-      try {
-        const silenceDetected = await invoke("check_silence") as boolean;
-        const timeoutReached = await invoke("check_timeout") as boolean;
-        if ((silenceDetected || timeoutReached) && statusRef.current === "recording") {
-          stopAndTranscribe();
-        }
-      } catch {
-        // Ignore polling errors
+
+  // Start recording helper — sets always-on-top
+  const beginRecording = useCallback(async () => {
+    setError("");
+    try {
+      await invoke("set_vad_enabled", { enabled: vadEnabledRef.current });
+      await invoke("set_max_recording_secs", { secs: getMaxRecordingSecs() });
+      await invoke("start_recording");
+      setStatus("recording");
+      setRecordingTime(0);
+      timerRef.current = window.setInterval(() => {
+        setRecordingTime((prev) => prev + 0.1);
+      }, 100);
+      if (!vadPollRef.current) {
+        vadPollRef.current = window.setInterval(async () => {
+          try {
+            const silenceDetected = vadEnabledRef.current ? await invoke("check_silence") as boolean : false;
+            const timeoutReached = await invoke("check_timeout") as boolean;
+            if ((silenceDetected || timeoutReached) && statusRef.current === "recording") {
+              stopAndTranscribe();
+            }
+          } catch { /* ok */ }
+        }, 150);
       }
-    }, 150);
+    } catch (e) {
+      setError(String(e));
+    }
   }, [stopAndTranscribe]);
-
-  const startTimer = useCallback(() => {
-    setRecordingTime(0);
-    timerRef.current = window.setInterval(() => {
-      setRecordingTime((prev) => prev + 0.1);
-    }, 100);
-  }, []);
 
   // Hotkey handler
   useEffect(() => {
@@ -152,54 +166,20 @@ function App() {
       if (currentStatus === "recording") {
         stopAndTranscribe();
       } else if (currentStatus === "idle") {
-        setError("");
-        try {
-          await invoke("set_vad_enabled", { enabled: vadEnabledRef.current });
-          await invoke("set_max_recording_secs", { secs: getMaxRecordingSecs() });
-          await invoke("start_recording");
-          setStatus("recording");
-          setRecordingTime(0);
-          timerRef.current = window.setInterval(() => {
-            setRecordingTime((prev) => prev + 0.1);
-          }, 100);
-          if (!vadPollRef.current) {
-            vadPollRef.current = window.setInterval(async () => {
-              try {
-                const silenceDetected = vadEnabledRef.current ? await invoke("check_silence") as boolean : false;
-                const timeoutReached = await invoke("check_timeout") as boolean;
-                if ((silenceDetected || timeoutReached) && statusRef.current === "recording") {
-                  stopAndTranscribe();
-                }
-              } catch { /* ok */ }
-            }, 150);
-          }
-        } catch (e) {
-          setError(String(e));
-        }
+        await beginRecording();
       }
     });
-
     return () => { unlistenHotkey.then((fn) => fn()); };
-  }, []);
+  }, [stopAndTranscribe, beginRecording]);
 
   const handleToggleRecording = useCallback(async () => {
     const currentStatus = statusRef.current;
     if (currentStatus === "recording") {
       await stopAndTranscribe();
     } else if (currentStatus === "idle") {
-      setError("");
-      try {
-        await invoke("set_vad_enabled", { enabled: vadEnabled });
-        await invoke("set_max_recording_secs", { secs: getMaxRecordingSecs() });
-        await invoke("start_recording");
-        setStatus("recording");
-        startTimer();
-        startVadPolling();
-      } catch (e) {
-        setError(String(e));
-      }
+      await beginRecording();
     }
-  }, [vadEnabled, stopAndTranscribe, startVadPolling, startTimer]);
+  }, [stopAndTranscribe, beginRecording]);
 
   // Init
   async function refreshModels() {
@@ -207,9 +187,7 @@ function App() {
       const allModels = await invoke("get_all_models_status") as ModelInfo[];
       setModels(allModels);
       return allModels;
-    } catch {
-      return [];
-    }
+    } catch { return []; }
   }
 
   useEffect(() => {
@@ -253,13 +231,9 @@ function App() {
         setSelectedModel(preferredModelName);
       }
       needsOnboarding = !settings.onboarding_completed;
-    } catch {
-      // Use defaults
-    }
+    } catch { /* defaults */ }
 
-    if (needsOnboarding) {
-      setView("onboarding");
-    }
+    if (needsOnboarding) setView("onboarding");
 
     const allModels = await refreshModels();
     const preferred = allModels.find((m) => m.name === preferredModelName && m.downloaded);
@@ -281,11 +255,7 @@ function App() {
       vad_enabled: vadEnabled,
       ...overrides,
     };
-    try {
-      await invoke("update_settings", { newSettings: settings });
-    } catch {
-      // Settings save failure is non-critical
-    }
+    try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
   }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled]);
 
   async function handleTestApiKey() {
@@ -296,9 +266,7 @@ function App() {
     try {
       await invoke("test_api_key", { provider: apiProvider, apiKey: activeKey });
       setApiKeyValid(true);
-    } catch {
-      setApiKeyValid(false);
-    }
+    } catch { setApiKeyValid(false); }
     setTestingApiKey(false);
   }
 
@@ -306,9 +274,7 @@ function App() {
     try {
       const devs = await invoke("get_audio_devices");
       setDevices(devs as string[]);
-    } catch (e) {
-      setError(String(e));
-    }
+    } catch (e) { setError(String(e)); }
   }
 
   async function loadWhisperModel(modelName?: string) {
@@ -320,10 +286,7 @@ function App() {
       setActiveModel(name);
       setSelectedModel(name);
       setStatus("idle");
-    } catch (e) {
-      setError(String(e));
-      setStatus("idle");
-    }
+    } catch (e) { setError(String(e)); setStatus("idle"); }
   }
 
   async function handleDownloadModel(modelName: string) {
@@ -336,59 +299,29 @@ function App() {
       await refreshModels();
       setStatus("idle");
       setDownloadingModel(null);
-      if (!activeModel) {
-        await loadWhisperModel(modelName);
-      }
-    } catch (e) {
-      setError(String(e));
-      setStatus("idle");
-      setDownloadingModel(null);
-    }
+      if (!activeModel) await loadWhisperModel(modelName);
+    } catch (e) { setError(String(e)); setStatus("idle"); setDownloadingModel(null); }
   }
 
   async function handleDeleteModel(modelName: string) {
     setError("");
     try {
       await invoke("delete_model", { modelName });
-      if (activeModel === modelName) {
-        setActiveModel(null);
-        setWhisperLoaded(false);
-      }
+      if (activeModel === modelName) { setActiveModel(null); setWhisperLoaded(false); }
       await refreshModels();
-    } catch (e) {
-      setError(String(e));
-    }
+    } catch (e) { setError(String(e)); }
   }
 
-  async function handleActivateModel(modelName: string) {
-    await loadWhisperModel(modelName);
-  }
-
-  // Computed values
+  // Computed
   const downloadedCount = models.filter((m) => m.downloaded).length;
   const maxRecordingSecs = transcriptionMode === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
   const timeRemaining = maxRecordingSecs - recordingTime;
-  const showTimeWarning = status === "recording" && timeRemaining <= 15;
+  const showTimeWarning = status === "recording" && timeRemaining <= 10;
   const activeApiKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
-
-  const langLabels: Record<Language, string> = {
-    he: "עברית",
-    en: "English",
-    auto: "זיהוי אוטומטי",
-  };
-
+  const langLabels: Record<Language, string> = { he: "עברית", en: "English", auto: "אוטומטי" };
   const modeLabel = transcriptionMode === "api" ? "API" : transcriptionMode === "local" ? "מקומי" : "אוטומטי";
-  const statusLabels: Record<AppStatus, string> = {
-    idle: canRecord ? `מוכן — Alt+D | ${langLabels[language]} | ${modeLabel}` : "מוכן",
-    recording: `🔴 מקליט... ${recordingTime.toFixed(1)}/${maxRecordingSecs}s`,
-    transcribing: transcriptionMode !== "local" && apiKeyConfigured
-      ? `⏳ מתמלל (${apiProvider === "deepgram" ? "Deepgram" : "OpenAI"})...`
-      : "⏳ מתמלל...",
-    downloading: "מוריד מודל...",
-    "loading-model": "טוען מודל...",
-  };
 
   // ---- ONBOARDING WIZARD ----
   if (view === "onboarding") {
@@ -399,9 +332,7 @@ function App() {
       try {
         await invoke("test_api_key", { provider: "deepgram" as ApiProvider, apiKey: wizardApiKey });
         setWizardKeyValid(true);
-      } catch {
-        setWizardKeyValid(false);
-      }
+      } catch { setWizardKeyValid(false); }
       setWizardKeyTesting(false);
     };
 
@@ -418,10 +349,7 @@ function App() {
         });
       } else if (wizardChoice === "local") {
         setTranscriptionMode("local");
-        await persistSettings({
-          onboarding_completed: true,
-          transcription_mode: "local",
-        });
+        await persistSettings({ onboarding_completed: true, transcription_mode: "local" });
       } else {
         await persistSettings({ onboarding_completed: true });
       }
@@ -429,7 +357,7 @@ function App() {
     };
 
     return (
-      <main className="container" dir="rtl">
+      <main className="container compact" dir="rtl">
         <div className="wizard-dots">
           {[1, 2, 3].map((s) => (
             <span key={s} className={`wizard-dot ${wizardStep === s ? "active" : wizardStep > s ? "done" : ""}`} />
@@ -438,8 +366,7 @@ function App() {
 
         {wizardStep === 1 && (
           <div className="wizard-step">
-            <div className="wizard-icon">🎤</div>
-            <h1 className="wizard-title">הכתבה בעברית</h1>
+            <h1 className="wizard-title">🎤 הכתבה בעברית</h1>
             <p className="wizard-subtitle">by BinTech AI — קוד פתוח</p>
             <div className="wizard-content">
               <p>הכתבה קולית בעברית מכל מקום במחשב.</p>
@@ -447,11 +374,9 @@ function App() {
                 <span className="wizard-key">Alt + D</span>
                 <span>להקלטה ועצירה</span>
               </div>
-              <p className="wizard-note">הטקסט יוקלד אוטומטית בשדה הפעיל.</p>
+              <p className="wizard-note">הטקסט מוקלד אוטומטית בשדה שבו העכבר נמצא.</p>
             </div>
-            <button className="btn-wizard-next" onClick={() => setWizardStep(2)}>
-              המשך
-            </button>
+            <button className="btn-wizard-next" onClick={() => setWizardStep(2)}>המשך</button>
           </div>
         )}
 
@@ -467,14 +392,20 @@ function App() {
                 <strong>☁️ API — מהיר ומדויק</strong>
                 <span className="wizard-card-badge">מומלץ</span>
               </div>
-              <p className="wizard-card-desc">תמלול בענן דרך Deepgram — מהיר, מדויק, דורש מפתח API (חינם לניסיון)</p>
+              <p className="wizard-card-desc">תמלול בענן דרך Deepgram. חינם לניסיון ($200 קרדיט).</p>
               {wizardChoice === "api" && (
                 <div className="wizard-guide">
+                  <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
                   <ol>
-                    <li>היכנס ל-<strong>deepgram.com</strong></li>
-                    <li>צור חשבון חינם ($200 קרדיט)</li>
-                    <li>לחץ <strong>Create API Key</strong></li>
-                    <li>הדבק את המפתח כאן:</li>
+                    <li>
+                      לחץ כאן →{" "}
+                      <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">
+                        deepgram.com — הרשמה
+                      </a>
+                    </li>
+                    <li>צור חשבון חינם (אימייל או Google)</li>
+                    <li>לחץ <strong>Create API Key</strong> בדף הראשי</li>
+                    <li>העתק את המפתח והדבק כאן:</li>
                   </ol>
                   <div className="api-key-row">
                     <input
@@ -482,7 +413,7 @@ function App() {
                       className="api-key-input"
                       value={wizardApiKey}
                       onChange={(e) => { setWizardApiKey(e.target.value); setWizardKeyValid(null); }}
-                      placeholder="API key..."
+                      placeholder="הדבק מפתח API..."
                     />
                     <button
                       className={`btn-test ${wizardKeyValid === true ? "valid" : wizardKeyValid === false ? "invalid" : ""}`}
@@ -492,8 +423,11 @@ function App() {
                       {wizardKeyTesting ? "..." : wizardKeyValid === true ? "✓" : wizardKeyValid === false ? "✗" : "בדוק"}
                     </button>
                   </div>
-                  {wizardKeyValid === true && <p className="settings-note success-note">המפתח תקין!</p>}
-                  {wizardKeyValid === false && <p className="settings-note error-note">המפתח לא תקין</p>}
+                  {wizardKeyValid === true && <p className="settings-note success-note">✅ המפתח תקין!</p>}
+                  {wizardKeyValid === false && <p className="settings-note error-note">❌ המפתח לא תקין</p>}
+                  <p className="wizard-note" style={{ fontSize: "0.7rem", marginTop: "0.3rem" }}>
+                    💡 המפתח נשמר רק אצלך במחשב. לא נשלח לשום מקום חוץ מ-Deepgram.
+                  </p>
                 </div>
               )}
             </div>
@@ -506,21 +440,12 @@ function App() {
                 <strong>💻 מקומי — פרטיות מלאה</strong>
                 <span className="wizard-card-badge">ללא אינטרנט</span>
               </div>
-              <p className="wizard-card-desc">תמלול על המחשב שלך. ללא שליחת נתונים. דורש הורדת מודל (75MB-1.5GB)</p>
-              {wizardChoice === "local" && (
-                <div className="wizard-guide">
-                  <p className="settings-note">בשלב הבא תוכל להוריד מודל — <strong>small</strong> מומלץ לרוב המחשבים.</p>
-                </div>
-              )}
+              <p className="wizard-card-desc">תמלול על המחשב. ללא שליחת נתונים. דורש הורדת מודל.</p>
             </div>
 
             <div className="wizard-nav">
               <button className="btn-wizard-back" onClick={() => setWizardStep(1)}>חזור</button>
-              <button
-                className="btn-wizard-next"
-                onClick={() => setWizardStep(3)}
-                disabled={!wizardChoice}
-              >
+              <button className="btn-wizard-next" onClick={() => setWizardStep(3)} disabled={!wizardChoice}>
                 {wizardChoice ? "המשך" : "בחר מצב"}
               </button>
             </div>
@@ -529,26 +454,29 @@ function App() {
 
         {wizardStep === 3 && (
           <div className="wizard-step">
-            <div className="wizard-icon">✅</div>
-            <h2 className="wizard-step-title">הכל מוכן!</h2>
+            <h2 className="wizard-step-title">✅ הכל מוכן!</h2>
             <div className="wizard-content">
               {wizardChoice === "api" && wizardApiKey ? (
                 <p className="wizard-success">Deepgram מוגדר — תמלול מהיר ומדויק</p>
               ) : wizardChoice === "local" ? (
                 <p className="wizard-note">מצב מקומי — הורד מודל בהגדרות כדי להתחיל</p>
               ) : (
-                <p className="wizard-note">ניתן להגדיר מפתח API או להוריד מודל בהגדרות</p>
+                <p className="wizard-note">הגדר מפתח API או הורד מודל בהגדרות</p>
               )}
               <div className="wizard-highlight">
-                <span>נסה עכשיו: לחץ</span>
+                <span>לחץ</span>
                 <span className="wizard-key">Alt + D</span>
                 <span>ודבר בעברית</span>
               </div>
+              <p className="wizard-note" style={{ fontSize: "0.7rem" }}>התוכנה רצה ברקע. גם בסגירת החלון Alt+D ממשיך לעבוד.</p>
             </div>
             <div className="wizard-final-actions">
-              <button className="btn-wizard-next" onClick={completeOnboarding}>
-                התחל להקליט
-              </button>
+              <button className="btn-wizard-next" onClick={completeOnboarding}>התחל</button>
+            </div>
+            <div className="wizard-credit">
+              <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="link-text">
+                🔗 BinTech AI — הנרי שטאובר
+              </a>
             </div>
           </div>
         )}
@@ -559,69 +487,50 @@ function App() {
   // ---- SETTINGS VIEW ----
   if (view === "settings") {
     return (
-      <main className="container" dir="rtl">
+      <main className="container compact" dir="rtl">
         <div className="settings-header">
           <h2>הגדרות</h2>
-          <button className="btn-back" onClick={() => setView("main")}>
-            חזור
-          </button>
+          <button className="btn-back" onClick={() => setView("main")}>חזור</button>
         </div>
 
-        {/* Transcription Engine */}
+        {/* Engine */}
         <div className="settings-section">
           <h3>מנוע תמלול</h3>
           <div className="settings-row">
             {([
               ["api", "API (ענן)"],
-              ["local", "מקומי (offline)"],
+              ["local", "מקומי"],
               ["auto_fallback", "אוטומטי"],
             ] as [TranscriptionMode, string][]).map(([mode, label]) => (
               <button
                 key={mode}
                 className={`btn-option ${transcriptionMode === mode ? "active" : ""}`}
-                onClick={() => {
-                  setTranscriptionMode(mode);
-                  persistSettings({ transcription_mode: mode });
-                }}
+                onClick={() => { setTranscriptionMode(mode); persistSettings({ transcription_mode: mode }); }}
               >
                 {label}
               </button>
             ))}
           </div>
-          <p className="settings-note">
-            {transcriptionMode === "api" && "API: מהיר ומדויק, דורש מפתח Deepgram/OpenAI וחיבור אינטרנט"}
-            {transcriptionMode === "local" && "מקומי: פרטיות מלאה, ללא אינטרנט, דורש מודל מותקן"}
-            {transcriptionMode === "auto_fallback" && "אוטומטי: API עם גיבוי מקומי כשאין חיבור או מפתח"}
-          </p>
         </div>
 
-        {/* API Provider + Key */}
+        {/* API Key */}
         {transcriptionMode !== "local" && (
           <div className="settings-section">
             <h3>ספק API</h3>
-            <div className="settings-row" style={{ marginBottom: "0.75rem" }}>
+            <div className="settings-row" style={{ marginBottom: "0.5rem" }}>
               {([
-                ["deepgram", "Deepgram (מומלץ)"],
-                ["open_ai", "OpenAI Whisper"],
+                ["deepgram", "Deepgram"],
+                ["open_ai", "OpenAI"],
               ] as [ApiProvider, string][]).map(([prov, label]) => (
                 <button
                   key={prov}
                   className={`btn-option ${apiProvider === prov ? "active" : ""}`}
-                  onClick={() => {
-                    setApiProvider(prov);
-                    setApiKeyValid(null);
-                    persistSettings({ api_provider: prov });
-                  }}
+                  onClick={() => { setApiProvider(prov); setApiKeyValid(null); persistSettings({ api_provider: prov }); }}
                 >
                   {label}
                 </button>
               ))}
             </div>
-            <p className="settings-note" style={{ marginBottom: "0.75rem" }}>
-              {apiProvider === "deepgram" ? "Deepgram Nova-3: מהיר במיוחד, תמיכה בעברית ($0.0043/דקה)" : "OpenAI Whisper: דיוק גבוה, $0.006/דקה"}
-            </p>
-
-            <h3>מפתח {apiProvider === "deepgram" ? "Deepgram" : "OpenAI"}</h3>
             <div className="api-key-row">
               <input
                 type="password"
@@ -647,31 +556,27 @@ function App() {
                 {testingApiKey ? "..." : apiKeyValid === true ? "✓" : apiKeyValid === false ? "✗" : "בדוק"}
               </button>
             </div>
-            {apiKeyValid === false && (
-              <p className="settings-note error-note">המפתח לא תקין — בדוק שהמפתח נכון</p>
-            )}
-            {apiKeyValid === true && (
-              <p className="settings-note success-note">המפתח תקין</p>
-            )}
+            {apiKeyValid === false && <p className="settings-note error-note">המפתח לא תקין</p>}
+            {apiKeyValid === true && <p className="settings-note success-note">המפתח תקין</p>}
             <p className="settings-note">
-              {apiProvider === "deepgram" ? "קבל מפתח: deepgram.com" : "קבל מפתח: platform.openai.com"}
-              {activeApiKey && " | מפתח מוגדר"}
+              {apiProvider === "deepgram" ? (
+                <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → deepgram.com</a>
+              ) : (
+                <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="link-text">קבל מפתח → platform.openai.com</a>
+              )}
             </p>
           </div>
         )}
 
         {/* Language */}
         <div className="settings-section">
-          <h3>שפת תמלול</h3>
+          <h3>שפה</h3>
           <div className="settings-row">
             {(["he", "en", "auto"] as Language[]).map((lang) => (
               <button
                 key={lang}
                 className={`btn-option ${language === lang ? "active" : ""}`}
-                onClick={() => {
-                  setLanguage(lang);
-                  persistSettings({ language: lang });
-                }}
+                onClick={() => { setLanguage(lang); persistSettings({ language: lang }); }}
               >
                 {langLabels[lang]}
               </button>
@@ -681,7 +586,7 @@ function App() {
 
         {/* VAD */}
         <div className="settings-section">
-          <h3>עצירה אוטומטית (VAD)</h3>
+          <h3>עצירה אוטומטית</h3>
           <label className="toggle-label">
             <input
               type="checkbox"
@@ -693,34 +598,24 @@ function App() {
                 persistSettings({ vad_enabled: newVal });
               }}
             />
-            <span className="toggle-text">
-              עצור הקלטה אוטומטית כשמפסיקים לדבר (2.5 שניות שקט)
-            </span>
+            <span className="toggle-text">עצור כשמפסיקים לדבר (4.5 שניות שקט)</span>
           </label>
         </div>
 
-        {/* Microphone */}
+        {/* Mics */}
         <div className="settings-section">
           <h3>מיקרופונים ({devices.length})</h3>
           {devices.length > 0 ? (
-            <ul className="device-list">
-              {devices.map((d, i) => <li key={i}>{d}</li>)}
-            </ul>
+            <ul className="device-list">{devices.map((d, i) => <li key={i}>{d}</li>)}</ul>
           ) : (
             <p className="settings-note">לא נמצאו מיקרופונים</p>
           )}
-          <p className="settings-note">המערכת משתמשת במיקרופון ברירת המחדל של Windows</p>
         </div>
 
-        {/* Model Manager */}
+        {/* Models */}
         <div className="settings-section">
-          <h3>ניהול מודלים מקומיים</h3>
-          {transcriptionMode === "api" && (
-            <p className="settings-note">מודלים מקומיים נדרשים רק למצב מקומי / אוטומטי</p>
-          )}
-          {activeModel && (
-            <p className="settings-note active-note">מודל פעיל: <strong>{activeModel}</strong></p>
-          )}
+          <h3>מודלים מקומיים</h3>
+          {activeModel && <p className="settings-note active-note">פעיל: <strong>{activeModel}</strong></p>}
           <div className="model-cards">
             {models.map((m) => {
               const isActive = activeModel === m.name;
@@ -728,10 +623,7 @@ function App() {
               return (
                 <div key={m.name} className={`model-card ${isActive ? "active" : ""} ${m.downloaded ? "downloaded" : ""}`}>
                   <div className="model-card-header">
-                    <span className="model-name">
-                      {m.name}
-                      {isActive && <span className="active-dot" />}
-                    </span>
+                    <span className="model-name">{m.name}{isActive && <span className="active-dot" />}</span>
                     <span className="model-size">{m.size_label}</span>
                   </div>
                   <p className="model-desc">{m.description}</p>
@@ -739,26 +631,16 @@ function App() {
                     {m.downloaded ? (
                       <>
                         <span className="tag-downloaded">מותקן</span>
-                        {!isActive && (
-                          <button onClick={() => handleActivateModel(m.name)} className="btn-activate" disabled={status === "loading-model"}>
-                            הפעל
-                          </button>
-                        )}
-                        <button onClick={() => handleDeleteModel(m.name)} className="btn-delete" disabled={isActive && status === "recording"}>
-                          מחק
-                        </button>
+                        {!isActive && <button onClick={() => loadWhisperModel(m.name)} className="btn-activate" disabled={status === "loading-model"}>הפעל</button>}
+                        <button onClick={() => handleDeleteModel(m.name)} className="btn-delete" disabled={isActive && status === "recording"}>מחק</button>
                       </>
                     ) : isDownloading ? (
                       <div className="mini-progress">
-                        <div className="progress-bar">
-                          <div className="progress-fill" style={{ width: `${downloadProgress}%` }} />
-                        </div>
+                        <div className="progress-bar"><div className="progress-fill" style={{ width: `${downloadProgress}%` }} /></div>
                         <span className="progress-label">{downloadProgress}%</span>
                       </div>
                     ) : (
-                      <button onClick={() => handleDownloadModel(m.name)} className="btn-primary btn-small" disabled={status === "downloading"}>
-                        הורד
-                      </button>
+                      <button onClick={() => handleDownloadModel(m.name)} className="btn-primary btn-small" disabled={status === "downloading"}>הורד</button>
                     )}
                   </div>
                 </div>
@@ -770,82 +652,68 @@ function App() {
         {/* About */}
         <div className="settings-section about-section">
           <h3>אודות</h3>
-          <p className="about-app-name">הכתבה בעברית v2.0.0</p>
+          <p className="about-app-name">הכתבה בעברית v2.0</p>
           <p className="about-brand">BinTech AI — הנרי שטאובר</p>
-          <p className="settings-note" style={{ marginTop: "0.5rem" }}>קוד פתוח — נבנה עם Tauri, Whisper, ו-❤️</p>
           <div className="about-links">
-            <p className="settings-note">📧 henrystauber22@gmail.com</p>
-            <p className="settings-note">🔗 taplink.cc/henry.ai</p>
-            <p className="settings-note">🎥 youtube.com/@AIWithHenry</p>
+            <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="link-text">🔗 כל הקישורים</a>
+            <a href="https://youtube.com/@AIWithHenry" target="_blank" rel="noopener" className="link-text">🎥 YouTube</a>
+            <a href="mailto:henrystauber22@gmail.com" className="link-text">📧 henrystauber22@gmail.com</a>
           </div>
-          <p className="settings-note" style={{ marginTop: "0.75rem" }}>Alt+D: הקלט/עצור מכל מקום | מגבלת הקלטה: {maxRecordingSecs}s</p>
+          <p className="settings-note" style={{ marginTop: "0.5rem", fontSize: "0.65rem" }}>
+            קוד פתוח · MIT · סדנאות והרצאות AI
+          </p>
         </div>
 
-        {error && (
-          <p className="error" onClick={() => setError("")}>❌ {error}</p>
-        )}
+        {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
       </main>
     );
   }
 
-  // ---- MAIN VIEW ----
+  // ---- MAIN VIEW (compact) ----
   const dismissCloseTip = async () => {
     setShowCloseTip(false);
     await persistSettings({ close_notification_shown: true });
   };
 
   return (
-    <main className="container" dir="rtl">
+    <main className="container compact" dir="rtl">
       {showCloseTip && (
         <div className="close-tip-banner">
-          <span>💡 האפליקציה ממשיכה לפעול ברקע. Alt+D עובד גם כשהחלון סגור.</span>
-          <button className="btn-close-tip" onClick={dismissCloseTip}>הבנתי</button>
+          <span>💡 Alt+D עובד גם כשהחלון סגור</span>
+          <button className="btn-close-tip" onClick={dismissCloseTip}>✓</button>
         </div>
       )}
+
       <div className="main-header">
-        <h1>הכתבה בעברית</h1>
-        <button className="btn-settings" onClick={() => setView("settings")} title="הגדרות">
-          ⚙
-        </button>
+        <h1>🎤 הכתבה</h1>
+        <button className="btn-settings" onClick={() => setView("settings")} title="הגדרות">⚙</button>
       </div>
 
-      {/* No model — first-time setup (skip if API is configured) */}
+      {/* No setup — first-time prompt */}
       {models.length > 0 && downloadedCount === 0 && !apiKeyConfigured && status !== "downloading" && (
-        <div className="setup-section">
-          <p>יש להוריד מודל תמלול או להגדיר מפתח API בהגדרות</p>
-          <div className="model-cards">
-            {models.filter(m => ["small", "medium"].includes(m.name)).map((m) => (
-              <div key={m.name} className="model-card">
-                <div className="model-card-header">
-                  <span className="model-name">{m.name}</span>
-                  <span className="model-size">{m.size_label}</span>
-                </div>
-                <p className="model-desc">{m.description}</p>
-                <button onClick={() => handleDownloadModel(m.name)} className="btn-primary btn-small">הורד</button>
-              </div>
-            ))}
-          </div>
+        <div className="setup-section compact-setup">
+          <p>הגדר מפתח API או הורד מודל בהגדרות ⚙</p>
         </div>
       )}
 
       {/* Downloading */}
       {status === "downloading" && downloadingModel && (
         <div className="download-section">
-          <p>מוריד מודל {downloadingModel}... {downloadProgress}%</p>
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${downloadProgress}%` }} />
-          </div>
+          <p>מוריד {downloadingModel}... {downloadProgress}%</p>
+          <div className="progress-bar"><div className="progress-fill" style={{ width: `${downloadProgress}%` }} /></div>
         </div>
       )}
 
       {/* Status */}
       <div className="status-section">
         <div className={`status-indicator ${status} ${showTimeWarning ? "warning" : ""}`}>
-          {statusLabels[status]}
+          {status === "idle" && (canRecord ? `מוכן — ${langLabels[language]} · ${modeLabel}` : "הגדר API / מודל")}
+          {status === "recording" && `🔴 מקליט ${recordingTime.toFixed(0)}s`}
+          {status === "transcribing" && "⏳ מתמלל..."}
+          {status === "downloading" && "מוריד..."}
+          {status === "loading-model" && "טוען מודל..."}
         </div>
-        {showTimeWarning && (
-          <p className="time-warning">נותרו {Math.ceil(timeRemaining)} שניות</p>
-        )}
+        {showTimeWarning && <p className="time-warning">נותרו {Math.ceil(timeRemaining)}s</p>}
       </div>
 
       {/* Record button */}
@@ -855,7 +723,7 @@ function App() {
           className={`btn-record ${status === "recording" ? "recording" : ""}`}
           disabled={status === "transcribing" || status === "downloading" || status === "loading-model" || !canRecord}
         >
-          {status === "recording" ? "⏹ עצור והכתב" : "🎤 הקלט"}
+          {status === "recording" ? "⏹ עצור" : "🎤 הקלט"}
         </button>
       </div>
 
@@ -863,39 +731,39 @@ function App() {
       {status === "recording" && (
         <div className="recording-progress">
           <div className="progress-bar">
-            <div
-              className={`progress-fill ${showTimeWarning ? "warning" : ""}`}
-              style={{ width: `${(recordingTime / maxRecordingSecs) * 100}%` }}
-            />
+            <div className={`progress-fill ${showTimeWarning ? "warning" : ""}`} style={{ width: `${(recordingTime / maxRecordingSecs) * 100}%` }} />
           </div>
         </div>
       )}
 
-      {/* Transcript */}
+      {/* Transcript — editable */}
       {transcript && (
         <div className="transcript-section">
-          <h3>תמלול אחרון:</h3>
-          <p className="transcript-text">{transcript}</p>
+          <textarea
+            className="transcript-edit"
+            value={editableTranscript}
+            onChange={(e) => setEditableTranscript(e.target.value)}
+            rows={2}
+            dir="rtl"
+          />
           <div className="transcript-actions">
-            <button onClick={() => invoke("inject_text", { text: transcript })} className="btn-secondary">
-              ⌨️ הקלד
+            <button onClick={() => injectText(editableTranscript)} className="btn-secondary" title="הדבק בשדה הפעיל">
+              ⌨️ הדבק
             </button>
-            <button onClick={() => navigator.clipboard.writeText(transcript)} className="btn-secondary">
+            <button onClick={() => navigator.clipboard.writeText(editableTranscript)} className="btn-secondary" title="העתק ללוח">
               📋 העתק
             </button>
           </div>
         </div>
       )}
 
-      {error && (
-        <p className="error" onClick={() => setError("")}>❌ {error}</p>
-      )}
+      {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
 
-      {history.length > 0 && (
+      {history.length > 1 && (
         <div className="history-section">
           <h3>היסטוריה:</h3>
-          {history.map((h) => (
-            <p key={h.id} className="history-item" onClick={() => navigator.clipboard.writeText(h.text)} title="לחץ להעתקה">
+          {history.slice(1).map((h) => (
+            <p key={h.id} className="history-item" onClick={() => navigator.clipboard.writeText(h.text)} title="העתק">
               {h.text}
             </p>
           ))}
@@ -903,10 +771,8 @@ function App() {
       )}
 
       <div className="footer">
-        <p>
-          Alt+D: הקלט/עצור מכל מקום | {langLabels[language]} | {vadEnabled ? "עצירה אוטומטית" : "עצירה ידנית"}
-        </p>
-        <p className="footer-brand">BinTech AI — הנרי שטאובר</p>
+        <span>Alt+D · {langLabels[language]} · {vadEnabled ? "אוטומטי" : "ידני"}</span>
+        <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="footer-brand">BinTech AI</a>
       </div>
     </main>
   );

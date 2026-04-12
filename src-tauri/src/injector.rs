@@ -14,7 +14,7 @@ pub fn inject_text(text: &str, _method: &InjectionMethod) -> Result<(), String> 
         .set_text(text)
         .map_err(|e| format!("Clipboard set error: {}", e))?;
 
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    std::thread::sleep(std::time::Duration::from_millis(250));
 
     enigo
         .key(Key::Control, Direction::Press)

@@ -13,6 +13,10 @@
   text-align: center;
 }
 
+.container.compact {
+  padding: 0.5rem 0.75rem;
+}
+
 h1 {
   font-size: 1.3rem;
   margin-bottom: 0;
@@ -556,14 +560,18 @@ button {
 
 /* Footer */
 .footer {
-  margin-top: 2rem;
-  padding-top: 1rem;
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
   border-top: 1px solid #2a2a4a;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.65rem;
+  color: #555;
 }
 
-.footer p {
+.footer span {
   color: #555;
-  font-size: 0.8rem;
 }
 
 /* Loading Model */
@@ -971,8 +979,54 @@ button {
 /* ===== v2.0 — FOOTER BRAND ===== */
 
 .footer-brand {
-  font-size: 0.7rem;
+  font-size: 0.65rem;
   color: #4da6ff88;
-  margin-top: 0.25rem;
+  text-decoration: none;
+}
+
+.footer-brand:hover {
+  color: #4da6ff;
+}
+
+/* ===== EDITABLE TRANSCRIPT ===== */
+
+.transcript-edit {
+  width: 100%;
+  background: #16213e;
+  border: 1px solid #4da6ff44;
+  border-radius: 8px;
+  color: #e8e8e8;
+  font-family: inherit;
+  font-size: 0.85rem;
+  padding: 0.5rem;
+  resize: vertical;
+  min-height: 2rem;
+  direction: rtl;
+  text-align: right;
+  line-height: 1.4;
+}
+
+.transcript-edit:focus {
+  outline: none;
+  border-color: #4da6ff88;
+}
+
+/* ===== WIZARD EXTRAS ===== */
+
+.wizard-guide-title {
+  font-weight: 600;
+  font-size: 0.8rem;
+  margin-bottom: 0.3rem;
+  color: #ccc;
+}
+
+.wizard-credit {
+  margin-top: 0.75rem;
+  text-align: center;
+}
+
+.compact-setup {
+  padding: 0.5rem;
+  font-size: 0.8rem;
 }
 

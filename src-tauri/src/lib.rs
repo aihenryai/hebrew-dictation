@@ -215,12 +215,7 @@ fn setup_global_shortcuts(app: &AppHandle) {
     app.global_shortcut()
         .on_shortcut(toggle_shortcut, move |_app, shortcut, event| {
             if event.state == ShortcutState::Pressed {
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    if !window.is_visible().unwrap_or(true) {
-                        let _ = window.show();
-                        let _ = window.minimize();
-                    }
-                }
+                // Emit event without showing/focusing the window — keeps focus in the text field
                 let _ = app_handle.emit("hotkey-pressed", shortcut.to_string());
             }
         })

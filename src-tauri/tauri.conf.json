@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "הכתבה בעברית",
-        "width": 340,
-        "height": 420,
-        "minWidth": 280,
-        "minHeight": 300,
+        "width": 300,
+        "height": 260,
+        "minWidth": 240,
+        "minHeight": 200,
         "resizable": true,
         "visible": true,
         "decorations": true,

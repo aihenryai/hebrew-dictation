@@ -4,7 +4,7 @@ use std::time::Instant;
 
 /// VAD (Voice Activity Detection) configuration
 const SILENCE_THRESHOLD: f32 = 0.008;
-const SILENCE_DURATION_SECS: f32 = 3.5;
+const SILENCE_DURATION_SECS: f32 = 4.5;
 const MIN_SPEECH_DURATION_SECS: f32 = 0.5;
 const VAD_CHECK_INTERVAL_MS: u64 = 100;
 
