@@ -1,0 +1,32 @@
+name = "hebrew-dictation-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# KV namespaces — IDs are filled in by `wrangler kv namespace create <BINDING>`
+# After running create, paste the returned id below.
+[[kv_namespaces]]
+binding = "DEVICES"
+id = "PLACEHOLDER_DEVICES_KV_ID"
+
+[[kv_namespaces]]
+binding = "EMAILS"
+id = "PLACEHOLDER_EMAILS_KV_ID"
+
+[[kv_namespaces]]
+binding = "LICENSES"
+id = "PLACEHOLDER_LICENSES_KV_ID"
+
+# Public vars (non-secret)
+[vars]
+FREE_TIER_MINUTES = "30"
+EMAIL_BONUS_MINUTES = "30"
+GROQ_MODEL = "whisper-large-v3-turbo"
+# BACKEND: switches transcription provider. Values: "groq" | "deepgram"
+# Default to "groq" — change to "deepgram" if Phase 0 benchmark gate fails for Groq.
+BACKEND = "groq"
+
+# Secrets — set via:
+#   wrangler secret put GROQ_API_KEY
+#   wrangler secret put DEEPGRAM_API_KEY
+# Do NOT commit them here.

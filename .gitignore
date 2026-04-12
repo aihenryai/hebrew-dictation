@@ -1,0 +1,47 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Environment / secrets
+.env
+.env.*
+benchmark/.env
+
+# Cloudflare Worker (reference only — not deployed)
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+
+# Benchmark audio samples (user-provided)
+benchmark/samples/*.wav
+benchmark/samples/*.mp3
+
+# Claude Code config
+.claude/
+
+# OS
+Thumbs.db

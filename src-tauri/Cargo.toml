@@ -1,0 +1,31 @@
+[package]
+name = "hebrew-dictation"
+version = "1.0.0"
+description = "הכתבה בעברית — Hebrew Voice Dictation by BinTech AI"
+authors = ["Henry Stauber <henrystauber22@gmail.com>"]
+edition = "2021"
+
+[lib]
+name = "hebrew_dictation_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros"] }
+cpal = "0.15"
+sha2 = "0.10"
+enigo = "0.2"
+reqwest = { version = "0.12", features = ["stream", "multipart", "json"] }
+futures-util = "0.3"
+dirs = "6"
+whisper-rs = "0.16"
+arboard = "3"
+sysinfo = "0.33"

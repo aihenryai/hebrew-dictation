@@ -1,0 +1,5 @@
+requests>=2.31.0
+python-dotenv>=1.0.0
+jiwer>=3.0.0
+# Optional — local whisper benchmark (install separately to avoid heavy deps by default):
+# faster-whisper>=1.0.0
