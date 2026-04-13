@@ -53,6 +53,36 @@ pub struct AppSettings {
     pub close_notification_shown: bool,
 }
 
+/// Settings sent to the webview — API keys are redacted to booleans.
+#[derive(Debug, Clone, Serialize)]
+pub struct RedactedSettings {
+    pub transcription_mode: TranscriptionMode,
+    pub api_provider: ApiProvider,
+    pub has_openai_key: bool,
+    pub has_deepgram_key: bool,
+    pub preferred_model: String,
+    pub language: String,
+    pub vad_enabled: bool,
+    pub onboarding_completed: bool,
+    pub close_notification_shown: bool,
+}
+
+impl AppSettings {
+    pub fn redacted(&self) -> RedactedSettings {
+        RedactedSettings {
+            transcription_mode: self.transcription_mode.clone(),
+            api_provider: self.api_provider.clone(),
+            has_openai_key: self.openai_api_key.as_ref().is_some_and(|k| !k.is_empty()),
+            has_deepgram_key: self.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty()),
+            preferred_model: self.preferred_model.clone(),
+            language: self.language.clone(),
+            vad_enabled: self.vad_enabled,
+            onboarding_completed: self.onboarding_completed,
+            close_notification_shown: self.close_notification_shown,
+        }
+    }
+}
+
 fn default_preferred_model() -> String {
     "small".to_string()
 }

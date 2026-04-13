@@ -39,8 +39,8 @@ export async function handleTranscribe(
     return jsonError(413, `Audio exceeds ${MAX_AUDIO_BYTES} byte limit`);
   }
 
-  // Prefer client-provided duration; fall back to byte-size estimate.
-  const minutesUsed = computeMinutesFromRequest(request, audio.byteLength);
+  // Always compute duration server-side from audio byte size (never trust client headers).
+  const minutesUsed = computeMinutesFromAudioSize(audio.byteLength);
 
   const device = await getOrCreateDevice(env, deviceHash);
   const limit = getQuotaLimit(env, device);
@@ -62,7 +62,8 @@ export async function handleTranscribe(
         ? await transcribeDeepgram(audio, env.DEEPGRAM_API_KEY)
         : await transcribeGroq(audio, env.GROQ_API_KEY, env.GROQ_MODEL);
   } catch (e) {
-    return jsonError(502, `Transcription backend failed: ${(e as Error).message}`);
+    console.error("Transcription backend error:", (e as Error).message);
+    return jsonError(502, "Transcription service temporarily unavailable");
   }
 
   const updated = await consumeMinutes(env, device, minutesUsed);
@@ -104,24 +105,11 @@ export async function handleQuota(
 }
 
 /**
- * Computes minutes consumed for quota purposes.
- * Strategy:
- *   1. If client sent X-Audio-Duration-Seconds header, trust it (most accurate).
- *   2. Otherwise, estimate from byte size assuming 16kHz mono PCM s16 (~1.875MB/min).
- * Always rounds up to 0.1 min minimum to prevent abuse via tiny clips.
+ * Computes minutes consumed for quota purposes from audio byte size.
+ * Estimate assumes 16kHz mono PCM s16 (~1.875 MB/min).
+ * Rounds up to 0.1 min minimum to prevent abuse via tiny clips.
  */
-function computeMinutesFromRequest(
-  request: Request,
-  audioBytes: number
-): number {
-  const durationHeader = request.headers.get("X-Audio-Duration-Seconds");
-  if (durationHeader) {
-    const seconds = parseFloat(durationHeader);
-    if (!isNaN(seconds) && seconds > 0) {
-      return Math.max(0.1, seconds / 60);
-    }
-  }
-  // Fallback: 1.875MB ≈ 1 minute of 16kHz mono PCM s16
+function computeMinutesFromAudioSize(audioBytes: number): number {
   const estimated = audioBytes / (1.875 * 1024 * 1024);
   return Math.max(0.1, estimated);
 }

@@ -23,8 +23,10 @@ export async function transcribeGroq(
   });
 
   if (!response.ok) {
+    // Log full error server-side; never expose backend details to callers.
     const errText = await response.text();
-    throw new Error(`Groq ${response.status}: ${errText.slice(0, 200)}`);
+    console.error(`Groq ${response.status}: ${errText.slice(0, 500)}`);
+    throw new Error("Transcription service temporarily unavailable");
   }
 
   const json = (await response.json()) as { text?: string };

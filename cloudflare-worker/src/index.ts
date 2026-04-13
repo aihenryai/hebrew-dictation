@@ -20,9 +20,12 @@ export default {
     const { pathname } = url;
     const { method } = request;
 
+    const origin = request.headers.get("Origin") ?? "";
+    const cors = corsHeaders(origin);
+
     // CORS preflight (Tauri webview will send these)
     if (method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: cors });
     }
 
     let response: Response;
@@ -41,19 +44,26 @@ export default {
     }
 
     // Attach CORS headers to all responses
-    for (const [k, v] of Object.entries(corsHeaders())) {
+    for (const [k, v] of Object.entries(cors)) {
       response.headers.set(k, v);
     }
     return response;
   },
 } satisfies ExportedHandler<Env>;
 
-function corsHeaders(): Record<string, string> {
+/** Origins allowed to call this worker (Tauri webview on each platform). */
+const ALLOWED_ORIGINS = new Set([
+  "tauri://localhost",        // Windows / Linux
+  "http://tauri.localhost",   // macOS
+]);
+
+function corsHeaders(origin: string): Record<string, string> {
   return {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : "",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers":
-      "Content-Type, X-Device-Hash, X-Audio-Duration-Seconds, Authorization",
+      "Content-Type, X-Device-Hash, Authorization",
     "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
   };
 }

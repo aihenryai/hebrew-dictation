@@ -172,16 +172,24 @@ fn delete_model(state: State<AppState>, model_name: String) -> Result<(), String
 }
 
 #[tauri::command]
-fn get_settings(state: State<AppState>) -> Result<settings::AppSettings, String> {
+fn get_settings(state: State<AppState>) -> Result<settings::RedactedSettings, String> {
     let s = state.settings.lock().map_err(|e| e.to_string())?;
-    Ok(s.clone())
+    Ok(s.redacted())
 }
 
 #[tauri::command]
 fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) -> Result<(), String> {
-    settings::save_settings(&new_settings)?;
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-    *s = new_settings;
+    // Preserve existing API keys unless the caller explicitly sends a new non-empty value.
+    let mut merged = new_settings;
+    if merged.openai_api_key.as_ref().is_none_or(|k| k.is_empty()) {
+        merged.openai_api_key = s.openai_api_key.clone();
+    }
+    if merged.deepgram_api_key.as_ref().is_none_or(|k| k.is_empty()) {
+        merged.deepgram_api_key = s.deepgram_api_key.clone();
+    }
+    settings::save_settings(&merged)?;
+    *s = merged;
     Ok(())
 }
 

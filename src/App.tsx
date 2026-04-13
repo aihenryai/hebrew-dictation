@@ -9,11 +9,25 @@ type Language = "he" | "en" | "auto";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "open_ai" | "deepgram";
 
+/** Settings sent to the backend (keys only included when user explicitly changes them). */
 interface AppSettings {
   transcription_mode: TranscriptionMode;
   api_provider: ApiProvider;
   openai_api_key: string | null;
   deepgram_api_key: string | null;
+  preferred_model: string;
+  language: string;
+  vad_enabled: boolean;
+  onboarding_completed?: boolean;
+  close_notification_shown?: boolean;
+}
+
+/** Redacted settings returned from the backend (keys replaced with booleans). */
+interface RedactedSettings {
+  transcription_mode: TranscriptionMode;
+  api_provider: ApiProvider;
+  has_openai_key: boolean;
+  has_deepgram_key: boolean;
   preferred_model: string;
   language: string;
   vad_enabled: boolean;
@@ -219,13 +233,14 @@ function App() {
     let preferredModelName = "small";
     let needsOnboarding = true;
     try {
-      const settings = await invoke("get_settings") as AppSettings;
+      const settings = await invoke("get_settings") as RedactedSettings;
       setTranscriptionMode(settings.transcription_mode);
       setApiProvider(settings.api_provider);
       setLanguage(settings.language as Language);
       setVadEnabled(settings.vad_enabled);
-      if (settings.openai_api_key) setOpenaiKey(settings.openai_api_key);
-      if (settings.deepgram_api_key) setDeepgramKey(settings.deepgram_api_key);
+      // Keys are redacted — just track whether they exist on the backend.
+      if (settings.has_openai_key) setOpenaiKey("••••••••");
+      if (settings.has_deepgram_key) setDeepgramKey("••••••••");
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
@@ -244,17 +259,26 @@ function App() {
     }
   }
 
+  /** Send null for keys unless user typed a real new value (not the placeholder). */
+  const sanitizeKey = (key: string | null): string | null => {
+    if (!key || key === "••••••••") return null;
+    return key;
+  };
+
   const persistSettings = useCallback(async (overrides: Partial<AppSettings> = {}) => {
     const settings: AppSettings = {
       transcription_mode: transcriptionMode,
       api_provider: apiProvider,
-      openai_api_key: openaiKey || null,
-      deepgram_api_key: deepgramKey || null,
+      openai_api_key: sanitizeKey(openaiKey),
+      deepgram_api_key: sanitizeKey(deepgramKey),
       preferred_model: selectedModel,
       language: language,
       vad_enabled: vadEnabled,
       ...overrides,
     };
+    // Also sanitize keys in overrides
+    if (settings.openai_api_key === "••••••••") settings.openai_api_key = null;
+    if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
   }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled]);
 

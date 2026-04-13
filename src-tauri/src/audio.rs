@@ -51,7 +51,7 @@ impl AudioRecorder {
 
     pub fn set_max_recording_secs(&self, secs: f32) {
         if let Ok(mut max) = self.max_recording_secs.lock() {
-            *max = secs;
+            *max = secs.clamp(1.0, 300.0);
         }
     }
 

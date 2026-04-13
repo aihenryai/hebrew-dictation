@@ -148,15 +148,29 @@ pub async fn transcribe_deepgram(
 
 // ── Unified entry point ──
 
+/// Languages accepted by the transcription APIs.
+const VALID_LANGUAGES: &[&str] = &[
+    "auto", "he", "en", "ar", "fr", "ru", "es", "de", "it", "pt", "ja", "ko", "zh",
+];
+
+fn validate_language(language: &str) -> Result<&str, String> {
+    if VALID_LANGUAGES.contains(&language) {
+        Ok(language)
+    } else {
+        Err(format!("שפה לא נתמכת: {}", language))
+    }
+}
+
 pub async fn transcribe_api(
     provider: &ApiProvider,
     samples: &[f32],
     api_key: &str,
     language: &str,
 ) -> Result<String, String> {
+    let lang = validate_language(language)?;
     match provider {
-        ApiProvider::OpenAI => transcribe_openai(samples, api_key, language).await,
-        ApiProvider::Deepgram => transcribe_deepgram(samples, api_key, language).await,
+        ApiProvider::OpenAI => transcribe_openai(samples, api_key, lang).await,
+        ApiProvider::Deepgram => transcribe_deepgram(samples, api_key, lang).await,
     }
 }
 
