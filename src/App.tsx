@@ -20,6 +20,8 @@ interface AppSettings {
   vad_enabled: boolean;
   onboarding_completed?: boolean;
   close_notification_shown?: boolean;
+  always_on_top?: boolean;
+  autostart_enabled?: boolean;
 }
 
 /** Redacted settings returned from the backend (keys replaced with booleans). */
@@ -33,6 +35,8 @@ interface RedactedSettings {
   vad_enabled: boolean;
   onboarding_completed?: boolean;
   close_notification_shown?: boolean;
+  always_on_top?: boolean;
+  autostart_enabled?: boolean;
 }
 
 interface ModelInfo {
@@ -77,6 +81,8 @@ function App() {
   const [wizardKeyTesting, setWizardKeyTesting] = useState(false);
   const [wizardChoice, setWizardChoice] = useState<"api" | "local" | null>(null);
   const [showCloseTip, setShowCloseTip] = useState(false);
+  const [alwaysOnTop, setAlwaysOnTop] = useState(true);
+  const [autostartEnabled, setAutostartEnabled] = useState(true);
   const pendingCloseTipRef = useRef(false);
   const statusRef = useRef(status);
   const vadEnabledRef = useRef(vadEnabled);
@@ -241,6 +247,8 @@ function App() {
       // Keys are redacted — just track whether they exist on the backend.
       if (settings.has_openai_key) setOpenaiKey("••••••••");
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
+      if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
+      if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
@@ -274,13 +282,15 @@ function App() {
       preferred_model: selectedModel,
       language: language,
       vad_enabled: vadEnabled,
+      always_on_top: alwaysOnTop,
+      autostart_enabled: autostartEnabled,
       ...overrides,
     };
     // Also sanitize keys in overrides
     if (settings.openai_api_key === "••••••••") settings.openai_api_key = null;
     if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled]);
+  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled]);
 
   async function handleTestApiKey() {
     const activeKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
@@ -626,6 +636,42 @@ function App() {
           </label>
         </div>
 
+        {/* Always on top */}
+        <div className="settings-section">
+          <h3>חלון מעל הכל</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={alwaysOnTop}
+              onChange={() => {
+                const v = !alwaysOnTop;
+                setAlwaysOnTop(v);
+                invoke("set_window_always_on_top", { enabled: v }).catch(() => {});
+                persistSettings({ always_on_top: v });
+              }}
+            />
+            <span className="toggle-text">הצג את חלון ההקלטה מעל כל התוכנות (כדי לראות סטטוס)</span>
+          </label>
+        </div>
+
+        {/* Autostart */}
+        <div className="settings-section">
+          <h3>הפעלה אוטומטית בעלייה</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={autostartEnabled}
+              onChange={() => {
+                const v = !autostartEnabled;
+                setAutostartEnabled(v);
+                invoke("set_autostart_enabled", { enabled: v }).catch(() => {});
+                persistSettings({ autostart_enabled: v });
+              }}
+            />
+            <span className="toggle-text">הפעל את התוכנה אוטומטית כשהמחשב נדלק</span>
+          </label>
+        </div>
+
         {/* Mics */}
         <div className="settings-section">
           <h3>מיקרופונים ({devices.length})</h3>
@@ -676,7 +722,7 @@ function App() {
         {/* About */}
         <div className="settings-section about-section">
           <h3>אודות</h3>
-          <p className="about-app-name">הכתבה בעברית v2.0</p>
+          <p className="about-app-name">הכתבה בעברית v2.1</p>
           <p className="about-brand">BinTech AI — הנרי שטאובר</p>
           <div className="about-links">
             <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="link-text">🔗 כל הקישורים</a>

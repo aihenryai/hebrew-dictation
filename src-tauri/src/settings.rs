@@ -51,6 +51,10 @@ pub struct AppSettings {
     pub onboarding_completed: bool,
     #[serde(default)]
     pub close_notification_shown: bool,
+    #[serde(default = "default_true")]
+    pub always_on_top: bool,
+    #[serde(default = "default_true")]
+    pub autostart_enabled: bool,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -65,6 +69,8 @@ pub struct RedactedSettings {
     pub vad_enabled: bool,
     pub onboarding_completed: bool,
     pub close_notification_shown: bool,
+    pub always_on_top: bool,
+    pub autostart_enabled: bool,
 }
 
 impl AppSettings {
@@ -79,6 +85,8 @@ impl AppSettings {
             vad_enabled: self.vad_enabled,
             onboarding_completed: self.onboarding_completed,
             close_notification_shown: self.close_notification_shown,
+            always_on_top: self.always_on_top,
+            autostart_enabled: self.autostart_enabled,
         }
     }
 }
@@ -107,6 +115,8 @@ impl Default for AppSettings {
             vad_enabled: true,
             onboarding_completed: false,
             close_notification_shown: false,
+            always_on_top: true,
+            autostart_enabled: true,
         }
     }
 }

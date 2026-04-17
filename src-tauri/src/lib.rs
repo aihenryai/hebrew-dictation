@@ -216,6 +216,26 @@ fn get_audio_devices() -> Result<Vec<String>, String> {
     Ok(devices)
 }
 
+#[tauri::command]
+fn set_window_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.set_always_on_top(enabled).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autostart = app.autolaunch();
+    if enabled {
+        autostart.enable().map_err(|e| e.to_string())?;
+    } else {
+        autostart.disable().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn setup_global_shortcuts(app: &AppHandle) {
     let toggle_shortcut: Shortcut = "alt+d".parse().unwrap();
 
@@ -290,22 +310,26 @@ pub fn run() {
 
             use tauri_plugin_autostart::ManagerExt;
             let autostart = app.autolaunch();
-            if !autostart.is_enabled().unwrap_or(false) {
+            let (autostart_wanted, always_on_top_wanted, close_notif_shown) = {
+                let state = app.state::<AppState>();
+                let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                (s.autostart_enabled, s.always_on_top, s.close_notification_shown)
+            };
+            let autostart_active = autostart.is_enabled().unwrap_or(false);
+            if autostart_wanted && !autostart_active {
                 let _ = autostart.enable();
+            } else if !autostart_wanted && autostart_active {
+                let _ = autostart.disable();
             }
 
             let start_minimized = std::env::args().any(|a| a == "--minimized");
 
             if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_always_on_top(always_on_top_wanted);
                 if start_minimized {
                     let _ = window.hide();
                 }
                 let w = window.clone();
-                let state_handle = app.state::<AppState>();
-                let close_notif_shown = {
-                    let s = state_handle.settings.lock().unwrap_or_else(|e| e.into_inner());
-                    s.close_notification_shown
-                };
                 let notif_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(close_notif_shown));
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -341,6 +365,8 @@ pub fn run() {
             test_api_key,
             inject_text,
             get_audio_devices,
+            set_window_always_on_top,
+            set_autostart_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
