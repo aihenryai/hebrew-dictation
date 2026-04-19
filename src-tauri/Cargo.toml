@@ -29,3 +29,5 @@ dirs = "6"
 whisper-rs = "0.16"
 arboard = "3"
 sysinfo = "0.33"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+url = "2"

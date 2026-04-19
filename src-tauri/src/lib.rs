@@ -3,19 +3,27 @@ mod audio;
 mod injector;
 mod model;
 mod settings;
+mod streaming;
 mod whisper;
 
 use audio::AudioRecorder;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconEvent;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
+struct ActiveStreaming {
+    session: Arc<streaming::StreamingSession>,
+    audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+    dispatch_task: tokio::task::JoinHandle<()>,
+}
+
 struct AppState {
     recorder: Mutex<AudioRecorder>,
     whisper_engine: Mutex<Option<whisper::WhisperEngine>>,
     settings: Mutex<settings::AppSettings>,
+    streaming: tokio::sync::Mutex<Option<ActiveStreaming>>,
 }
 
 #[tauri::command]
@@ -104,6 +112,115 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
             }
         }
     }
+}
+
+#[tauri::command]
+async fn start_streaming_transcription(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    language: Option<String>,
+) -> Result<(), String> {
+    // Only one active session at a time.
+    {
+        let guard = state.streaming.lock().await;
+        if guard.is_some() {
+            return Err("Streaming session already active".to_string());
+        }
+    }
+
+    // Deepgram streaming rejects "auto" — map it to "he" to match the batch path behavior.
+    let lang = match language.as_deref() {
+        Some("auto") | None => "he".to_string(),
+        Some(other) => other.to_string(),
+    };
+    let api_key = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        if !matches!(s.api_provider, settings::ApiProvider::Deepgram) {
+            return Err("Streaming זמין רק עם Deepgram. עבור ל-Deepgram בהגדרות.".to_string());
+        }
+        s.deepgram_api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?
+    };
+
+    // Open WebSocket connection. If this fails, we surface the error and nothing is started.
+    let session = streaming::StreamingSession::start(&api_key, &lang, app.clone()).await?;
+
+    // Channel to pipe audio chunks from the CPAL callback (sync) to an async dispatcher.
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+
+    let session_for_task = session.clone();
+    let dispatch_task = tokio::spawn(async move {
+        while let Some(chunk) = audio_rx.recv().await {
+            if let Err(e) = session_for_task.send_audio_pcm16(&chunk).await {
+                eprintln!("streaming send error: {}", e);
+                break;
+            }
+        }
+    });
+
+    // Attach the chunk callback to the recorder BEFORE starting so chunks flow immediately.
+    {
+        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        let tx_for_cb = audio_tx.clone();
+        recorder.set_chunk_callback(move |chunk: &[f32]| {
+            let _ = tx_for_cb.send(chunk.to_vec());
+        });
+    }
+
+    // Start audio recording in a scoped block so the MutexGuard is not held across .await below.
+    let start_err = {
+        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.start_recording().err()
+    };
+    if let Some(e) = start_err {
+        {
+            let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+            recorder.clear_chunk_callback();
+        }
+        drop(audio_tx);
+        dispatch_task.abort();
+        let _ = session.stop().await;
+        return Err(e);
+    }
+
+    // Store the active session so stop_streaming_transcription can find it.
+    let mut guard = state.streaming.lock().await;
+    *guard = Some(ActiveStreaming {
+        session,
+        audio_tx,
+        dispatch_task,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<String, String> {
+    // Stop audio recording (drops the chunk callback activity).
+    {
+        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.clear_chunk_callback();
+        let _ = recorder.stop_recording();
+    }
+
+    let active = {
+        let mut guard = state.streaming.lock().await;
+        guard.take()
+    };
+
+    let Some(active) = active else {
+        return Err("No active streaming session".to_string());
+    };
+
+    // Drop the sender so the dispatch task terminates when the channel drains.
+    drop(active.audio_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), active.dispatch_task).await;
+
+    // Close the WebSocket and return the accumulated final text.
+    let text = active.session.stop().await?;
+    Ok(text)
 }
 
 #[tauri::command]
@@ -200,8 +317,32 @@ async fn test_api_key(provider: settings::ApiProvider, api_key: String) -> Resul
 }
 
 #[tauri::command]
-fn inject_text(text: String) -> Result<(), String> {
-    injector::inject_text(&text, &injector::InjectionMethod::Clipboard)
+fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
+    // Hide the main window briefly so its focus doesn't capture the simulated Ctrl+V.
+    // Without this, a focused Tauri window swallows the paste and nothing lands in the target app.
+    let main_window = app.get_webview_window("main");
+    let was_visible = main_window
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+
+    if was_visible {
+        if let Some(w) = &main_window {
+            let _ = w.hide();
+        }
+        // Let Windows promote the previously-active window to the foreground.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+
+    let result = injector::inject_text(&text, &injector::InjectionMethod::Clipboard);
+
+    if was_visible {
+        if let Some(w) = &main_window {
+            let _ = w.show();
+        }
+    }
+
+    result
 }
 
 #[tauri::command]
@@ -303,6 +444,7 @@ pub fn run() {
             recorder: Mutex::new(AudioRecorder::new()),
             whisper_engine: Mutex::new(None),
             settings: Mutex::new(settings::load_settings()),
+            streaming: tokio::sync::Mutex::new(None),
         })
         .setup(|app| {
             setup_global_shortcuts(app.handle());
@@ -354,6 +496,8 @@ pub fn run() {
             set_vad_enabled,
             set_max_recording_secs,
             transcribe,
+            start_streaming_transcription,
+            stop_streaming_transcription,
             load_whisper_model,
             is_whisper_loaded,
             is_model_downloaded,

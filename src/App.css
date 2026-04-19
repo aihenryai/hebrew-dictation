@@ -539,6 +539,33 @@ button {
   margin-top: 0.75rem;
 }
 
+/* Live streaming preview */
+.live-preview {
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.35);
+  border-radius: 12px;
+  text-align: start;
+}
+
+.live-preview-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #a5b4fc;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 0.35rem;
+}
+
+.live-preview-text {
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: #e0e7ff;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* Time warning */
 .time-warning {
   color: #ff6b6b;

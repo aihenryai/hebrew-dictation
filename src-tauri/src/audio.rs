@@ -3,13 +3,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// VAD (Voice Activity Detection) configuration
-const SILENCE_THRESHOLD: f32 = 0.008;
+/// Threshold tuned for multi-channel mics that interleave mostly-silent channels.
+/// 4-channel mics dilute per-frame RMS by √4 compared to mono, so we set this low.
+const SILENCE_THRESHOLD: f32 = 0.002;
 const SILENCE_DURATION_SECS: f32 = 4.5;
 const MIN_SPEECH_DURATION_SECS: f32 = 0.5;
 const VAD_CHECK_INTERVAL_MS: u64 = 100;
 
 /// Default maximum recording duration in seconds (local mode)
 const DEFAULT_MAX_RECORDING_SECS: f32 = 60.0;
+
+/// Callback invoked from the CPAL audio thread with 16kHz mono f32 samples.
+/// Used by streaming mode to push chunks to a WebSocket writer.
+pub type ChunkCallback = Arc<dyn Fn(&[f32]) + Send + Sync + 'static>;
 
 pub struct AudioRecorder {
     samples: Arc<Mutex<Vec<f32>>>,
@@ -30,6 +36,8 @@ pub struct AudioRecorder {
     vad_thread: Option<std::thread::JoinHandle<()>>,
     /// Max recording duration (configurable per mode)
     max_recording_secs: Arc<Mutex<f32>>,
+    /// Optional callback — when set, each audio chunk is also forwarded (16kHz mono) to the callback.
+    chunk_callback: Arc<Mutex<Option<ChunkCallback>>>,
 }
 
 impl AudioRecorder {
@@ -46,6 +54,24 @@ impl AudioRecorder {
             vad_enabled: Arc::new(Mutex::new(true)),
             vad_thread: None,
             max_recording_secs: Arc::new(Mutex::new(DEFAULT_MAX_RECORDING_SECS)),
+            chunk_callback: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Set a callback that receives each incoming audio chunk, converted to 16kHz mono f32.
+    /// Invoked from the CPAL audio thread — keep the callback non-blocking.
+    pub fn set_chunk_callback<F>(&self, cb: F)
+    where
+        F: Fn(&[f32]) + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = self.chunk_callback.lock() {
+            *guard = Some(Arc::new(cb));
+        }
+    }
+
+    pub fn clear_chunk_callback(&self) {
+        if let Ok(mut guard) = self.chunk_callback.lock() {
+            *guard = None;
         }
     }
 
@@ -97,6 +123,7 @@ impl AudioRecorder {
         // Create and own the stream in a dedicated thread (avoids unsafe Send)
         let samples_clone = self.samples.clone();
         let is_recording_clone = self.is_recording.clone();
+        let chunk_callback_clone = self.chunk_callback.clone();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
@@ -118,16 +145,33 @@ impl AudioRecorder {
 
             let samples = samples_clone;
             let is_recording = is_recording_clone;
+            let chunk_callback = chunk_callback_clone;
 
             let stream = match device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if let Ok(recording) = is_recording.lock() {
-                        if *recording {
-                            if let Ok(mut s) = samples.lock() {
-                                s.extend_from_slice(data);
-                            }
+                        if !*recording {
+                            return;
                         }
+                    } else {
+                        return;
+                    }
+
+                    if let Ok(mut s) = samples.lock() {
+                        s.extend_from_slice(data);
+                    }
+
+                    // If a streaming callback is registered, deliver a 16kHz mono copy of this chunk.
+                    let cb_opt = chunk_callback.lock().ok().and_then(|g| g.clone());
+                    if let Some(cb) = cb_opt {
+                        let mono = to_mono(data, native_channels);
+                        let resampled = if native_rate == 16000 {
+                            mono
+                        } else {
+                            resample(&mono, native_rate, 16000)
+                        };
+                        cb(&resampled);
                     }
                 },
                 |err| {
@@ -205,7 +249,9 @@ impl AudioRecorder {
                             continue;
                         }
                         let start = total.saturating_sub(samples_per_check);
-                        let rms = calculate_rms(&samples_guard[start..]);
+                        // For multi-channel mics, many channels are silent — compute RMS on
+                        // channel 0 only (stride by `channels`) to avoid diluting the signal.
+                        let rms = calculate_rms_strided(&samples_guard[start..], channels as usize);
                         (total, rms)
                     } else {
                         continue;
@@ -276,15 +322,7 @@ impl AudioRecorder {
         let native_rate = *self.device_sample_rate.lock().map_err(|e| e.to_string())?;
         let native_channels = *self.device_channels.lock().map_err(|e| e.to_string())?;
 
-        let mono = if native_channels > 1 {
-            let ch = native_channels as usize;
-            raw_samples
-                .chunks(ch)
-                .map(|frame| frame.iter().sum::<f32>() / ch as f32)
-                .collect()
-        } else {
-            raw_samples
-        };
+        let mono = to_mono(&raw_samples, native_channels);
 
         let target_rate = 16000u32;
         if native_rate == target_rate {
@@ -313,12 +351,35 @@ impl AudioRecorder {
     }
 }
 
-fn calculate_rms(samples: &[f32]) -> f32 {
+fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+    let ch = channels as usize;
+    samples
+        .chunks(ch)
+        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+        .collect()
+}
+
+/// RMS over a single channel of an interleaved audio buffer.
+/// `stride` is the device channel count — 1 for mono, 4 for an array mic, etc.
+/// We sample only channel 0 to avoid silent channels diluting the signal.
+fn calculate_rms_strided(samples: &[f32], stride: usize) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
-    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-    (sum_sq / samples.len() as f32).sqrt()
+    let stride = stride.max(1);
+    let mut sum_sq: f32 = 0.0;
+    let mut count: usize = 0;
+    for &s in samples.iter().step_by(stride) {
+        sum_sq += s * s;
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    (sum_sq / count as f32).sqrt()
 }
 
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {

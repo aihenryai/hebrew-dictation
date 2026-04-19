@@ -79,7 +79,8 @@ pub async fn transcribe_openai(
         .text("model", "whisper-1")
         .text("response_format", "text");
 
-    if language != "auto" {
+    // "auto" and "multi" → let Whisper auto-detect. Whisper doesn't accept "multi" as an ISO code.
+    if language != "auto" && language != "multi" {
         form = form.text("language", language.to_string());
     }
 
@@ -112,6 +113,7 @@ pub async fn transcribe_deepgram(
 ) -> Result<String, String> {
     let wav_data = samples_to_wav(samples, 16000);
 
+    // "auto" → default to Hebrew (single-language). "multi" → Nova-3 code-switching (Hebrew+English mid-sentence).
     let lang = if language == "auto" { "he" } else { language };
     let url = format!(
         "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true",
@@ -149,8 +151,9 @@ pub async fn transcribe_deepgram(
 // ── Unified entry point ──
 
 /// Languages accepted by the transcription APIs.
+/// "multi" enables Deepgram Nova-3 code-switching (Hebrew+English mid-sentence).
 const VALID_LANGUAGES: &[&str] = &[
-    "auto", "he", "en", "ar", "fr", "ru", "es", "de", "it", "pt", "ja", "ko", "zh",
+    "auto", "multi", "he", "en", "ar", "fr", "ru", "es", "de", "it", "pt", "ja", "ko", "zh",
 ];
 
 fn validate_language(language: &str) -> Result<&str, String> {

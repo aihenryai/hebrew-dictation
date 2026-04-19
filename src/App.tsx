@@ -5,7 +5,7 @@ import "./App.css";
 
 type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loading-model";
 type AppView = "main" | "settings" | "onboarding";
-type Language = "he" | "en" | "auto";
+type Language = "he" | "en" | "multi" | "auto";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "open_ai" | "deepgram";
 
@@ -22,6 +22,7 @@ interface AppSettings {
   close_notification_shown?: boolean;
   always_on_top?: boolean;
   autostart_enabled?: boolean;
+  streaming_enabled?: boolean;
 }
 
 /** Redacted settings returned from the backend (keys replaced with booleans). */
@@ -37,6 +38,12 @@ interface RedactedSettings {
   close_notification_shown?: boolean;
   always_on_top?: boolean;
   autostart_enabled?: boolean;
+  streaming_enabled?: boolean;
+}
+
+interface InterimPayload {
+  text: string;
+  is_final: boolean;
 }
 
 interface ModelInfo {
@@ -83,6 +90,8 @@ function App() {
   const [showCloseTip, setShowCloseTip] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(true);
+  const [streamingEnabled, setStreamingEnabled] = useState(false);
+  const [livePreview, setLivePreview] = useState("");
   const pendingCloseTipRef = useRef(false);
   const statusRef = useRef(status);
   const vadEnabledRef = useRef(vadEnabled);
@@ -90,11 +99,14 @@ function App() {
   const vadPollRef = useRef<number | null>(null);
   const timerRef = useRef<number | null>(null);
   const transcriptionModeRef = useRef(transcriptionMode);
+  const streamingEnabledRef = useRef(streamingEnabled);
+  const liveFinalRef = useRef("");
 
   useEffect(() => { statusRef.current = status; }, [status]);
   useEffect(() => { vadEnabledRef.current = vadEnabled; }, [vadEnabled]);
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { transcriptionModeRef.current = transcriptionMode; }, [transcriptionMode]);
+  useEffect(() => { streamingEnabledRef.current = streamingEnabled; }, [streamingEnabled]);
 
   const getMaxRecordingSecs = () => transcriptionModeRef.current === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
 
@@ -129,19 +141,33 @@ function App() {
     stopTimer();
 
     try {
-      const samples = await invoke("stop_recording") as number[];
-      if (samples.length < MIN_TRANSCRIBE_SAMPLES) {
-        setStatus("idle");
-        return;
-      }
+      if (streamingEnabledRef.current) {
+        // Streaming mode: the WebSocket already transcribed during recording;
+        // stop_streaming_transcription flushes pending finals and returns the accumulated text.
+        const text = await invoke("stop_streaming_transcription") as string;
+        setLivePreview("");
+        liveFinalRef.current = "";
+        if (text && text.trim()) {
+          setTranscript(text);
+          setEditableTranscript(text);
+          setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
+          await injectText(text);
+        }
+      } else {
+        const samples = await invoke("stop_recording") as number[];
+        if (samples.length < MIN_TRANSCRIBE_SAMPLES) {
+          setStatus("idle");
+          return;
+        }
 
-      const text = await invoke("transcribe", { samples, language: languageRef.current }) as string;
-      if (text && text.trim()) {
-        setTranscript(text);
-        setEditableTranscript(text);
-        setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
-        // Auto-inject into focused field
-        await injectText(text);
+        const text = await invoke("transcribe", { samples, language: languageRef.current }) as string;
+        if (text && text.trim()) {
+          setTranscript(text);
+          setEditableTranscript(text);
+          setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
+          // Auto-inject into focused field
+          await injectText(text);
+        }
       }
     } catch (e) {
       setError(String(e));
@@ -157,7 +183,13 @@ function App() {
     try {
       await invoke("set_vad_enabled", { enabled: vadEnabledRef.current });
       await invoke("set_max_recording_secs", { secs: getMaxRecordingSecs() });
-      await invoke("start_recording");
+      if (streamingEnabledRef.current) {
+        setLivePreview("");
+        liveFinalRef.current = "";
+        await invoke("start_streaming_transcription", { language: languageRef.current });
+      } else {
+        await invoke("start_recording");
+      }
       setStatus("recording");
       setRecordingTime(0);
       timerRef.current = window.setInterval(() => {
@@ -191,6 +223,26 @@ function App() {
     });
     return () => { unlistenHotkey.then((fn) => fn()); };
   }, [stopAndTranscribe, beginRecording]);
+
+  // Live transcription events (streaming mode). Accumulates final segments and
+  // appends the latest interim chunk for in-flight preview.
+  useEffect(() => {
+    const unlistenInterim = listen<InterimPayload>("transcription-interim", (event) => {
+      const { text, is_final } = event.payload;
+      if (!text) return;
+      if (is_final) {
+        liveFinalRef.current = liveFinalRef.current
+          ? `${liveFinalRef.current} ${text}`
+          : text;
+        setLivePreview(liveFinalRef.current);
+      } else {
+        setLivePreview(
+          liveFinalRef.current ? `${liveFinalRef.current} ${text}` : text
+        );
+      }
+    });
+    return () => { unlistenInterim.then((fn) => fn()); };
+  }, []);
 
   const handleToggleRecording = useCallback(async () => {
     const currentStatus = statusRef.current;
@@ -249,6 +301,7 @@ function App() {
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
       if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
+      if (typeof settings.streaming_enabled === "boolean") setStreamingEnabled(settings.streaming_enabled);
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
@@ -284,13 +337,14 @@ function App() {
       vad_enabled: vadEnabled,
       always_on_top: alwaysOnTop,
       autostart_enabled: autostartEnabled,
+      streaming_enabled: streamingEnabled,
       ...overrides,
     };
     // Also sanitize keys in overrides
     if (settings.openai_api_key === "••••••••") settings.openai_api_key = null;
     if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled]);
+  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled]);
 
   async function handleTestApiKey() {
     const activeKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
@@ -354,7 +408,7 @@ function App() {
   const activeApiKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
-  const langLabels: Record<Language, string> = { he: "עברית", en: "English", auto: "אוטומטי" };
+  const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית", auto: "אוטומטי" };
   const modeLabel = transcriptionMode === "api" ? "API" : transcriptionMode === "local" ? "מקומי" : "אוטומטי";
 
   // ---- ONBOARDING WIZARD ----
@@ -606,7 +660,7 @@ function App() {
         <div className="settings-section">
           <h3>שפה</h3>
           <div className="settings-row">
-            {(["he", "en", "auto"] as Language[]).map((lang) => (
+            {(["he", "en", "multi", "auto"] as Language[]).map((lang) => (
               <button
                 key={lang}
                 className={`btn-option ${language === lang ? "active" : ""}`}
@@ -633,6 +687,26 @@ function App() {
               }}
             />
             <span className="toggle-text">עצור כשמפסיקים לדבר (4.5 שניות שקט)</span>
+          </label>
+        </div>
+
+        {/* Streaming — simultaneous transcription via Deepgram WebSocket */}
+        <div className="settings-section">
+          <h3>הכתבה סימולטנית (ניסיוני)</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={streamingEnabled}
+              disabled={apiProvider !== "deepgram"}
+              onChange={() => {
+                const v = !streamingEnabled;
+                setStreamingEnabled(v);
+                persistSettings({ streaming_enabled: v });
+              }}
+            />
+            <span className="toggle-text">
+              תמלול בזמן אמת תוך כדי דיבור (Deepgram בלבד, בלי המתנה לעיבוד בסוף)
+            </span>
           </label>
         </div>
 
@@ -803,6 +877,14 @@ function App() {
           <div className="progress-bar">
             <div className={`progress-fill ${showTimeWarning ? "warning" : ""}`} style={{ width: `${(recordingTime / maxRecordingSecs) * 100}%` }} />
           </div>
+        </div>
+      )}
+
+      {/* Live transcription preview — shows while streaming is active */}
+      {streamingEnabled && (status === "recording" || status === "transcribing") && livePreview && (
+        <div className="live-preview">
+          <div className="live-preview-label">תמלול חי</div>
+          <div className="live-preview-text" dir="auto">{livePreview}</div>
         </div>
       )}
 

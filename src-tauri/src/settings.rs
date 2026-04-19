@@ -55,6 +55,8 @@ pub struct AppSettings {
     pub always_on_top: bool,
     #[serde(default = "default_true")]
     pub autostart_enabled: bool,
+    #[serde(default)]
+    pub streaming_enabled: bool,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -71,6 +73,7 @@ pub struct RedactedSettings {
     pub close_notification_shown: bool,
     pub always_on_top: bool,
     pub autostart_enabled: bool,
+    pub streaming_enabled: bool,
 }
 
 impl AppSettings {
@@ -87,6 +90,7 @@ impl AppSettings {
             close_notification_shown: self.close_notification_shown,
             always_on_top: self.always_on_top,
             autostart_enabled: self.autostart_enabled,
+            streaming_enabled: self.streaming_enabled,
         }
     }
 }
@@ -117,6 +121,7 @@ impl Default for AppSettings {
             close_notification_shown: false,
             always_on_top: true,
             autostart_enabled: true,
+            streaming_enabled: false,
         }
     }
 }
