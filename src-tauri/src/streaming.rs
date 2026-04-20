@@ -149,6 +149,18 @@ async fn handle_message(raw: &str, final_text: &Arc<Mutex<String>>, app: &AppHan
     }
 
     if is_final {
+        // Inject this segment into the active text field immediately so the user
+        // sees dictation appear in their target app as they speak (live streaming).
+        // A trailing space separates consecutive segments.
+        let to_inject = format!("{} ", transcript);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = crate::injector::inject_text(
+                &to_inject,
+                &crate::injector::InjectionMethod::Clipboard,
+            );
+        })
+        .await;
+
         let mut acc = final_text.lock().await;
         if !acc.is_empty() {
             acc.push(' ');

@@ -384,14 +384,23 @@ fn set_window_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String>
 
 /// Show the floating toolbar at the bottom-center of the active monitor
 /// and hide the main window (remembered for restore on hide).
-/// No-op if `floating_toolbar_enabled` is false.
+///
+/// `streaming` forces main to hide even when the toolbar itself is disabled —
+/// this keeps focus on the user's target app so live injection lands there,
+/// not in our own window.
 #[tauri::command]
-fn show_toolbar_window(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    let enabled = {
+fn show_toolbar_window(
+    app: AppHandle,
+    state: State<AppState>,
+    streaming: bool,
+) -> Result<(), String> {
+    let toolbar_enabled = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
         s.floating_toolbar_enabled
     };
-    if !enabled {
+
+    let should_hide_main = toolbar_enabled || streaming;
+    if !should_hide_main {
         return Ok(());
     }
 
@@ -408,33 +417,36 @@ fn show_toolbar_window(app: AppHandle, state: State<AppState>) -> Result<(), Str
         .main_was_visible_before_toolbar
         .store(was_visible, Ordering::Relaxed);
 
-    // Bottom-center of the monitor containing main (fallback: primary).
-    let monitor = main
-        .as_ref()
-        .and_then(|w| w.current_monitor().ok().flatten())
-        .or_else(|| toolbar.primary_monitor().ok().flatten());
+    if toolbar_enabled {
+        // Bottom-center of the monitor containing main (fallback: primary).
+        let monitor = main
+            .as_ref()
+            .and_then(|w| w.current_monitor().ok().flatten())
+            .or_else(|| toolbar.primary_monitor().ok().flatten());
 
-    if let Some(mon) = monitor {
-        let scale = mon.scale_factor();
-        let mon_size = mon.size();
-        let mon_pos = mon.position();
-        let logical_w = mon_size.width as f64 / scale;
-        let logical_h = mon_size.height as f64 / scale;
-        let logical_x = mon_pos.x as f64 / scale;
-        let logical_y = mon_pos.y as f64 / scale;
+        if let Some(mon) = monitor {
+            let scale = mon.scale_factor();
+            let mon_size = mon.size();
+            let mon_pos = mon.position();
+            let logical_w = mon_size.width as f64 / scale;
+            let logical_h = mon_size.height as f64 / scale;
+            let logical_x = mon_pos.x as f64 / scale;
+            let logical_y = mon_pos.y as f64 / scale;
 
-        let toolbar_w = 360.0_f64;
-        let toolbar_h = 56.0_f64;
-        let x = logical_x + (logical_w - toolbar_w) / 2.0;
-        let y = logical_y + logical_h - toolbar_h - 80.0;
-        let _ = toolbar.set_position(tauri::LogicalPosition::new(x, y));
+            let toolbar_w = 360.0_f64;
+            let toolbar_h = 56.0_f64;
+            let x = logical_x + (logical_w - toolbar_w) / 2.0;
+            let y = logical_y + logical_h - toolbar_h - 80.0;
+            let _ = toolbar.set_position(tauri::LogicalPosition::new(x, y));
+        }
+
+        let _ = toolbar.set_always_on_top(true);
+        let _ = toolbar.show();
     }
 
     if let Some(w) = &main {
         let _ = w.hide();
     }
-    let _ = toolbar.set_always_on_top(true);
-    let _ = toolbar.show();
 
     Ok(())
 }

@@ -146,8 +146,9 @@ function App() {
 
     try {
       if (streamingEnabledRef.current) {
-        // Streaming mode: the WebSocket already transcribed during recording;
-        // stop_streaming_transcription flushes pending finals and returns the accumulated text.
+        // Streaming mode: each final segment was injected incrementally via
+        // the streaming receive task (live dictation). The accumulated text is
+        // returned here only for UI display (editable transcript + history).
         const text = await invoke("stop_streaming_transcription") as string;
         setLivePreview("");
         liveFinalRef.current = "";
@@ -155,7 +156,6 @@ function App() {
           setTranscript(text);
           setEditableTranscript(text);
           setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
-          await injectText(text);
         }
       } else {
         const samples = await invoke("stop_recording") as number[];
@@ -198,7 +198,7 @@ function App() {
       // Only swap to the toolbar once the backend accepted the start — avoids
       // leaving the main window hidden behind a toolbar if start_* fails.
       await emit("toolbar-reset").catch(() => {});
-      await invoke("show_toolbar_window").catch(() => {});
+      await invoke("show_toolbar_window", { streaming: streamingEnabledRef.current }).catch(() => {});
       setStatus("recording");
       setRecordingTime(0);
       timerRef.current = window.setInterval(() => {
