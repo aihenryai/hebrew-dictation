@@ -7,6 +7,7 @@ mod streaming;
 mod whisper;
 
 use audio::AudioRecorder;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconEvent;
@@ -24,6 +25,9 @@ struct AppState {
     whisper_engine: Mutex<Option<whisper::WhisperEngine>>,
     settings: Mutex<settings::AppSettings>,
     streaming: tokio::sync::Mutex<Option<ActiveStreaming>>,
+    /// Tracks whether the main window was visible when the floating toolbar
+    /// took over, so we can restore it to the same state when recording stops.
+    main_was_visible_before_toolbar: AtomicBool,
 }
 
 #[tauri::command]
@@ -378,6 +382,83 @@ fn set_window_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String>
     Ok(())
 }
 
+/// Show the floating toolbar at the bottom-center of the active monitor
+/// and hide the main window (remembered for restore on hide).
+/// No-op if `floating_toolbar_enabled` is false.
+#[tauri::command]
+fn show_toolbar_window(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let enabled = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        s.floating_toolbar_enabled
+    };
+    if !enabled {
+        return Ok(());
+    }
+
+    let main = app.get_webview_window("main");
+    let toolbar = app
+        .get_webview_window("toolbar")
+        .ok_or_else(|| "toolbar window not found".to_string())?;
+
+    let was_visible = main
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    state
+        .main_was_visible_before_toolbar
+        .store(was_visible, Ordering::Relaxed);
+
+    // Bottom-center of the monitor containing main (fallback: primary).
+    let monitor = main
+        .as_ref()
+        .and_then(|w| w.current_monitor().ok().flatten())
+        .or_else(|| toolbar.primary_monitor().ok().flatten());
+
+    if let Some(mon) = monitor {
+        let scale = mon.scale_factor();
+        let mon_size = mon.size();
+        let mon_pos = mon.position();
+        let logical_w = mon_size.width as f64 / scale;
+        let logical_h = mon_size.height as f64 / scale;
+        let logical_x = mon_pos.x as f64 / scale;
+        let logical_y = mon_pos.y as f64 / scale;
+
+        let toolbar_w = 360.0_f64;
+        let toolbar_h = 56.0_f64;
+        let x = logical_x + (logical_w - toolbar_w) / 2.0;
+        let y = logical_y + logical_h - toolbar_h - 80.0;
+        let _ = toolbar.set_position(tauri::LogicalPosition::new(x, y));
+    }
+
+    if let Some(w) = &main {
+        let _ = w.hide();
+    }
+    let _ = toolbar.set_always_on_top(true);
+    let _ = toolbar.show();
+
+    Ok(())
+}
+
+/// Hide the floating toolbar and restore the main window if it was visible
+/// before the toolbar took over.
+#[tauri::command]
+fn hide_toolbar_window(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if let Some(t) = app.get_webview_window("toolbar") {
+        let _ = t.hide();
+    }
+
+    if state
+        .main_was_visible_before_toolbar
+        .swap(false, Ordering::Relaxed)
+    {
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.show();
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -458,6 +539,7 @@ pub fn run() {
             whisper_engine: Mutex::new(None),
             settings: Mutex::new(settings::load_settings()),
             streaming: tokio::sync::Mutex::new(None),
+            main_was_visible_before_toolbar: AtomicBool::new(false),
         })
         .setup(|app| {
             setup_global_shortcuts(app.handle());
@@ -525,6 +607,8 @@ pub fn run() {
             get_audio_devices,
             set_window_always_on_top,
             set_autostart_enabled,
+            show_toolbar_window,
+            hide_toolbar_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

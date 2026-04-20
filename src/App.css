@@ -1102,3 +1102,88 @@ button {
   font-size: 0.8rem;
 }
 
+/* ===== FLOATING TOOLBAR (separate window `toolbar`) ===== */
+
+/* Body must be transparent for the rounded-pill layout to show through. */
+html:has(.toolbar-view),
+body:has(.toolbar-view) {
+  background: transparent !important;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body:has(.toolbar-view) #root {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+}
+
+.toolbar-view {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: calc(100% - 8px);
+  height: calc(100% - 8px);
+  padding: 0.4rem 0.9rem;
+  box-sizing: border-box;
+  background: rgba(22, 22, 34, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 28px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  color: #e8e8e8;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.toolbar-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff3b5c;
+  box-shadow: 0 0 6px rgba(255, 59, 92, 0.6);
+  flex: 0 0 auto;
+  animation: toolbar-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes toolbar-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+
+.toolbar-live {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  color: #d8d8d8;
+}
+
+.toolbar-stop {
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  color: #fff;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease;
+}
+
+.toolbar-stop:hover {
+  background: rgba(255, 59, 92, 0.35);
+}
+
+.toolbar-stop:active {
+  background: rgba(255, 59, 92, 0.55);
+}
+

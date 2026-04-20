@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import "./App.css";
 
 type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loading-model";
@@ -23,6 +23,7 @@ interface AppSettings {
   always_on_top?: boolean;
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
+  floating_toolbar_enabled?: boolean;
 }
 
 /** Redacted settings returned from the backend (keys replaced with booleans). */
@@ -39,6 +40,7 @@ interface RedactedSettings {
   always_on_top?: boolean;
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
+  floating_toolbar_enabled?: boolean;
 }
 
 interface InterimPayload {
@@ -91,6 +93,7 @@ function App() {
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(true);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
+  const [floatingToolbarEnabled, setFloatingToolbarEnabled] = useState(true);
   const [livePreview, setLivePreview] = useState("");
   const [copiedHistoryId, setCopiedHistoryId] = useState<number | null>(null);
   const pendingCloseTipRef = useRef(false);
@@ -173,6 +176,7 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
+    await invoke("hide_toolbar_window").catch(() => {});
     setStatus("idle");
     setRecordingTime(0);
   }, [stopVadPolling, stopTimer, injectText]);
@@ -191,6 +195,10 @@ function App() {
       } else {
         await invoke("start_recording");
       }
+      // Only swap to the toolbar once the backend accepted the start — avoids
+      // leaving the main window hidden behind a toolbar if start_* fails.
+      await emit("toolbar-reset").catch(() => {});
+      await invoke("show_toolbar_window").catch(() => {});
       setStatus("recording");
       setRecordingTime(0);
       timerRef.current = window.setInterval(() => {
@@ -303,6 +311,7 @@ function App() {
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
       if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
       if (typeof settings.streaming_enabled === "boolean") setStreamingEnabled(settings.streaming_enabled);
+      if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
@@ -349,13 +358,14 @@ function App() {
       always_on_top: alwaysOnTop,
       autostart_enabled: autostartEnabled,
       streaming_enabled: streamingEnabled,
+      floating_toolbar_enabled: floatingToolbarEnabled,
       ...overrides,
     };
     // Also sanitize keys in overrides
     if (settings.openai_api_key === "••••••••") settings.openai_api_key = null;
     if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled]);
+  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
 
   async function handleTestApiKey() {
     const activeKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
@@ -739,6 +749,23 @@ function App() {
           </label>
         </div>
 
+        {/* Floating toolbar */}
+        <div className="settings-section">
+          <h3>פס כלים צף בזמן הקלטה</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={floatingToolbarEnabled}
+              onChange={() => {
+                const v = !floatingToolbarEnabled;
+                setFloatingToolbarEnabled(v);
+                persistSettings({ floating_toolbar_enabled: v });
+              }}
+            />
+            <span className="toggle-text">הצג פס מיני תחתון בזמן ההקלטה (מחליף את החלון הראשי)</span>
+          </label>
+        </div>
+
         {/* Autostart */}
         <div className="settings-section">
           <h3>הפעלה אוטומטית בעלייה</h3>
@@ -959,3 +986,61 @@ function App() {
 }
 
 export default App;
+
+/**
+ * Compact floating toolbar shown during recording (window `toolbar`).
+ * Display-only: listens to transcription events for live preview, and emits
+ * `hotkey-pressed` when the user clicks stop so the main window handles it.
+ */
+export function ToolbarApp() {
+  const [livePreview, setLivePreview] = useState("");
+  const liveFinalRef = useRef("");
+
+  useEffect(() => {
+    const unlistenInterim = listen<InterimPayload>("transcription-interim", (event) => {
+      const { text, is_final } = event.payload;
+      if (!text) return;
+      if (is_final) {
+        liveFinalRef.current = liveFinalRef.current
+          ? `${liveFinalRef.current} ${text}`
+          : text;
+        setLivePreview(liveFinalRef.current);
+      } else {
+        setLivePreview(
+          liveFinalRef.current ? `${liveFinalRef.current} ${text}` : text
+        );
+      }
+    });
+    const unlistenReset = listen("toolbar-reset", () => {
+      liveFinalRef.current = "";
+      setLivePreview("");
+    });
+    return () => {
+      unlistenInterim.then((fn) => fn());
+      unlistenReset.then((fn) => fn());
+    };
+  }, []);
+
+  const handleStop = useCallback(async () => {
+    // Re-use main's hotkey handler — it already toggles recording state.
+    await emit("hotkey-pressed", "toolbar");
+  }, []);
+
+  return (
+    <div className="toolbar-view" dir="rtl">
+      <span className="toolbar-dot" aria-hidden="true" />
+      <span className="toolbar-live" dir="auto">
+        {livePreview || "מקליט..."}
+      </span>
+      <button
+        type="button"
+        className="toolbar-stop"
+        onClick={handleStop}
+        title="עצור"
+        aria-label="עצור"
+      >
+        ⏹
+      </button>
+    </div>
+  );
+}

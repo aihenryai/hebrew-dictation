@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "הכתבה בעברית",
         "width": 300,
         "height": 260,
@@ -21,6 +22,21 @@
         "visible": true,
         "decorations": true,
         "alwaysOnTop": true
+      },
+      {
+        "label": "toolbar",
+        "title": "Dictation Toolbar",
+        "url": "index.html?window=toolbar",
+        "width": 360,
+        "height": 56,
+        "resizable": false,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "shadow": false
       }
     ],
     "security": {
