@@ -9,12 +9,28 @@
 .container {
   margin: 0 auto;
   padding: 1rem 1.25rem;
+  /* Grow with the window (user can resize), but cap for readable line lengths */
+  width: 100%;
   max-width: 340px;
   text-align: center;
+  box-sizing: border-box;
 }
 
 .container.compact {
   padding: 0.5rem 0.75rem;
+}
+
+/* When the user enlarges the window, expand content but keep lines readable */
+@media (min-width: 520px) {
+  .container {
+    max-width: 560px;
+  }
+}
+
+@media (min-width: 780px) {
+  .container {
+    max-width: 760px;
+  }
 }
 
 h1 {
