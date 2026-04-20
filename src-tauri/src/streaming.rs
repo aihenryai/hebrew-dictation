@@ -168,11 +168,14 @@ async fn handle_message(raw: &str, final_text: &Arc<Mutex<String>>, app: &AppHan
 fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error as WsErr;
     match e {
-        WsErr::Http(resp) if resp.status().as_u16() == 401 => {
-            "API key invalid — check your Deepgram key in settings".to_string()
-        }
-        WsErr::Http(resp) => format!("Deepgram streaming error: HTTP {}", resp.status()),
-        WsErr::Io(io) => format!("Cannot connect to Deepgram — {}", io),
-        _ => format!("Streaming error: {}", e),
+        WsErr::Http(resp) => match resp.status().as_u16() {
+            401 | 403 => "מפתח Deepgram לא תקין — עדכן אותו בהגדרות".to_string(),
+            402 => "נגמר הקרדיט ב-Deepgram — צור חשבון חדש או הוסף קרדיט בלוח הבקרה".to_string(),
+            429 => "חרגת ממגבלת השימוש ב-Deepgram — נסה שוב בעוד רגע".to_string(),
+            400 => "Deepgram דחה את הבקשה (400) — ייתכן שפת תמלול לא נתמכת במצב streaming".to_string(),
+            code => format!("שגיאת Deepgram (HTTP {})", code),
+        },
+        WsErr::Io(io) => format!("אין חיבור ל-Deepgram — {}", io),
+        _ => format!("שגיאת streaming: {}", e),
     }
 }

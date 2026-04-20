@@ -92,6 +92,7 @@ function App() {
   const [autostartEnabled, setAutostartEnabled] = useState(true);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
   const [livePreview, setLivePreview] = useState("");
+  const [copiedHistoryId, setCopiedHistoryId] = useState<number | null>(null);
   const pendingCloseTipRef = useRef(false);
   const statusRef = useRef(status);
   const vadEnabledRef = useRef(vadEnabled);
@@ -306,7 +307,17 @@ function App() {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
       }
-      needsOnboarding = !settings.onboarding_completed;
+      // Skip the wizard if the user already has a working setup — either they've saved
+      // an API key (via settings directly) or a local whisper model will be available below.
+      // The flag is the source of truth once set; we backfill below for legacy installs.
+      const hasKey = settings.has_openai_key || settings.has_deepgram_key;
+      needsOnboarding = !settings.onboarding_completed && !hasKey;
+
+      // Backfill the flag so future launches don't recheck (and so it's consistent
+      // with the user's saved config even if they never completed the wizard UI).
+      if (hasKey && !settings.onboarding_completed) {
+        try { await invoke("mark_onboarding_complete"); } catch { /* ok */ }
+      }
     } catch { /* defaults */ }
 
     if (needsOnboarding) setView("onboarding");
@@ -915,9 +926,26 @@ function App() {
         <div className="history-section">
           <h3>היסטוריה:</h3>
           {history.slice(1).map((h) => (
-            <p key={h.id} className="history-item" onClick={() => navigator.clipboard.writeText(h.text)} title="העתק">
-              {h.text}
-            </p>
+            <div key={h.id} className="history-item">
+              <span className="history-item-text">{h.text}</span>
+              <button
+                type="button"
+                className={`history-copy-btn ${copiedHistoryId === h.id ? "copied" : ""}`}
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(h.text);
+                    setCopiedHistoryId(h.id);
+                    window.setTimeout(() => {
+                      setCopiedHistoryId((cur) => (cur === h.id ? null : cur));
+                    }, 1500);
+                  } catch { /* clipboard denied */ }
+                }}
+                title="העתק"
+                aria-label="העתק"
+              >
+                {copiedHistoryId === h.id ? "✓ הועתק" : "📋 העתק"}
+              </button>
+            </div>
           ))}
         </div>
       )}

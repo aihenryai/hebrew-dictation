@@ -44,19 +44,33 @@ fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 
 fn api_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
-        "API timeout — try a shorter recording or check your connection".to_string()
+        "פג תוקף הבקשה — נסה הקלטה קצרה יותר או בדוק את החיבור".to_string()
     } else if e.is_connect() {
-        "Cannot connect to API — check your internet connection".to_string()
+        "אין חיבור לאינטרנט — בדוק את החיבור ונסה שוב".to_string()
     } else {
-        format!("API request failed: {}", e)
+        format!("שגיאת רשת: {}", e)
     }
 }
 
 fn status_error(status: reqwest::StatusCode, body: &str) -> String {
     match status.as_u16() {
-        401 | 403 => "API key invalid — check your key in settings".to_string(),
-        429 => "API rate limited — try again in a moment".to_string(),
-        _ => format!("API error {}: {}", status.as_u16(), body),
+        401 | 403 => "מפתח ה-API לא תקין — עדכן אותו בהגדרות".to_string(),
+        402 => "נגמר הקרדיט ב-Deepgram — צור חשבון חדש או הוסף קרדיט בלוח הבקרה".to_string(),
+        429 => "חרגת ממגבלת השימוש — נסה שוב בעוד רגע".to_string(),
+        400 => format!("בקשה לא תקינה ל-API — ייתכן שההקלטה ריקה או קצרה מדי ({})", truncate_body(body)),
+        500..=599 => "שרת ה-API לא זמין כרגע — נסה שוב בעוד רגע".to_string(),
+        _ => format!("שגיאת API ({}): {}", status.as_u16(), truncate_body(body)),
+    }
+}
+
+fn truncate_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() > 160 {
+        let mut t: String = trimmed.chars().take(160).collect();
+        t.push('…');
+        t
+    } else {
+        trimmed.to_string()
     }
 }
 

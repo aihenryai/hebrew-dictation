@@ -71,7 +71,7 @@ fn transcribe_local(state: &State<AppState>, samples: &[f32], lang: &str) -> Res
     let engine = state.whisper_engine.lock().map_err(|e| e.to_string())?;
     match engine.as_ref() {
         Some(engine) => engine.transcribe(samples, lang),
-        None => Err("Whisper engine not loaded. Please download a model first.".to_string()),
+        None => Err("המודל המקומי לא טעון — הורד מודל Whisper מההגדרות לפני תמלול מקומי".to_string()),
     }
 }
 
@@ -124,7 +124,7 @@ async fn start_streaming_transcription(
     {
         let guard = state.streaming.lock().await;
         if guard.is_some() {
-            return Err("Streaming session already active".to_string());
+            return Err("כבר פעיל חיבור streaming קיים — המתן רגע ונסה שוב".to_string());
         }
     }
 
@@ -211,7 +211,7 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
     };
 
     let Some(active) = active else {
-        return Err("No active streaming session".to_string());
+        return Err("אין חיבור streaming פעיל".to_string());
     };
 
     // Drop the sender so the dispatch task terminates when the channel drains.
@@ -314,6 +314,19 @@ fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) 
 async fn test_api_key(provider: settings::ApiProvider, api_key: String) -> Result<String, String> {
     api_transcribe::test_api_key(&provider, &api_key).await?;
     Ok("ok".to_string())
+}
+
+/// Mark the onboarding wizard as completed without disturbing any other settings.
+/// Used to backfill the flag for users who configured keys directly in the settings
+/// view and should not see the wizard on every launch.
+#[tauri::command]
+fn mark_onboarding_complete(state: State<AppState>) -> Result<(), String> {
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    if !s.onboarding_completed {
+        s.onboarding_completed = true;
+        settings::save_settings(&s)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -498,6 +511,7 @@ pub fn run() {
             transcribe,
             start_streaming_transcription,
             stop_streaming_transcription,
+            mark_onboarding_complete,
             load_whisper_model,
             is_whisper_loaded,
             is_model_downloaded,
