@@ -1102,6 +1102,53 @@ button {
   font-size: 0.8rem;
 }
 
+/* ===== UPDATE BANNER ===== */
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.6rem;
+  background: linear-gradient(135deg, rgba(77, 166, 255, 0.18), rgba(77, 166, 255, 0.06));
+  border: 1px solid rgba(77, 166, 255, 0.35);
+  border-radius: 10px;
+  font-size: 0.78rem;
+  color: #d8eaff;
+}
+
+.update-banner.installing {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.4rem;
+}
+
+.update-banner.installing span {
+  text-align: center;
+}
+
+.btn-update-install {
+  background: #4da6ff;
+  color: #0b1024;
+  border: none;
+  padding: 0.25rem 0.8rem;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.75rem;
+  transition: background 0.15s ease;
+}
+
+.btn-update-install:hover:not(:disabled) {
+  background: #6bb5ff;
+}
+
+.btn-update-install:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ===== FLOATING TOOLBAR (separate window `toolbar`) ===== */
 
 /* Body must be transparent for the rounded-pill layout to show through. */

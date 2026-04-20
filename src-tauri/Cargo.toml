@@ -1,6 +1,6 @@
 [package]
 name = "hebrew-dictation"
-version = "2.2.1"
+version = "2.2.2"
 description = "הכתבה בעברית — Hebrew Voice Dictation by BinTech AI"
 authors = ["Henry Stauber <henrystauber22@gmail.com>"]
 edition = "2021"
@@ -31,3 +31,5 @@ arboard = "3"
 sysinfo = "0.33"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 url = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

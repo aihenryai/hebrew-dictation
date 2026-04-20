@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
+import { check, Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loading-model";
@@ -96,6 +98,10 @@ function App() {
   const [floatingToolbarEnabled, setFloatingToolbarEnabled] = useState(true);
   const [livePreview, setLivePreview] = useState("");
   const [copiedHistoryId, setCopiedHistoryId] = useState<number | null>(null);
+  const [updateAvailable, setUpdateAvailable] = useState<{ version: string } | null>(null);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const updateRef = useRef<Update | null>(null);
   const pendingCloseTipRef = useRef(false);
   const statusRef = useRef(status);
   const vadEnabledRef = useRef(vadEnabled);
@@ -270,6 +276,46 @@ function App() {
       return allModels;
     } catch { return []; }
   }
+
+  // Check for a new release once at startup. Silent on network/endpoint errors.
+  useEffect(() => {
+    (async () => {
+      try {
+        const update = await check();
+        if (update) {
+          updateRef.current = update;
+          setUpdateAvailable({ version: update.version });
+        }
+      } catch {
+        // Offline or endpoint unreachable — ignore, try again next launch.
+      }
+    })();
+  }, []);
+
+  const handleInstallUpdate = useCallback(async () => {
+    const update = updateRef.current;
+    if (!update || updateInstalling) return;
+    setUpdateInstalling(true);
+    setUpdateProgress(0);
+    let contentLength = 0;
+    let downloaded = 0;
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          contentLength = event.data.contentLength ?? 0;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength ?? 0;
+          if (contentLength > 0) {
+            setUpdateProgress(Math.round((downloaded / contentLength) * 100));
+          }
+        }
+      });
+      await relaunch();
+    } catch (e) {
+      setError(`עדכון נכשל: ${e}`);
+      setUpdateInstalling(false);
+    }
+  }, [updateInstalling]);
 
   useEffect(() => {
     initApp();
@@ -863,6 +909,28 @@ function App() {
         <div className="close-tip-banner">
           <span>💡 Alt+D עובד גם כשהחלון סגור</span>
           <button className="btn-close-tip" onClick={dismissCloseTip}>✓</button>
+        </div>
+      )}
+
+      {updateAvailable && !updateInstalling && (
+        <div className="update-banner">
+          <span>🎉 גרסה חדשה {updateAvailable.version} זמינה</span>
+          <button
+            className="btn-update-install"
+            onClick={handleInstallUpdate}
+            disabled={status !== "idle"}
+            title={status !== "idle" ? "סיים את ההקלטה לפני העדכון" : "התקן עדכון"}
+          >
+            התקן
+          </button>
+        </div>
+      )}
+      {updateInstalling && (
+        <div className="update-banner installing">
+          <span>⬇ מוריד עדכון {updateProgress}%</span>
+          <div className="progress-bar">
+            <div className="progress-fill" style={{ width: `${updateProgress}%` }} />
+          </div>
         </div>
       )}
 
