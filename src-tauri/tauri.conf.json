@@ -51,6 +51,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "publisher": "BinTech AI",
     "shortDescription": "הכתבה בעברית — Hebrew voice dictation for Windows",
@@ -68,7 +69,10 @@
       "nsis": {
         "displayLanguageSelector": false,
         "installMode": "currentUser",
-        "languages": ["Hebrew"]
+        "languages": ["Hebrew"],
+        "customLanguageFiles": {
+          "Hebrew": "nsis/Hebrew.nsh"
+        }
       }
     }
   },
