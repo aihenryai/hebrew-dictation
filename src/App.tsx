@@ -768,7 +768,7 @@ function App() {
 
         {/* Autostart */}
         <div className="settings-section">
-          <h3>הפעלה אוטומטית בעלייה</h3>
+          <h3>הפעלה אוטומטית בהדלקה</h3>
           <label className="toggle-label">
             <input
               type="checkbox"
@@ -834,7 +834,7 @@ function App() {
         {/* About */}
         <div className="settings-section about-section">
           <h3>אודות</h3>
-          <p className="about-app-name">הכתבה בעברית v2.1</p>
+          <p className="about-app-name">הכתבה בעברית v2.2</p>
           <p className="about-brand">BinTech AI — הנרי שטאובר</p>
           <div className="about-links">
             <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="link-text">🔗 כל הקישורים</a>
