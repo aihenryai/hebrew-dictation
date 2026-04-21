@@ -1,6 +1,6 @@
 [package]
 name = "hebrew-dictation"
-version = "2.2.2"
+version = "2.2.3"
 description = "הכתבה בעברית — Hebrew Voice Dictation by BinTech AI"
 authors = ["Henry Stauber <henrystauber22@gmail.com>"]
 edition = "2021"
