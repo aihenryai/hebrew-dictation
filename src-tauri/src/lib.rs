@@ -309,6 +309,9 @@ fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) 
     if merged.deepgram_api_key.as_ref().is_none_or(|k| k.is_empty()) {
         merged.deepgram_api_key = s.deepgram_api_key.clone();
     }
+    if merged.groq_api_key.as_ref().is_none_or(|k| k.is_empty()) {
+        merged.groq_api_key = s.groq_api_key.clone();
+    }
     settings::save_settings(&merged)?;
     *s = merged;
     Ok(())

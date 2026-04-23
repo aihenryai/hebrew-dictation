@@ -9,7 +9,7 @@ type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loadin
 type AppView = "main" | "settings" | "onboarding";
 type Language = "he" | "en" | "multi" | "auto";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
-type ApiProvider = "open_ai" | "deepgram";
+type ApiProvider = "open_ai" | "deepgram" | "groq";
 
 /** Settings sent to the backend (keys only included when user explicitly changes them). */
 interface AppSettings {
@@ -17,6 +17,7 @@ interface AppSettings {
   api_provider: ApiProvider;
   openai_api_key: string | null;
   deepgram_api_key: string | null;
+  groq_api_key: string | null;
   preferred_model: string;
   language: string;
   vad_enabled: boolean;
@@ -34,6 +35,7 @@ interface RedactedSettings {
   api_provider: ApiProvider;
   has_openai_key: boolean;
   has_deepgram_key: boolean;
+  has_groq_key: boolean;
   preferred_model: string;
   language: string;
   vad_enabled: boolean;
@@ -84,13 +86,15 @@ function App() {
   const [apiProvider, setApiProvider] = useState<ApiProvider>("deepgram");
   const [openaiKey, setOpenaiKey] = useState("");
   const [deepgramKey, setDeepgramKey] = useState("");
+  const [groqKey, setGroqKey] = useState("");
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
   const [testingApiKey, setTestingApiKey] = useState(false);
   const [wizardStep, setWizardStep] = useState(1);
   const [wizardApiKey, setWizardApiKey] = useState("");
   const [wizardKeyValid, setWizardKeyValid] = useState<boolean | null>(null);
   const [wizardKeyTesting, setWizardKeyTesting] = useState(false);
-  const [wizardChoice, setWizardChoice] = useState<"api" | "local" | null>(null);
+  const [wizardChoice, setWizardChoice] = useState<"api" | "groq" | "local" | null>(null);
+  const [wizardProviderKey, setWizardProviderKey] = useState<"deepgram" | "groq">("deepgram");
   const [showCloseTip, setShowCloseTip] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(true);
@@ -354,6 +358,7 @@ function App() {
       // Keys are redacted — just track whether they exist on the backend.
       if (settings.has_openai_key) setOpenaiKey("••••••••");
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
+      if (settings.has_groq_key) setGroqKey("••••••••");
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
       if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
       if (typeof settings.streaming_enabled === "boolean") setStreamingEnabled(settings.streaming_enabled);
@@ -365,7 +370,7 @@ function App() {
       // Skip the wizard if the user already has a working setup — either they've saved
       // an API key (via settings directly) or a local whisper model will be available below.
       // The flag is the source of truth once set; we backfill below for legacy installs.
-      const hasKey = settings.has_openai_key || settings.has_deepgram_key;
+      const hasKey = settings.has_openai_key || settings.has_deepgram_key || settings.has_groq_key;
       needsOnboarding = !settings.onboarding_completed && !hasKey;
 
       // Backfill the flag so future launches don't recheck (and so it's consistent
@@ -398,6 +403,7 @@ function App() {
       api_provider: apiProvider,
       openai_api_key: sanitizeKey(openaiKey),
       deepgram_api_key: sanitizeKey(deepgramKey),
+      groq_api_key: sanitizeKey(groqKey),
       preferred_model: selectedModel,
       language: language,
       vad_enabled: vadEnabled,
@@ -410,11 +416,12 @@ function App() {
     // Also sanitize keys in overrides
     if (settings.openai_api_key === "••••••••") settings.openai_api_key = null;
     if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
+    if (settings.groq_api_key === "••••••••") settings.groq_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
+  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, groqKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
 
   async function handleTestApiKey() {
-    const activeKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
+    const activeKey = apiProvider === "open_ai" ? openaiKey : apiProvider === "groq" ? groqKey : deepgramKey;
     if (!activeKey) return;
     setTestingApiKey(true);
     setApiKeyValid(null);
@@ -472,7 +479,7 @@ function App() {
   const maxRecordingSecs = transcriptionMode === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
   const timeRemaining = maxRecordingSecs - recordingTime;
   const showTimeWarning = status === "recording" && timeRemaining <= 10;
-  const activeApiKey = apiProvider === "open_ai" ? openaiKey : deepgramKey;
+  const activeApiKey = apiProvider === "open_ai" ? openaiKey : apiProvider === "groq" ? groqKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
   const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית", auto: "אוטומטי" };
@@ -485,7 +492,7 @@ function App() {
       setWizardKeyTesting(true);
       setWizardKeyValid(null);
       try {
-        await invoke("test_api_key", { provider: "deepgram" as ApiProvider, apiKey: wizardApiKey });
+        await invoke("test_api_key", { provider: wizardProviderKey as ApiProvider, apiKey: wizardApiKey });
         setWizardKeyValid(true);
       } catch { setWizardKeyValid(false); }
       setWizardKeyTesting(false);
@@ -500,6 +507,16 @@ function App() {
           onboarding_completed: true,
           deepgram_api_key: wizardApiKey,
           api_provider: "deepgram",
+          transcription_mode: "api",
+        });
+      } else if (wizardChoice === "groq" && wizardApiKey) {
+        setGroqKey(wizardApiKey);
+        setApiProvider("groq");
+        setTranscriptionMode("api");
+        await persistSettings({
+          onboarding_completed: true,
+          groq_api_key: wizardApiKey,
+          api_provider: "groq",
           transcription_mode: "api",
         });
       } else if (wizardChoice === "local") {
@@ -541,13 +558,25 @@ function App() {
 
             <div
               className={`wizard-card ${wizardChoice === "api" ? "selected" : ""}`}
-              onClick={() => setWizardChoice("api")}
+              onClick={() => {
+                setWizardChoice("api");
+                setWizardProviderKey("deepgram");
+                setWizardApiKey("");
+                setWizardKeyValid(null);
+              }}
             >
               <div className="wizard-card-header">
-                <strong>☁️ API — מהיר ומדויק</strong>
+                <strong>☁️ Deepgram — מהיר ומדויק</strong>
                 <span className="wizard-card-badge">מומלץ</span>
               </div>
-              <p className="wizard-card-desc">תמלול בענן דרך Deepgram. חינם לניסיון ($200 קרדיט).</p>
+              <p className="wizard-card-desc">תמלול בענן דרך Deepgram Nova-3. הדיוק הגבוה ביותר בעברית.</p>
+              <ul className="wizard-card-facts">
+                <li>✅ <strong>~50 שעות חינם</strong> עם $200 קרדיט של Deepgram</li>
+                <li>✅ <strong>ללא כרטיס אשראי</strong> — אי אפשר לחייב אותך בטעות</li>
+                <li>✅ מהירות: 1-2 שניות מסוף הדיבור לטקסט</li>
+                <li>⚠ דורש אינטרנט + האודיו נשלח ל-Deepgram</li>
+                <li>💡 כשהקרדיט נגמר — אפשר לעבור ל-Groq (זול פי 5) או למצב מקומי</li>
+              </ul>
               {wizardChoice === "api" && (
                 <div className="wizard-guide">
                   <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
@@ -558,7 +587,7 @@ function App() {
                         deepgram.com — הרשמה
                       </a>
                     </li>
-                    <li>צור חשבון חינם (אימייל או Google)</li>
+                    <li>צור חשבון חינם (אימייל או Google) — <strong>בלי כרטיס אשראי</strong></li>
                     <li>לחץ <strong>Create API Key</strong> בדף הראשי</li>
                     <li>העתק את המפתח והדבק כאן:</li>
                   </ol>
@@ -568,7 +597,7 @@ function App() {
                       className="api-key-input"
                       value={wizardApiKey}
                       onChange={(e) => { setWizardApiKey(e.target.value); setWizardKeyValid(null); }}
-                      placeholder="הדבק מפתח API..."
+                      placeholder="הדבק מפתח Deepgram..."
                     />
                     <button
                       className={`btn-test ${wizardKeyValid === true ? "valid" : wizardKeyValid === false ? "invalid" : ""}`}
@@ -588,14 +617,82 @@ function App() {
             </div>
 
             <div
+              className={`wizard-card ${wizardChoice === "groq" ? "selected" : ""}`}
+              onClick={() => {
+                setWizardChoice("groq");
+                setWizardProviderKey("groq");
+                setWizardApiKey("");
+                setWizardKeyValid(null);
+              }}
+            >
+              <div className="wizard-card-header">
+                <strong>⚡ Groq — הכי זול</strong>
+                <span className="wizard-card-badge">חלופה זולה</span>
+              </div>
+              <p className="wizard-card-desc">Whisper Turbo דרך Groq. פי 5 יותר זול מ-Deepgram.</p>
+              <ul className="wizard-card-facts">
+                <li>✅ <strong>~$0.04/שעה</strong> — הזול בשוק (Free tier מוגבל)</li>
+                <li>✅ מהירות: 1-2 שניות</li>
+                <li>⚠ דיוק בעברית מעט נמוך מ-Deepgram</li>
+                <li>⚠ ללא streaming (תמלול רק אחרי שלוחצים ״עצור״)</li>
+                <li>💡 מתאים אחרי שה-$200 של Deepgram נגמרים</li>
+              </ul>
+              {wizardChoice === "groq" && (
+                <div className="wizard-guide">
+                  <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
+                  <ol>
+                    <li>
+                      לחץ כאן →{" "}
+                      <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">
+                        console.groq.com/keys
+                      </a>
+                    </li>
+                    <li>התחבר עם Google / GitHub / Email</li>
+                    <li>לחץ <strong>Create API Key</strong></li>
+                    <li>העתק את המפתח (מתחיל ב-<code>gsk_</code>) והדבק כאן:</li>
+                  </ol>
+                  <div className="api-key-row">
+                    <input
+                      type="password"
+                      className="api-key-input"
+                      value={wizardApiKey}
+                      onChange={(e) => { setWizardApiKey(e.target.value); setWizardKeyValid(null); }}
+                      placeholder="gsk_..."
+                    />
+                    <button
+                      className={`btn-test ${wizardKeyValid === true ? "valid" : wizardKeyValid === false ? "invalid" : ""}`}
+                      onClick={handleWizardTestKey}
+                      disabled={wizardKeyTesting || !wizardApiKey}
+                    >
+                      {wizardKeyTesting ? "..." : wizardKeyValid === true ? "✓" : wizardKeyValid === false ? "✗" : "בדוק"}
+                    </button>
+                  </div>
+                  {wizardKeyValid === true && <p className="settings-note success-note">✅ המפתח תקין!</p>}
+                  {wizardKeyValid === false && <p className="settings-note error-note">❌ המפתח לא תקין</p>}
+                  <p className="wizard-note" style={{ fontSize: "0.7rem", marginTop: "0.3rem" }}>
+                    💡 המפתח נשמר רק אצלך במחשב. לא נשלח לשום מקום חוץ מ-Groq.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div
               className={`wizard-card ${wizardChoice === "local" ? "selected" : ""}`}
               onClick={() => setWizardChoice("local")}
             >
               <div className="wizard-card-header">
                 <strong>💻 מקומי — פרטיות מלאה</strong>
-                <span className="wizard-card-badge">ללא אינטרנט</span>
+                <span className="wizard-card-badge">חינם לעד</span>
               </div>
-              <p className="wizard-card-desc">תמלול על המחשב. ללא שליחת נתונים. דורש הורדת מודל.</p>
+              <p className="wizard-card-desc">תמלול Whisper שרץ על המחשב שלך. האודיו לא יוצא החוצה.</p>
+              <ul className="wizard-card-facts">
+                <li>✅ <strong>חינם לעד</strong> — ללא חשבון, ללא קרדיט, ללא הגבלה</li>
+                <li>✅ פרטיות מלאה — האודיו לא עוזב את המחשב</li>
+                <li>✅ עובד אופליין — בלי חיבור לאינטרנט</li>
+                <li>⚠ איטי יותר: 5-10 שניות עיבוד (תלוי בחוזק המחשב)</li>
+                <li>⚠ דורש הורדת מודל חד-פעמית: 75MB עד 1.5GB</li>
+                <li>⚠ דיוק בעברית סביר, אבל נמוך מ-Deepgram</li>
+              </ul>
             </div>
 
             <div className="wizard-nav">
@@ -613,6 +710,8 @@ function App() {
             <div className="wizard-content">
               {wizardChoice === "api" && wizardApiKey ? (
                 <p className="wizard-success">Deepgram מוגדר — תמלול מהיר ומדויק</p>
+              ) : wizardChoice === "groq" && wizardApiKey ? (
+                <p className="wizard-success">Groq מוגדר — תמלול מהיר וזול</p>
               ) : wizardChoice === "local" ? (
                 <p className="wizard-note">מצב מקומי — הורד מודל בהגדרות כדי להתחיל</p>
               ) : (
@@ -653,16 +752,18 @@ function App() {
           <h3>מנוע תמלול</h3>
           <div className="settings-row">
             {([
-              ["api", "API (ענן)"],
-              ["local", "מקומי"],
-              ["auto_fallback", "אוטומטי"],
-            ] as [TranscriptionMode, string][]).map(([mode, label]) => (
+              ["api", "API (ענן)", "מהיר ומדויק, עולה קרדיט"],
+              ["local", "מקומי", "אופליין, איטי יותר"],
+              ["auto_fallback", "אוטומטי", "API אם יש, אחרת מקומי"],
+            ] as [TranscriptionMode, string, string][]).map(([mode, label, sub]) => (
               <button
                 key={mode}
-                className={`btn-option ${transcriptionMode === mode ? "active" : ""}`}
+                className={`btn-option btn-option-stack ${transcriptionMode === mode ? "active" : ""}`}
                 onClick={() => { setTranscriptionMode(mode); persistSettings({ transcription_mode: mode }); }}
+                title={sub}
               >
-                {label}
+                <span className="btn-option-label">{label}</span>
+                <span className="btn-option-sub">{sub}</span>
               </button>
             ))}
           </div>
@@ -675,6 +776,7 @@ function App() {
             <div className="settings-row" style={{ marginBottom: "0.5rem" }}>
               {([
                 ["deepgram", "Deepgram"],
+                ["groq", "Groq"],
                 ["open_ai", "OpenAI"],
               ] as [ApiProvider, string][]).map(([prov, label]) => (
                 <button
@@ -686,22 +788,32 @@ function App() {
                 </button>
               ))}
             </div>
+            <p className="settings-note provider-fact">
+              {apiProvider === "deepgram"
+                ? "💰 $200 קרדיט חינם ≈ 50 שעות הכתבה. ללא כרטיס אשראי. דיוק הכי גבוה בעברית."
+                : apiProvider === "groq"
+                ? "💰 Groq Whisper Turbo: ~$0.04/שעה — הכי זול. יש Free tier מוגבל. ללא streaming."
+                : "💰 OpenAI Whisper: $0.006/דקה ≈ $0.36/שעה. דורש כרטיס אשראי."}
+            </p>
             <div className="api-key-row">
               <input
                 type="password"
                 className="api-key-input"
-                value={apiProvider === "open_ai" ? openaiKey : deepgramKey}
+                value={apiProvider === "open_ai" ? openaiKey : apiProvider === "groq" ? groqKey : deepgramKey}
                 onChange={(e) => {
                   if (apiProvider === "open_ai") setOpenaiKey(e.target.value);
+                  else if (apiProvider === "groq") setGroqKey(e.target.value);
                   else setDeepgramKey(e.target.value);
                   setApiKeyValid(null);
                 }}
                 onBlur={() => persistSettings(
                   apiProvider === "open_ai"
                     ? { openai_api_key: openaiKey || null }
+                    : apiProvider === "groq"
+                    ? { groq_api_key: groqKey || null }
                     : { deepgram_api_key: deepgramKey || null }
                 )}
-                placeholder={apiProvider === "open_ai" ? "sk-..." : "API key..."}
+                placeholder={apiProvider === "open_ai" ? "sk-..." : apiProvider === "groq" ? "gsk_..." : "API key..."}
               />
               <button
                 className={`btn-test ${apiKeyValid === true ? "valid" : apiKeyValid === false ? "invalid" : ""}`}
@@ -713,13 +825,26 @@ function App() {
             </div>
             {apiKeyValid === false && <p className="settings-note error-note">המפתח לא תקין</p>}
             {apiKeyValid === true && <p className="settings-note success-note">המפתח תקין</p>}
-            <p className="settings-note">
-              {apiProvider === "deepgram" ? (
-                <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → deepgram.com</a>
-              ) : (
-                <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="link-text">קבל מפתח → platform.openai.com</a>
-              )}
-            </p>
+            <div className="settings-links-row">
+              <p className="settings-note">
+                {apiProvider === "deepgram" ? (
+                  <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → deepgram.com</a>
+                ) : apiProvider === "groq" ? (
+                  <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → groq.com</a>
+                ) : (
+                  <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="link-text">קבל מפתח → platform.openai.com</a>
+                )}
+              </p>
+              <p className="settings-note">
+                {apiProvider === "deepgram" ? (
+                  <a href="https://console.deepgram.com/project/default/usage" target="_blank" rel="noopener" className="link-text">כמה קרדיט נשאר? →</a>
+                ) : apiProvider === "groq" ? (
+                  <a href="https://console.groq.com/settings/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש →</a>
+                ) : (
+                  <a href="https://platform.openai.com/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש →</a>
+                )}
+              </p>
+            </div>
           </div>
         )}
 

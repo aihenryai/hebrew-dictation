@@ -555,6 +555,53 @@ button {
   color: #fff;
 }
 
+.btn-option-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  padding: 0.4rem 0.6rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.btn-option-stack .btn-option-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.btn-option-stack .btn-option-sub {
+  font-size: 0.65rem;
+  color: #888;
+  line-height: 1.2;
+}
+
+.btn-option-stack.active .btn-option-sub {
+  color: #8cc8ff;
+}
+
+.settings-note.provider-fact {
+  color: #bbb;
+  background: #1f2438;
+  border: 1px solid #2a3055;
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
+  margin: 0.4rem 0;
+}
+
+.settings-links-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.settings-links-row .settings-note {
+  margin: 0.25rem 0;
+  font-size: 0.72rem;
+}
+
 .settings-note {
   color: #888;
   font-size: 0.8rem;
@@ -931,6 +978,24 @@ button {
   color: #888;
   font-size: 0.8rem;
   margin: 0.4rem 0 0;
+}
+
+.wizard-card-facts {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+  text-align: right;
+}
+
+.wizard-card-facts li {
+  color: #bbb;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  margin: 0.2rem 0;
+}
+
+.wizard-card-facts li strong {
+  color: #fff;
 }
 
 .wizard-guide {

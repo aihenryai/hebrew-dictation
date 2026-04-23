@@ -55,7 +55,7 @@ fn api_error(e: &reqwest::Error) -> String {
 fn status_error(status: reqwest::StatusCode, body: &str) -> String {
     match status.as_u16() {
         401 | 403 => "מפתח ה-API לא תקין — עדכן אותו בהגדרות".to_string(),
-        402 => "נגמר הקרדיט ב-Deepgram — צור חשבון חדש או הוסף קרדיט בלוח הבקרה".to_string(),
+        402 => "נגמר הקרדיט אצל ספק ה-API — החלף ספק בהגדרות או הוסף קרדיט בלוח הבקרה".to_string(),
         429 => "חרגת ממגבלת השימוש — נסה שוב בעוד רגע".to_string(),
         400 => format!("בקשה לא תקינה ל-API — ייתכן שההקלטה ריקה או קצרה מדי ({})", truncate_body(body)),
         500..=599 => "שרת ה-API לא זמין כרגע — נסה שוב בעוד רגע".to_string(),
@@ -116,6 +116,59 @@ pub async fn transcribe_openai(
     let text = response.text().await
         .map_err(|e| format!("Failed to read API response: {}", e))?;
     Ok(text.trim().to_string())
+}
+
+// ── Groq Whisper Turbo API ──
+// OpenAI-compatible endpoint, much cheaper (~$0.04/hr vs Deepgram $4/hr).
+// Batch only — no streaming support.
+
+pub async fn transcribe_groq(
+    samples: &[f32],
+    api_key: &str,
+    language: &str,
+) -> Result<String, String> {
+    let wav_data = samples_to_wav(samples, 16000);
+
+    let file_part = multipart::Part::bytes(wav_data)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| format!("Failed to create multipart: {}", e))?;
+
+    let mut form = multipart::Form::new()
+        .part("file", file_part)
+        .text("model", "whisper-large-v3-turbo")
+        .text("response_format", "json");
+
+    // Groq accepts ISO-639-1 codes. "auto" / "multi" → omit to let Whisper auto-detect.
+    if language != "auto" && language != "multi" {
+        form = form.text("language", language.to_string());
+    }
+
+    let response = reqwest::Client::new()
+        .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| api_error(&e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(status_error(status, &body));
+    }
+
+    let body: serde_json::Value = response.json().await
+        .map_err(|e| format!("Failed to parse Groq response: {}", e))?;
+
+    let transcript = body["text"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(transcript)
 }
 
 // ── Deepgram Nova-3 API ──
@@ -188,6 +241,7 @@ pub async fn transcribe_api(
     match provider {
         ApiProvider::OpenAI => transcribe_openai(samples, api_key, lang).await,
         ApiProvider::Deepgram => transcribe_deepgram(samples, api_key, lang).await,
+        ApiProvider::Groq => transcribe_groq(samples, api_key, lang).await,
     }
 }
 

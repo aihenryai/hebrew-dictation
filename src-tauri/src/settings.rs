@@ -23,6 +23,7 @@ impl Default for TranscriptionMode {
 pub enum ApiProvider {
     OpenAI,
     Deepgram,
+    Groq,
 }
 
 impl Default for ApiProvider {
@@ -41,6 +42,8 @@ pub struct AppSettings {
     pub openai_api_key: Option<String>,
     #[serde(default)]
     pub deepgram_api_key: Option<String>,
+    #[serde(default)]
+    pub groq_api_key: Option<String>,
     #[serde(default = "default_preferred_model")]
     pub preferred_model: String,
     #[serde(default = "default_language")]
@@ -68,6 +71,7 @@ pub struct RedactedSettings {
     pub api_provider: ApiProvider,
     pub has_openai_key: bool,
     pub has_deepgram_key: bool,
+    pub has_groq_key: bool,
     pub preferred_model: String,
     pub language: String,
     pub vad_enabled: bool,
@@ -86,6 +90,7 @@ impl AppSettings {
             api_provider: self.api_provider.clone(),
             has_openai_key: self.openai_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             has_deepgram_key: self.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty()),
+            has_groq_key: self.groq_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             preferred_model: self.preferred_model.clone(),
             language: self.language.clone(),
             vad_enabled: self.vad_enabled,
@@ -118,6 +123,7 @@ impl Default for AppSettings {
             api_provider: ApiProvider::default(),
             openai_api_key: None,
             deepgram_api_key: None,
+            groq_api_key: None,
             preferred_model: default_preferred_model(),
             language: default_language(),
             vad_enabled: true,
@@ -136,6 +142,7 @@ impl AppSettings {
         match self.api_provider {
             ApiProvider::OpenAI => self.openai_api_key.as_deref(),
             ApiProvider::Deepgram => self.deepgram_api_key.as_deref(),
+            ApiProvider::Groq => self.groq_api_key.as_deref(),
         }
     }
 }
@@ -172,6 +179,13 @@ pub fn load_settings() -> AppSettings {
         if let Ok(key) = std::env::var("DEEPGRAM_API_KEY") {
             if !key.is_empty() {
                 settings.deepgram_api_key = Some(key);
+            }
+        }
+    }
+    if settings.groq_api_key.is_none() {
+        if let Ok(key) = std::env::var("GROQ_API_KEY") {
+            if !key.is_empty() {
+                settings.groq_api_key = Some(key);
             }
         }
     }
