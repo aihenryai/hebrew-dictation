@@ -361,7 +361,13 @@ function App() {
       if (settings.has_groq_key) setGroqKey("••••••••");
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
       if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
-      if (typeof settings.streaming_enabled === "boolean") setStreamingEnabled(settings.streaming_enabled);
+      if (typeof settings.streaming_enabled === "boolean") {
+        const streamingStale = settings.streaming_enabled && settings.api_provider !== "deepgram";
+        setStreamingEnabled(streamingStale ? false : settings.streaming_enabled);
+        if (streamingStale) {
+          invoke("update_settings", { patch: { streaming_enabled: false } }).catch(() => {});
+        }
+      }
       if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
@@ -513,11 +519,13 @@ function App() {
         setGroqKey(wizardApiKey);
         setApiProvider("groq");
         setTranscriptionMode("api");
+        setStreamingEnabled(false);
         await persistSettings({
           onboarding_completed: true,
           groq_api_key: wizardApiKey,
           api_provider: "groq",
           transcription_mode: "api",
+          streaming_enabled: false,
         });
       } else if (wizardChoice === "local") {
         setTranscriptionMode("local");
@@ -617,6 +625,25 @@ function App() {
             </div>
 
             <div
+              className={`wizard-card ${wizardChoice === "local" ? "selected" : ""}`}
+              onClick={() => setWizardChoice("local")}
+            >
+              <div className="wizard-card-header">
+                <strong>💻 מקומי — פרטיות מלאה</strong>
+                <span className="wizard-card-badge">חינם לעד</span>
+              </div>
+              <p className="wizard-card-desc">תמלול Whisper שרץ על המחשב שלך. האודיו לא יוצא החוצה.</p>
+              <ul className="wizard-card-facts">
+                <li>✅ <strong>חינם לעד</strong> — ללא חשבון, ללא קרדיט, ללא הגבלה</li>
+                <li>✅ פרטיות מלאה — האודיו לא עוזב את המחשב</li>
+                <li>✅ עובד אופליין — בלי חיבור לאינטרנט</li>
+                <li>⚠ איטי יותר: 5-10 שניות עיבוד (תלוי בחוזק המחשב)</li>
+                <li>⚠ דורש הורדת מודל חד-פעמית: 75MB עד 1.5GB</li>
+                <li>⚠ דיוק בעברית סביר, אבל נמוך מ-Deepgram</li>
+              </ul>
+            </div>
+
+            <div
               className={`wizard-card ${wizardChoice === "groq" ? "selected" : ""}`}
               onClick={() => {
                 setWizardChoice("groq");
@@ -626,16 +653,16 @@ function App() {
               }}
             >
               <div className="wizard-card-header">
-                <strong>⚡ Groq — הכי זול</strong>
-                <span className="wizard-card-badge">חלופה זולה</span>
+                <strong>⚡ Groq — חלופה אחרי שה-$200 נגמרים</strong>
+                <span className="wizard-card-badge">חלופה</span>
               </div>
-              <p className="wizard-card-desc">Whisper Turbo דרך Groq. פי 5 יותר זול מ-Deepgram.</p>
+              <p className="wizard-card-desc">Whisper Turbo דרך Groq. ~$0.04/שעה — פי 5 יותר זול מ-Deepgram (אבל פחות מדויק).</p>
               <ul className="wizard-card-facts">
                 <li>✅ <strong>~$0.04/שעה</strong> — הזול בשוק (Free tier מוגבל)</li>
                 <li>✅ מהירות: 1-2 שניות</li>
                 <li>⚠ דיוק בעברית מעט נמוך מ-Deepgram</li>
-                <li>⚠ ללא streaming (תמלול רק אחרי שלוחצים ״עצור״)</li>
-                <li>💡 מתאים אחרי שה-$200 של Deepgram נגמרים</li>
+                <li>⚠ <strong>ללא תמלול סימולטני</strong> (תמלול רק אחרי שלוחצים ״עצור״)</li>
+                <li>💡 רלוונטי בעיקר אחרי שה-$200 של Deepgram ניצלו</li>
               </ul>
               {wizardChoice === "groq" && (
                 <div className="wizard-guide">
@@ -674,25 +701,6 @@ function App() {
                   </p>
                 </div>
               )}
-            </div>
-
-            <div
-              className={`wizard-card ${wizardChoice === "local" ? "selected" : ""}`}
-              onClick={() => setWizardChoice("local")}
-            >
-              <div className="wizard-card-header">
-                <strong>💻 מקומי — פרטיות מלאה</strong>
-                <span className="wizard-card-badge">חינם לעד</span>
-              </div>
-              <p className="wizard-card-desc">תמלול Whisper שרץ על המחשב שלך. האודיו לא יוצא החוצה.</p>
-              <ul className="wizard-card-facts">
-                <li>✅ <strong>חינם לעד</strong> — ללא חשבון, ללא קרדיט, ללא הגבלה</li>
-                <li>✅ פרטיות מלאה — האודיו לא עוזב את המחשב</li>
-                <li>✅ עובד אופליין — בלי חיבור לאינטרנט</li>
-                <li>⚠ איטי יותר: 5-10 שניות עיבוד (תלוי בחוזק המחשב)</li>
-                <li>⚠ דורש הורדת מודל חד-פעמית: 75MB עד 1.5GB</li>
-                <li>⚠ דיוק בעברית סביר, אבל נמוך מ-Deepgram</li>
-              </ul>
             </div>
 
             <div className="wizard-nav">
@@ -782,7 +790,16 @@ function App() {
                 <button
                   key={prov}
                   className={`btn-option ${apiProvider === prov ? "active" : ""}`}
-                  onClick={() => { setApiProvider(prov); setApiKeyValid(null); persistSettings({ api_provider: prov }); }}
+                  onClick={() => {
+                    setApiProvider(prov);
+                    setApiKeyValid(null);
+                    const patch: Record<string, unknown> = { api_provider: prov };
+                    if (prov !== "deepgram" && streamingEnabled) {
+                      setStreamingEnabled(false);
+                      patch.streaming_enabled = false;
+                    }
+                    persistSettings(patch);
+                  }}
                 >
                   {label}
                 </button>

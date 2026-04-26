@@ -131,7 +131,7 @@ impl Default for AppSettings {
             close_notification_shown: false,
             always_on_top: true,
             autostart_enabled: true,
-            streaming_enabled: false,
+            streaming_enabled: true,
             floating_toolbar_enabled: true,
         }
     }

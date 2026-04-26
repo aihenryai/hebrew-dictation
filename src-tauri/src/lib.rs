@@ -148,11 +148,44 @@ async fn start_streaming_transcription(
             .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?
     };
 
-    // Open WebSocket connection. If this fails, we surface the error and nothing is started.
-    let session = streaming::StreamingSession::start(&api_key, &lang, app.clone()).await?;
-
     // Channel to pipe audio chunks from the CPAL callback (sync) to an async dispatcher.
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+
+    // Attach the chunk callback BEFORE starting the recorder, so the very first CPAL
+    // callback (which may fire ~10ms after start) already has somewhere to send audio.
+    {
+        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        let tx_for_cb = audio_tx.clone();
+        recorder.set_chunk_callback(move |chunk: &[f32]| {
+            let _ = tx_for_cb.send(chunk.to_vec());
+        });
+    }
+
+    // Start audio capture IMMEDIATELY — before opening the WebSocket. Audio chunks flow
+    // into `audio_rx` and buffer there during the WS handshake (~300ms). Once the WS is
+    // open below, the dispatch task drains the buffered pre-roll and continues live.
+    // This prevents the "first words lost" bug when the user presses Alt+D and starts
+    // speaking immediately.
+    let start_err = {
+        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.start_recording().err()
+    };
+    if let Some(e) = start_err {
+        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.clear_chunk_callback();
+        return Err(e);
+    }
+
+    // Open WebSocket. If this fails, roll back the recorder we just started.
+    let session = match streaming::StreamingSession::start(&api_key, &lang, app.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+            recorder.clear_chunk_callback();
+            let _ = recorder.stop_recording();
+            return Err(e);
+        }
+    };
 
     let session_for_task = session.clone();
     let dispatch_task = tokio::spawn(async move {
@@ -163,31 +196,6 @@ async fn start_streaming_transcription(
             }
         }
     });
-
-    // Attach the chunk callback to the recorder BEFORE starting so chunks flow immediately.
-    {
-        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        let tx_for_cb = audio_tx.clone();
-        recorder.set_chunk_callback(move |chunk: &[f32]| {
-            let _ = tx_for_cb.send(chunk.to_vec());
-        });
-    }
-
-    // Start audio recording in a scoped block so the MutexGuard is not held across .await below.
-    let start_err = {
-        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        recorder.start_recording().err()
-    };
-    if let Some(e) = start_err {
-        {
-            let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-            recorder.clear_chunk_callback();
-        }
-        drop(audio_tx);
-        dispatch_task.abort();
-        let _ = session.stop().await;
-        return Err(e);
-    }
 
     // Store the active session so stop_streaming_transcription can find it.
     let mut guard = state.streaming.lock().await;
@@ -202,11 +210,17 @@ async fn start_streaming_transcription(
 
 #[tauri::command]
 async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<String, String> {
-    // Stop audio recording (drops the chunk callback activity).
+    // Stop the CPAL stream FIRST. With the chunk callback still wired, the final 10-30ms
+    // of WASAPI-buffered audio is delivered via the callback into `audio_tx` before the
+    // stream is dropped. clear_chunk_callback AFTER ensures nothing further is queued.
+    // This prevents the "last words cut off" bug.
     {
         let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        recorder.clear_chunk_callback();
         let _ = recorder.stop_recording();
+    }
+    {
+        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.clear_chunk_callback();
     }
 
     let active = {

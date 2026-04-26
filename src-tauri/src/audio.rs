@@ -150,19 +150,17 @@ impl AudioRecorder {
             let stream = match device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if let Ok(recording) = is_recording.lock() {
-                        if !*recording {
-                            return;
+                    let is_rec = is_recording.lock().map(|r| *r).unwrap_or(false);
+
+                    // Local-mode samples rely on is_recording for trimming the tail.
+                    if is_rec {
+                        if let Ok(mut s) = samples.lock() {
+                            s.extend_from_slice(data);
                         }
-                    } else {
-                        return;
                     }
 
-                    if let Ok(mut s) = samples.lock() {
-                        s.extend_from_slice(data);
-                    }
-
-                    // If a streaming callback is registered, deliver a 16kHz mono copy of this chunk.
+                    // Streaming-mode: deliver tail audio even after is_recording=false so the
+                    // last ~10-30ms WASAPI buffer reaches Deepgram before the stream is dropped.
                     let cb_opt = chunk_callback.lock().ok().and_then(|g| g.clone());
                     if let Some(cb) = cb_opt {
                         let mono = to_mono(data, native_channels);
