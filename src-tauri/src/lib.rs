@@ -317,9 +317,6 @@ fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) 
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
     // Preserve existing API keys unless the caller explicitly sends a new non-empty value.
     let mut merged = new_settings;
-    if merged.openai_api_key.as_ref().is_none_or(|k| k.is_empty()) {
-        merged.openai_api_key = s.openai_api_key.clone();
-    }
     if merged.deepgram_api_key.as_ref().is_none_or(|k| k.is_empty()) {
         merged.deepgram_api_key = s.deepgram_api_key.clone();
     }
@@ -345,6 +342,18 @@ fn mark_onboarding_complete(state: State<AppState>) -> Result<(), String> {
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
     if !s.onboarding_completed {
         s.onboarding_completed = true;
+        settings::save_settings(&s)?;
+    }
+    Ok(())
+}
+
+/// Record that the user has accepted the terms of use shown in the wizard.
+/// Persists to settings.json so the terms gate is not re-shown on every launch.
+#[tauri::command]
+fn accept_terms(state: State<AppState>) -> Result<(), String> {
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    if !s.terms_accepted {
+        s.terms_accepted = true;
         settings::save_settings(&s)?;
     }
     Ok(())
@@ -625,6 +634,7 @@ pub fn run() {
             start_streaming_transcription,
             stop_streaming_transcription,
             mark_onboarding_complete,
+            accept_terms,
             load_whisper_model,
             is_whisper_loaded,
             is_model_downloaded,

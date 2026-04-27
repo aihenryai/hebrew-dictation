@@ -1084,6 +1084,80 @@ button {
   padding-top: 0.5rem;
 }
 
+/* About — CTA grid (YouTube / WhatsApp / Taplink / Feedback) */
+.about-cta-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.4rem;
+  margin: 0.75rem 0;
+}
+
+.about-cta-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.2rem;
+  padding: 0.55rem 0.3rem;
+  background: #16213e;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  color: #ccc;
+  text-decoration: none;
+  font-size: 0.7rem;
+  font-weight: 500;
+  transition: all 0.15s;
+}
+
+.about-cta-btn:hover {
+  background: #1f2c4f;
+  border-color: #4da6ff66;
+  color: #fff;
+}
+
+.about-cta-btn span:first-child {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.about-cta-btn-primary {
+  background: linear-gradient(135deg, #4da6ff22, #8b5cf622);
+  border-color: #4da6ff66;
+  color: #fff;
+}
+
+.about-cta-btn-primary:hover {
+  background: linear-gradient(135deg, #4da6ff33, #8b5cf633);
+  border-color: #4da6ff;
+}
+
+.about-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border-top: 1px solid #2a2a4a;
+  padding-top: 0.6rem;
+  margin-top: 0.5rem;
+}
+
+.about-meta-link {
+  font-size: 0.72rem;
+}
+
+.about-attribution {
+  margin-top: 0.6rem !important;
+  font-size: 0.62rem !important;
+  color: #888 !important;
+  line-height: 1.5;
+}
+
+.about-trademark {
+  margin-top: 0.3rem !important;
+  font-size: 0.58rem !important;
+  color: #666 !important;
+  line-height: 1.5;
+}
+
 /* ===== CLOSE TIP BANNER ===== */
 
 .close-tip-banner {
@@ -1160,6 +1234,70 @@ button {
 .wizard-credit {
   margin-top: 0.75rem;
   text-align: center;
+  font-size: 0.65rem;
+  color: #888;
+  line-height: 1.4;
+}
+
+/* Wizard step 3 — CTA grid (YouTube / WhatsApp / Taplink / Feedback) */
+.wizard-cta-block {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid #2a2a4a;
+}
+
+.wizard-cta-title {
+  text-align: center;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: #ccc;
+  margin: 0 0 0.6rem;
+}
+
+.wizard-cta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.4rem;
+}
+
+.wizard-cta-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.6rem 0.5rem;
+  background: #16213e;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  color: #ddd;
+  text-decoration: none;
+  font-size: 0.78rem;
+  font-weight: 500;
+  transition: all 0.15s;
+}
+
+.wizard-cta-btn:hover {
+  background: #1f2c4f;
+  border-color: #4da6ff66;
+  color: #fff;
+}
+
+.wizard-cta-btn .cta-icon {
+  font-size: 1.05rem;
+  line-height: 1;
+}
+
+.wizard-cta-btn.cta-youtube:hover { border-color: #ff4d4d99; }
+.wizard-cta-btn.cta-whatsapp:hover { border-color: #25d36699; }
+.wizard-cta-btn.cta-taplink:hover { border-color: #4da6ff99; }
+.wizard-cta-btn.cta-feedback {
+  background: linear-gradient(135deg, #4da6ff22, #8b5cf622);
+  border-color: #4da6ff66;
+  color: #fff;
+}
+.wizard-cta-btn.cta-feedback:hover {
+  background: linear-gradient(135deg, #4da6ff33, #8b5cf633);
+  border-color: #4da6ff;
 }
 
 .compact-setup {

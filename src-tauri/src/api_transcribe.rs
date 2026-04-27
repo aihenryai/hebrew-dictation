@@ -74,50 +74,6 @@ fn truncate_body(body: &str) -> String {
     }
 }
 
-// ── OpenAI Whisper API ──
-
-pub async fn transcribe_openai(
-    samples: &[f32],
-    api_key: &str,
-    language: &str,
-) -> Result<String, String> {
-    let wav_data = samples_to_wav(samples, 16000);
-
-    let file_part = multipart::Part::bytes(wav_data)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")
-        .map_err(|e| format!("Failed to create multipart: {}", e))?;
-
-    let mut form = multipart::Form::new()
-        .part("file", file_part)
-        .text("model", "whisper-1")
-        .text("response_format", "text");
-
-    // "auto" and "multi" → let Whisper auto-detect. Whisper doesn't accept "multi" as an ISO code.
-    if language != "auto" && language != "multi" {
-        form = form.text("language", language.to_string());
-    }
-
-    let response = reqwest::Client::new()
-        .post("https://api.openai.com/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .multipart(form)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| api_error(&e))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(status_error(status, &body));
-    }
-
-    let text = response.text().await
-        .map_err(|e| format!("Failed to read API response: {}", e))?;
-    Ok(text.trim().to_string())
-}
-
 // ── Groq Whisper Turbo API ──
 // OpenAI-compatible endpoint, much cheaper (~$0.04/hr vs Deepgram $4/hr).
 // Batch only — no streaming support.
@@ -239,7 +195,6 @@ pub async fn transcribe_api(
 ) -> Result<String, String> {
     let lang = validate_language(language)?;
     match provider {
-        ApiProvider::OpenAI => transcribe_openai(samples, api_key, lang).await,
         ApiProvider::Deepgram => transcribe_deepgram(samples, api_key, lang).await,
         ApiProvider::Groq => transcribe_groq(samples, api_key, lang).await,
     }

@@ -22,7 +22,7 @@
 
 | מצב | מה צריך | יתרונות |
 |-----|---------|---------|
-| **☁️ API** | מפתח Deepgram/OpenAI (חינם לניסיון) | מהיר ומדויק מאוד |
+| **☁️ API** | מפתח Deepgram/Groq (חינם, ללא כרטיס אשראי) | מהיר ומדויק מאוד |
 | **💻 מקומי** | הורדת מודל Whisper (75MB-1.5GB) | פרטיות מלאה, ללא אינטרנט |
 
 **מצב אוטומטי** (ברירת מחדל): API עם גיבוי מקומי כשאין חיבור.
@@ -73,7 +73,7 @@ npm run tauri build
 - **[Tauri v2](https://v2.tauri.app/)** — framework לאפליקציות desktop
 - **[whisper-rs](https://github.com/tazz4843/whisper-rs)** — Whisper.cpp bindings for Rust
 - **React 19** + TypeScript — ממשק משתמש
-- **[Deepgram Nova-3](https://deepgram.com/)** / **OpenAI Whisper** — API תמלול בענן
+- **[Deepgram Nova-3](https://deepgram.com/)** / **[Groq Whisper Turbo](https://groq.com/)** — API תמלול בענן (ללא כרטיס אשראי)
 
 ## תרומה לפרויקט
 
@@ -87,6 +87,24 @@ npm run tauri build
 npx tsc --noEmit          # Frontend
 cd src-tauri && cargo check  # Rust
 ```
+
+## Privacy & Data Flow
+
+A short fingerprint of where data goes — useful for security review or before deploying in an organization.
+
+| What | Where it lives | When it leaves your machine |
+|------|----------------|-----------------------------|
+| **Audio recording** | RAM only (during Alt+D press) | Sent to the transcription provider you chose (Deepgram / Groq), then discarded. **In local Whisper mode — never leaves the machine.** |
+| **API key** (Deepgram / Groq) | `%APPDATA%/hebrew-dictation/settings.json` (local file) | Only sent to the matching provider as a Bearer token in transcription requests. **Never sent to BinTech or any other third party.** |
+| **Settings** (hotkey, provider choice, model) | Same `settings.json` | Never leaves the machine. |
+| **History** (last transcribed lines) | Same `settings.json`, capped at recent items | Never leaves the machine. |
+| **Update check** | Outbound HTTPS to `github.com/aihenryai/hebrew-dictation/releases/latest/download/latest.json` | One request at app start. Disable by blocking the host in your firewall. |
+
+**No telemetry, no analytics, no crash reporting.** The app does not call home, does not log usage, and does not collect identifiers. The only outbound connections during normal operation are (1) the transcription provider you selected and (2) the GitHub update check above.
+
+The microphone is engaged **only while Alt+D is held**. There is no always-on listening mode. You can verify this via the OS-level microphone indicator (Windows / macOS).
+
+**Trademarks:** Deepgram and Groq are trademarks of their respective owners. The app supports those services via their public APIs but is not endorsed by, affiliated with, or sponsored by them.
 
 ## רישיון
 

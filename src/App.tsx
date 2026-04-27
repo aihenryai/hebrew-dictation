@@ -5,23 +5,46 @@ import { check, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
+/* ----------- אפליקציה: קבועים ----------- */
+const APP_VERSION = "v2.4.0";
+const APP_LICENSE = "MIT";
+
+const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
+
+const LINKS = {
+  youtube: "https://youtube.com/@AIWithHenry",
+  whatsappChannel: "https://chat.whatsapp.com/Kx8EwqLre3fBSfhbpFE2tF",
+  taplink: "https://taplink.cc/henry.ai",
+  github: "https://github.com/aihenryai/hebrew-dictation",
+  email: "henrystauber22@gmail.com",
+};
+
+// פידבק והצעות לשיפור — נשלח ישירות לאימייל של הנרי
+const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
+  "פידבק על הכתבה בעברית"
+)}&body=${encodeURIComponent(
+  "היי הנרי,\n\n[כתבו כאן: באג / בקשה לפיצ'ר / שאלה / מחשבה]\n\nגרסה: " +
+    APP_VERSION +
+    "\n"
+)}`;
+
 type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loading-model";
 type AppView = "main" | "settings" | "onboarding";
 type Language = "he" | "en" | "multi" | "auto";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
-type ApiProvider = "open_ai" | "deepgram" | "groq";
+type ApiProvider = "deepgram" | "groq";
 
 /** Settings sent to the backend (keys only included when user explicitly changes them). */
 interface AppSettings {
   transcription_mode: TranscriptionMode;
   api_provider: ApiProvider;
-  openai_api_key: string | null;
   deepgram_api_key: string | null;
   groq_api_key: string | null;
   preferred_model: string;
   language: string;
   vad_enabled: boolean;
   onboarding_completed?: boolean;
+  terms_accepted?: boolean;
   close_notification_shown?: boolean;
   always_on_top?: boolean;
   autostart_enabled?: boolean;
@@ -33,13 +56,13 @@ interface AppSettings {
 interface RedactedSettings {
   transcription_mode: TranscriptionMode;
   api_provider: ApiProvider;
-  has_openai_key: boolean;
   has_deepgram_key: boolean;
   has_groq_key: boolean;
   preferred_model: string;
   language: string;
   vad_enabled: boolean;
   onboarding_completed?: boolean;
+  terms_accepted?: boolean;
   close_notification_shown?: boolean;
   always_on_top?: boolean;
   autostart_enabled?: boolean;
@@ -84,7 +107,6 @@ function App() {
   const [recordingTime, setRecordingTime] = useState(0);
   const [transcriptionMode, setTranscriptionMode] = useState<TranscriptionMode>("auto_fallback");
   const [apiProvider, setApiProvider] = useState<ApiProvider>("deepgram");
-  const [openaiKey, setOpenaiKey] = useState("");
   const [deepgramKey, setDeepgramKey] = useState("");
   const [groqKey, setGroqKey] = useState("");
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
@@ -95,6 +117,9 @@ function App() {
   const [wizardKeyTesting, setWizardKeyTesting] = useState(false);
   const [wizardChoice, setWizardChoice] = useState<"api" | "groq" | "local" | null>(null);
   const [wizardProviderKey, setWizardProviderKey] = useState<"deepgram" | "groq">("deepgram");
+  const [wizardTermsAsIs, setWizardTermsAsIs] = useState(false);
+  const [wizardTermsKeys, setWizardTermsKeys] = useState(false);
+  const [showTermsGate, setShowTermsGate] = useState(false);
   const [showCloseTip, setShowCloseTip] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(true);
@@ -356,7 +381,6 @@ function App() {
       setLanguage(settings.language as Language);
       setVadEnabled(settings.vad_enabled);
       // Keys are redacted — just track whether they exist on the backend.
-      if (settings.has_openai_key) setOpenaiKey("••••••••");
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
       if (settings.has_groq_key) setGroqKey("••••••••");
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
@@ -376,13 +400,19 @@ function App() {
       // Skip the wizard if the user already has a working setup — either they've saved
       // an API key (via settings directly) or a local whisper model will be available below.
       // The flag is the source of truth once set; we backfill below for legacy installs.
-      const hasKey = settings.has_openai_key || settings.has_deepgram_key || settings.has_groq_key;
+      const hasKey = settings.has_deepgram_key || settings.has_groq_key;
       needsOnboarding = !settings.onboarding_completed && !hasKey;
 
       // Backfill the flag so future launches don't recheck (and so it's consistent
       // with the user's saved config even if they never completed the wizard UI).
       if (hasKey && !settings.onboarding_completed) {
         try { await invoke("mark_onboarding_complete"); } catch { /* ok */ }
+      }
+
+      // Existing v2.3.x users who already finished onboarding but never accepted the
+      // v2.4.0 terms must accept them once before continuing to use the app.
+      if (settings.onboarding_completed && !settings.terms_accepted) {
+        setShowTermsGate(true);
       }
     } catch { /* defaults */ }
 
@@ -407,7 +437,6 @@ function App() {
     const settings: AppSettings = {
       transcription_mode: transcriptionMode,
       api_provider: apiProvider,
-      openai_api_key: sanitizeKey(openaiKey),
       deepgram_api_key: sanitizeKey(deepgramKey),
       groq_api_key: sanitizeKey(groqKey),
       preferred_model: selectedModel,
@@ -420,14 +449,13 @@ function App() {
       ...overrides,
     };
     // Also sanitize keys in overrides
-    if (settings.openai_api_key === "••••••••") settings.openai_api_key = null;
     if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
     if (settings.groq_api_key === "••••••••") settings.groq_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, openaiKey, deepgramKey, groqKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
+  }, [transcriptionMode, apiProvider, deepgramKey, groqKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
 
   async function handleTestApiKey() {
-    const activeKey = apiProvider === "open_ai" ? openaiKey : apiProvider === "groq" ? groqKey : deepgramKey;
+    const activeKey = apiProvider === "groq" ? groqKey : deepgramKey;
     if (!activeKey) return;
     setTestingApiKey(true);
     setApiKeyValid(null);
@@ -485,7 +513,7 @@ function App() {
   const maxRecordingSecs = transcriptionMode === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
   const timeRemaining = maxRecordingSecs - recordingTime;
   const showTimeWarning = status === "recording" && timeRemaining <= 10;
-  const activeApiKey = apiProvider === "open_ai" ? openaiKey : apiProvider === "groq" ? groqKey : deepgramKey;
+  const activeApiKey = apiProvider === "groq" ? groqKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
   const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית", auto: "אוטומטי" };
@@ -533,13 +561,16 @@ function App() {
       } else {
         await persistSettings({ onboarding_completed: true });
       }
+      try { await invoke("accept_terms"); } catch { /* ok */ }
       setView("main");
     };
+
+    const termsAccepted = wizardTermsAsIs && wizardTermsKeys;
 
     return (
       <main className="container compact" dir="rtl">
         <div className="wizard-dots">
-          {[1, 2, 3].map((s) => (
+          {[1, 2, 3, 4].map((s) => (
             <span key={s} className={`wizard-dot ${wizardStep === s ? "active" : wizardStep > s ? "done" : ""}`} />
           ))}
         </div>
@@ -561,6 +592,91 @@ function App() {
         )}
 
         {wizardStep === 2 && (
+          <div className="wizard-step">
+            <h2 className="wizard-step-title">לפני שמתחילים — הצהרת שימוש</h2>
+            <p className="wizard-subtitle" style={{ marginBottom: "0.8rem" }}>
+              התוכנה חינמית וקוד פתוח. כמה דברים שחשוב להבין לפני התחלה.
+            </p>
+            <div className="wizard-content" style={{ display: "flex", flexDirection: "column", gap: "0.5rem", textAlign: "right" }}>
+              <div className="wizard-card" style={{ cursor: "default", padding: "0.6rem 0.8rem" }}>
+                <div className="wizard-card-header">
+                  <span style={{ fontWeight: 600 }}>🛡 התוכנה ניתנת ״כפי שהיא״</span>
+                </div>
+                <p className="wizard-card-desc" style={{ fontSize: "0.78rem" }}>
+                  אין אחריות לדיוק התמלול. אסור להסתמך עליו לבדו במצבים קריטיים — רפואי, משפטי, פיננסי.
+                </p>
+              </div>
+              <div className="wizard-card" style={{ cursor: "default", padding: "0.6rem 0.8rem" }}>
+                <div className="wizard-card-header">
+                  <span style={{ fontWeight: 600 }}>💳 רק מפתחות בלי כרטיס אשראי</span>
+                </div>
+                <p className="wizard-card-desc" style={{ fontSize: "0.78rem" }}>
+                  תומכים רק ב-Deepgram ו-Groq — שניהם נותנים מפתח חינם בלי להזין אשראי. אם תבחרו לטעון קרדיט בתשלום — זה ביניכם לבין הספק.
+                </p>
+              </div>
+              <div className="wizard-card" style={{ cursor: "default", padding: "0.6rem 0.8rem" }}>
+                <div className="wizard-card-header">
+                  <span style={{ fontWeight: 600 }}>🔑 אחריות על המפתח עליכם</span>
+                </div>
+                <p className="wizard-card-desc" style={{ fontSize: "0.78rem" }}>
+                  המפתח שלכם נשמר רק על המחשב שלכם. לא אצלנו. שמירתו בסוד ורענון אם דלף — באחריותכם.
+                </p>
+              </div>
+              <div className="wizard-card" style={{ cursor: "default", padding: "0.6rem 0.8rem" }}>
+                <div className="wizard-card-header">
+                  <span style={{ fontWeight: 600 }}>⚖ אסור להקליט אדם בלי הסכמתו</span>
+                </div>
+                <p className="wizard-card-desc" style={{ fontSize: "0.78rem" }}>
+                  חוק האזנת סתר תשל״ט-1979. השימוש בתוכנה לצורך זה אסור והאחריות החוקית עליכם.
+                </p>
+              </div>
+
+              <a
+                href={TERMS_FULL_URL}
+                target="_blank"
+                rel="noopener"
+                className="link-text"
+                style={{ fontSize: "0.78rem", marginTop: "0.2rem" }}
+              >
+                לתנאי השימוש המלאים באתר →
+              </a>
+
+              <label className="toggle-label" style={{ marginTop: "0.4rem", alignItems: "flex-start", gap: "0.5rem" }}>
+                <input
+                  type="checkbox"
+                  checked={wizardTermsAsIs}
+                  onChange={() => setWizardTermsAsIs(!wizardTermsAsIs)}
+                />
+                <span className="toggle-text" style={{ fontSize: "0.82rem" }}>
+                  קראתי והבנתי שהתוכנה ניתנת ״כפי שהיא״ ללא אחריות לדיוק התמלול
+                </span>
+              </label>
+              <label className="toggle-label" style={{ alignItems: "flex-start", gap: "0.5rem" }}>
+                <input
+                  type="checkbox"
+                  checked={wizardTermsKeys}
+                  onChange={() => setWizardTermsKeys(!wizardTermsKeys)}
+                />
+                <span className="toggle-text" style={{ fontSize: "0.82rem" }}>
+                  אני מאשר שאני אחראי על מפתחות ה-API שלי ועל השימוש בהם
+                </span>
+              </label>
+            </div>
+            <div className="wizard-nav">
+              <button className="btn-wizard-back" onClick={() => setWizardStep(1)}>חזור</button>
+              <button
+                className="btn-wizard-next"
+                onClick={() => setWizardStep(3)}
+                disabled={!termsAccepted}
+                title={!termsAccepted ? "סמנו את שני התנאים כדי להמשיך" : ""}
+              >
+                {termsAccepted ? "מסכים, המשך" : "סמנו את שני התנאים"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {wizardStep === 3 && (
           <div className="wizard-step">
             <h2 className="wizard-step-title">בחר מצב תמלול</h2>
 
@@ -704,15 +820,15 @@ function App() {
             </div>
 
             <div className="wizard-nav">
-              <button className="btn-wizard-back" onClick={() => setWizardStep(1)}>חזור</button>
-              <button className="btn-wizard-next" onClick={() => setWizardStep(3)} disabled={!wizardChoice}>
+              <button className="btn-wizard-back" onClick={() => setWizardStep(2)}>חזור</button>
+              <button className="btn-wizard-next" onClick={() => setWizardStep(4)} disabled={!wizardChoice}>
                 {wizardChoice ? "המשך" : "בחר מצב"}
               </button>
             </div>
           </div>
         )}
 
-        {wizardStep === 3 && (
+        {wizardStep === 4 && (
           <div className="wizard-step">
             <h2 className="wizard-step-title">✅ הכל מוכן!</h2>
             <div className="wizard-content">
@@ -731,14 +847,34 @@ function App() {
                 <span>ודבר בעברית</span>
               </div>
               <p className="wizard-note" style={{ fontSize: "0.7rem" }}>התוכנה רצה ברקע. גם בסגירת החלון Alt+D ממשיך לעבוד.</p>
+
+              <div className="wizard-cta-block">
+                <p className="wizard-cta-title">אהבתם? עקבו לעוד כלי AI מעולים בעברית</p>
+                <div className="wizard-cta-grid">
+                  <a className="wizard-cta-btn cta-youtube" href={LINKS.youtube} target="_blank" rel="noopener">
+                    <span className="cta-icon">🎥</span>
+                    <span className="cta-label">YouTube</span>
+                  </a>
+                  <a className="wizard-cta-btn cta-whatsapp" href={LINKS.whatsappChannel} target="_blank" rel="noopener">
+                    <span className="cta-icon">💬</span>
+                    <span className="cta-label">WhatsApp</span>
+                  </a>
+                  <a className="wizard-cta-btn cta-taplink" href={LINKS.taplink} target="_blank" rel="noopener">
+                    <span className="cta-icon">🔗</span>
+                    <span className="cta-label">כל הקישורים</span>
+                  </a>
+                  <a className="wizard-cta-btn cta-feedback" href={FEEDBACK_URL} target="_blank" rel="noopener">
+                    <span className="cta-icon">✏️</span>
+                    <span className="cta-label">פידבק</span>
+                  </a>
+                </div>
+              </div>
             </div>
             <div className="wizard-final-actions">
               <button className="btn-wizard-next" onClick={completeOnboarding}>התחל</button>
             </div>
             <div className="wizard-credit">
-              <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="link-text">
-                🔗 BinTech AI — הנרי שטאובר
-              </a>
+              <span>נוצר ע״י הנרי שטאובר · BinTech AI · רישיון {APP_LICENSE} · {APP_VERSION}</span>
             </div>
           </div>
         )}
@@ -785,7 +921,6 @@ function App() {
               {([
                 ["deepgram", "Deepgram"],
                 ["groq", "Groq"],
-                ["open_ai", "OpenAI"],
               ] as [ApiProvider, string][]).map(([prov, label]) => (
                 <button
                   key={prov}
@@ -808,29 +943,24 @@ function App() {
             <p className="settings-note provider-fact">
               {apiProvider === "deepgram"
                 ? "💰 $200 קרדיט חינם ≈ 50 שעות הכתבה. ללא כרטיס אשראי. דיוק הכי גבוה בעברית."
-                : apiProvider === "groq"
-                ? "💰 Groq Whisper Turbo: ~$0.04/שעה — הכי זול. יש Free tier מוגבל. ללא streaming."
-                : "💰 OpenAI Whisper: $0.006/דקה ≈ $0.36/שעה. דורש כרטיס אשראי."}
+                : "💰 Groq Whisper Turbo: ~$0.04/שעה — הכי זול. יש Free tier מוגבל. ללא streaming."}
             </p>
             <div className="api-key-row">
               <input
                 type="password"
                 className="api-key-input"
-                value={apiProvider === "open_ai" ? openaiKey : apiProvider === "groq" ? groqKey : deepgramKey}
+                value={apiProvider === "groq" ? groqKey : deepgramKey}
                 onChange={(e) => {
-                  if (apiProvider === "open_ai") setOpenaiKey(e.target.value);
-                  else if (apiProvider === "groq") setGroqKey(e.target.value);
+                  if (apiProvider === "groq") setGroqKey(e.target.value);
                   else setDeepgramKey(e.target.value);
                   setApiKeyValid(null);
                 }}
                 onBlur={() => persistSettings(
-                  apiProvider === "open_ai"
-                    ? { openai_api_key: openaiKey || null }
-                    : apiProvider === "groq"
+                  apiProvider === "groq"
                     ? { groq_api_key: groqKey || null }
                     : { deepgram_api_key: deepgramKey || null }
                 )}
-                placeholder={apiProvider === "open_ai" ? "sk-..." : apiProvider === "groq" ? "gsk_..." : "API key..."}
+                placeholder={apiProvider === "groq" ? "gsk_..." : "API key..."}
               />
               <button
                 className={`btn-test ${apiKeyValid === true ? "valid" : apiKeyValid === false ? "invalid" : ""}`}
@@ -846,19 +976,15 @@ function App() {
               <p className="settings-note">
                 {apiProvider === "deepgram" ? (
                   <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → deepgram.com</a>
-                ) : apiProvider === "groq" ? (
-                  <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → groq.com</a>
                 ) : (
-                  <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="link-text">קבל מפתח → platform.openai.com</a>
+                  <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → groq.com</a>
                 )}
               </p>
               <p className="settings-note">
                 {apiProvider === "deepgram" ? (
                   <a href="https://console.deepgram.com/project/default/usage" target="_blank" rel="noopener" className="link-text">כמה קרדיט נשאר? →</a>
-                ) : apiProvider === "groq" ? (
-                  <a href="https://console.groq.com/settings/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש →</a>
                 ) : (
-                  <a href="https://platform.openai.com/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש →</a>
+                  <a href="https://console.groq.com/settings/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש →</a>
                 )}
               </p>
             </div>
@@ -1022,15 +1148,38 @@ function App() {
         {/* About */}
         <div className="settings-section about-section">
           <h3>אודות</h3>
-          <p className="about-app-name">הכתבה בעברית v2.2</p>
+          <p className="about-app-name">הכתבה בעברית {APP_VERSION}</p>
           <p className="about-brand">BinTech AI — הנרי שטאובר</p>
-          <div className="about-links">
-            <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="link-text">🔗 כל הקישורים</a>
-            <a href="https://youtube.com/@AIWithHenry" target="_blank" rel="noopener" className="link-text">🎥 YouTube</a>
-            <a href="mailto:henrystauber22@gmail.com" className="link-text">📧 henrystauber22@gmail.com</a>
+
+          <div className="about-cta-grid">
+            <a className="about-cta-btn" href={LINKS.youtube} target="_blank" rel="noopener" title="ערוץ YouTube">
+              <span>🎥</span><span>YouTube</span>
+            </a>
+            <a className="about-cta-btn" href={LINKS.whatsappChannel} target="_blank" rel="noopener" title="ערוץ WhatsApp">
+              <span>💬</span><span>WhatsApp</span>
+            </a>
+            <a className="about-cta-btn" href={LINKS.taplink} target="_blank" rel="noopener" title="כל הקישורים">
+              <span>🔗</span><span>קישורים</span>
+            </a>
+            <a className="about-cta-btn about-cta-btn-primary" href={FEEDBACK_URL} title="שלח פידבק במייל">
+              <span>✉️</span><span>פידבק</span>
+            </a>
           </div>
-          <p className="settings-note" style={{ marginTop: "0.5rem", fontSize: "0.65rem" }}>
-            קוד פתוח · MIT · סדנאות והרצאות AI
+
+          <div className="about-meta">
+            <a href={LINKS.github} target="_blank" rel="noopener" className="link-text about-meta-link">
+              📂 קוד פתוח ב-GitHub
+            </a>
+            <a href={`mailto:${LINKS.email}`} className="link-text about-meta-link">
+              📧 {LINKS.email}
+            </a>
+          </div>
+
+          <p className="settings-note about-attribution">
+            רישיון {APP_LICENSE} · נבנה עם Tauri · whisper.cpp · React · ספריות OSS עם הקרדיט בקוד המקור
+          </p>
+          <p className="settings-note about-trademark">
+            Deepgram, OpenAI ו-Groq הם סימני מסחר של החברות בהתאמה. אין קשר עסקי או חסות.
           </p>
         </div>
 
@@ -1044,6 +1193,51 @@ function App() {
     setShowCloseTip(false);
     await persistSettings({ close_notification_shown: true });
   };
+
+  if (showTermsGate) {
+    const termsAccepted = wizardTermsAsIs && wizardTermsKeys;
+    const acceptAndClose = async () => {
+      try { await invoke("accept_terms"); } catch { /* ok */ }
+      setShowTermsGate(false);
+    };
+    return (
+      <main className="container compact" dir="rtl">
+        <div className="wizard-step">
+          <h2 className="wizard-step-title">עדכון תנאי שימוש — v2.4.0</h2>
+          <p className="wizard-subtitle" style={{ marginBottom: "0.6rem" }}>
+            בגרסה החדשה הוסרה התלות ב-OpenAI (שמצריכה כרטיס אשראי) ונותרו רק ספקים חינמיים: Deepgram + Groq. נא לאשר את התנאים כדי להמשיך.
+          </p>
+          <div className="wizard-content" style={{ display: "flex", flexDirection: "column", gap: "0.5rem", textAlign: "right" }}>
+            <a href={TERMS_FULL_URL} target="_blank" rel="noopener" className="link-text" style={{ fontSize: "0.85rem" }}>
+              לתנאי השימוש המלאים באתר →
+            </a>
+            <label className="toggle-label" style={{ alignItems: "flex-start", gap: "0.5rem" }}>
+              <input type="checkbox" checked={wizardTermsAsIs} onChange={() => setWizardTermsAsIs(!wizardTermsAsIs)} />
+              <span className="toggle-text" style={{ fontSize: "0.82rem" }}>
+                קראתי והבנתי שהתוכנה ניתנת ״כפי שהיא״ ללא אחריות לדיוק התמלול
+              </span>
+            </label>
+            <label className="toggle-label" style={{ alignItems: "flex-start", gap: "0.5rem" }}>
+              <input type="checkbox" checked={wizardTermsKeys} onChange={() => setWizardTermsKeys(!wizardTermsKeys)} />
+              <span className="toggle-text" style={{ fontSize: "0.82rem" }}>
+                אני מאשר שאני אחראי על מפתחות ה-API שלי ועל השימוש בהם
+              </span>
+            </label>
+          </div>
+          <div className="wizard-nav">
+            <button
+              className="btn-wizard-next"
+              onClick={acceptAndClose}
+              disabled={!termsAccepted}
+              title={!termsAccepted ? "סמנו את שני התנאים כדי להמשיך" : ""}
+            >
+              {termsAccepted ? "מסכים, המשך" : "סמנו את שני התנאים"}
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="container compact" dir="rtl">

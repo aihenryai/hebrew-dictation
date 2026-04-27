@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionMode {
-    /// Use user's own API key (Deepgram / OpenAI).
+    /// Use user's own API key (Deepgram / Groq).
     Api,
     /// Local whisper-rs — offline, full privacy.
     Local,
@@ -18,10 +18,9 @@ impl Default for TranscriptionMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiProvider {
-    OpenAI,
     Deepgram,
     Groq,
 }
@@ -32,14 +31,29 @@ impl Default for ApiProvider {
     }
 }
 
+/// Custom deserializer that maps unknown / legacy variants (e.g. "open_ai" from v2.3.x) to
+/// the default Deepgram so older settings.json files don't fail to load after the OpenAI
+/// provider was removed in v2.4.0.
+impl<'de> Deserialize<'de> for ApiProvider {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "deepgram" => Ok(ApiProvider::Deepgram),
+            "groq" => Ok(ApiProvider::Groq),
+            _ => Ok(ApiProvider::default()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default)]
     pub transcription_mode: TranscriptionMode,
     #[serde(default)]
     pub api_provider: ApiProvider,
-    #[serde(default)]
-    pub openai_api_key: Option<String>,
     #[serde(default)]
     pub deepgram_api_key: Option<String>,
     #[serde(default)]
@@ -52,6 +66,8 @@ pub struct AppSettings {
     pub vad_enabled: bool,
     #[serde(default)]
     pub onboarding_completed: bool,
+    #[serde(default)]
+    pub terms_accepted: bool,
     #[serde(default)]
     pub close_notification_shown: bool,
     #[serde(default = "default_true")]
@@ -69,13 +85,13 @@ pub struct AppSettings {
 pub struct RedactedSettings {
     pub transcription_mode: TranscriptionMode,
     pub api_provider: ApiProvider,
-    pub has_openai_key: bool,
     pub has_deepgram_key: bool,
     pub has_groq_key: bool,
     pub preferred_model: String,
     pub language: String,
     pub vad_enabled: bool,
     pub onboarding_completed: bool,
+    pub terms_accepted: bool,
     pub close_notification_shown: bool,
     pub always_on_top: bool,
     pub autostart_enabled: bool,
@@ -88,13 +104,13 @@ impl AppSettings {
         RedactedSettings {
             transcription_mode: self.transcription_mode.clone(),
             api_provider: self.api_provider.clone(),
-            has_openai_key: self.openai_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             has_deepgram_key: self.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             has_groq_key: self.groq_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             preferred_model: self.preferred_model.clone(),
             language: self.language.clone(),
             vad_enabled: self.vad_enabled,
             onboarding_completed: self.onboarding_completed,
+            terms_accepted: self.terms_accepted,
             close_notification_shown: self.close_notification_shown,
             always_on_top: self.always_on_top,
             autostart_enabled: self.autostart_enabled,
@@ -121,13 +137,13 @@ impl Default for AppSettings {
         Self {
             transcription_mode: TranscriptionMode::default(),
             api_provider: ApiProvider::default(),
-            openai_api_key: None,
             deepgram_api_key: None,
             groq_api_key: None,
             preferred_model: default_preferred_model(),
             language: default_language(),
             vad_enabled: true,
             onboarding_completed: false,
+            terms_accepted: false,
             close_notification_shown: false,
             always_on_top: true,
             autostart_enabled: true,
@@ -140,7 +156,6 @@ impl Default for AppSettings {
 impl AppSettings {
     pub fn active_api_key(&self) -> Option<&str> {
         match self.api_provider {
-            ApiProvider::OpenAI => self.openai_api_key.as_deref(),
             ApiProvider::Deepgram => self.deepgram_api_key.as_deref(),
             ApiProvider::Groq => self.groq_api_key.as_deref(),
         }
@@ -168,13 +183,6 @@ pub fn load_settings() -> AppSettings {
     };
 
     // Auto-fill from environment variables if keys are not set
-    if settings.openai_api_key.is_none() {
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            if !key.is_empty() {
-                settings.openai_api_key = Some(key);
-            }
-        }
-    }
     if settings.deepgram_api_key.is_none() {
         if let Ok(key) = std::env::var("DEEPGRAM_API_KEY") {
             if !key.is_empty() {
