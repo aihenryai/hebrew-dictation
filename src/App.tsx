@@ -1179,7 +1179,7 @@ function App() {
             רישיון {APP_LICENSE} · נבנה עם Tauri · whisper.cpp · React · ספריות OSS עם הקרדיט בקוד המקור
           </p>
           <p className="settings-note about-trademark">
-            Deepgram, OpenAI ו-Groq הם סימני מסחר של החברות בהתאמה. אין קשר עסקי או חסות.
+            Deepgram ו-Groq הם סימני מסחר של החברות בהתאמה. אין קשר עסקי או חסות.
           </p>
         </div>
 
