@@ -251,6 +251,7 @@ fn load_whisper_model(state: State<AppState>, model_name: String) -> Result<(), 
         "small" => 1500,
         "medium" => 3500,
         "large-v3-turbo" => 6000,
+        "ivrit-large-v3-turbo" => 6000,
         _ => 1000,
     };
     let mut sys = sysinfo::System::new();
@@ -268,7 +269,7 @@ fn load_whisper_model(state: State<AppState>, model_name: String) -> Result<(), 
         return Err(format!("Model not found: {}", model_path.display()));
     }
 
-    let engine = whisper::WhisperEngine::new(&model_path)?;
+    let engine = whisper::WhisperEngine::new(&model_path, model_name.clone())?;
     let mut whisper = state.whisper_engine.lock().map_err(|e| e.to_string())?;
     *whisper = Some(engine);
     Ok(())

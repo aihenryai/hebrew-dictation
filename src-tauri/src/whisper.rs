@@ -8,17 +8,20 @@ const TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
 
 pub struct WhisperEngine {
     ctx: WhisperContext,
+    /// Model name (e.g. "small", "ivrit-large-v3-turbo"). Used to enforce
+    /// language overrides for models with degraded language detection.
+    model_name: String,
 }
 
 impl WhisperEngine {
-    pub fn new(model_path: &Path) -> Result<Self, String> {
+    pub fn new(model_path: &Path, model_name: String) -> Result<Self, String> {
         let ctx = WhisperContext::new_with_params(
             model_path.to_str().ok_or("Invalid model path")?,
             WhisperContextParameters::default(),
         )
         .map_err(|e| format!("Failed to load Whisper model: {}", e))?;
 
-        Ok(Self { ctx })
+        Ok(Self { ctx, model_name })
     }
 
     pub fn transcribe(&self, samples: &[f32], language: &str) -> Result<String, String> {
@@ -27,10 +30,19 @@ impl WhisperEngine {
             .create_state()
             .map_err(|e| format!("Failed to create whisper state: {}", e))?;
 
+        // ivrit.ai models had their language-detection capability degraded during
+        // training and the model card explicitly requires the language token to
+        // be set to Hebrew. Override "auto" / any non-"he" input for these models.
+        let effective_lang = if self.model_name.starts_with("ivrit-") {
+            "he".to_string()
+        } else {
+            language.to_string()
+        };
+
         // Run transcription with timeout to prevent hanging on long audio
         let (tx, rx) = mpsc::channel();
         let samples_owned = samples.to_vec();
-        let lang_owned = language.to_string();
+        let lang_owned = effective_lang;
 
         std::thread::spawn(move || {
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });

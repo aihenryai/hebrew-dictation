@@ -35,9 +35,25 @@ const MODELS: &[(&str, &str, u64, &str)] = &[
         1_624_555_275,
         "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
     ),
+    (
+        // ivrit.ai fine-tune of Whisper large-v3-turbo, trained on ~5,000h of
+        // Hebrew (Knesset plenums, crowd-transcribed audio, Wikipedia). Same
+        // GGML format / size as the standard turbo. Apache-2.0.
+        "ivrit-large-v3-turbo",
+        "https://huggingface.co/ivrit-ai/whisper-large-v3-turbo-ggml/resolve/main/ggml-model.bin",
+        1_624_555_275,
+        "c8090411113357097bfafc2b8e228ec1639fa7f5fe4ecb5d054ac0ccef8641b1",
+    ),
 ];
 
-const VALID_MODEL_NAMES: &[&str] = &["tiny", "base", "small", "medium", "large-v3-turbo"];
+const VALID_MODEL_NAMES: &[&str] = &[
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3-turbo",
+    "ivrit-large-v3-turbo",
+];
 
 pub fn validate_model_name(model_name: &str) -> Result<(), String> {
     if VALID_MODEL_NAMES.contains(&model_name) {
@@ -88,7 +104,11 @@ pub fn get_all_models_status() -> Vec<ModelInfo> {
                 "medium" => ("~1.5GB".to_string(), "מדויק לעברית, דורש 4GB+ RAM".to_string()),
                 "large-v3-turbo" => (
                     "~1.6GB".to_string(),
-                    "האיכות הגבוהה ביותר לעברית, דורש 6GB+ RAM".to_string(),
+                    "Whisper סטנדרטי, איכות גבוהה, דורש 6GB+ RAM".to_string(),
+                ),
+                "ivrit-large-v3-turbo" => (
+                    "~1.6GB".to_string(),
+                    "מותאם לעברית — מודל ivrit.ai מאומן ~5,000 שעות (כנסת + ויקי). מומלץ לעברית. דורש 6GB+ RAM".to_string(),
                 ),
                 _ => (format!("{}B", size), String::new()),
             };

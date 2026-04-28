@@ -6,7 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.4.0";
+const APP_VERSION = "v2.5.0";
 const APP_LICENSE = "MIT";
 
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
@@ -1113,13 +1113,23 @@ function App() {
           <h3>מודלים מקומיים</h3>
           {activeModel && <p className="settings-note active-note">פעיל: <strong>{activeModel}</strong></p>}
           <div className="model-cards">
-            {models.map((m) => {
+            {[...models].sort((a, b) => {
+              // Surface ivrit-* models first — they're the recommended Hebrew option.
+              const aIvrit = a.name.startsWith("ivrit-") ? 0 : 1;
+              const bIvrit = b.name.startsWith("ivrit-") ? 0 : 1;
+              return aIvrit - bIvrit;
+            }).map((m) => {
               const isActive = activeModel === m.name;
               const isDownloading = downloadingModel === m.name;
+              const isHebrewModel = m.name.startsWith("ivrit-");
               return (
-                <div key={m.name} className={`model-card ${isActive ? "active" : ""} ${m.downloaded ? "downloaded" : ""}`}>
+                <div key={m.name} className={`model-card ${isActive ? "active" : ""} ${m.downloaded ? "downloaded" : ""} ${isHebrewModel ? "hebrew-recommended" : ""}`}>
                   <div className="model-card-header">
-                    <span className="model-name">{m.name}{isActive && <span className="active-dot" />}</span>
+                    <span className="model-name">
+                      {m.name}
+                      {isHebrewModel && <span className="badge-hebrew" title="מודל מותאם לעברית">🇮🇱 מומלץ לעברית</span>}
+                      {isActive && <span className="active-dot" />}
+                    </span>
                     <span className="model-size">{m.size_label}</span>
                   </div>
                   <p className="model-desc">{m.description}</p>
