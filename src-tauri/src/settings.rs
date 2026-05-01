@@ -54,9 +54,11 @@ pub struct AppSettings {
     pub transcription_mode: TranscriptionMode,
     #[serde(default)]
     pub api_provider: ApiProvider,
-    #[serde(default)]
+    /// Cache only — persisted in OS-secure storage (Credential Manager / Keychain), never in JSON.
+    #[serde(skip)]
     pub deepgram_api_key: Option<String>,
-    #[serde(default)]
+    /// Cache only — persisted in OS-secure storage (Credential Manager / Keychain), never in JSON.
+    #[serde(skip)]
     pub groq_api_key: Option<String>,
     #[serde(default = "default_preferred_model")]
     pub preferred_model: String,
@@ -171,18 +173,111 @@ fn get_settings_path() -> PathBuf {
     get_settings_dir().join("settings.json")
 }
 
-pub fn load_settings() -> AppSettings {
+/// Result of the one-shot key migration that runs on every app launch.
+/// `Migrated` and `Failed` carry information for the frontend to surface.
+#[derive(Debug, Clone)]
+pub enum MigrationOutcome {
+    /// No legacy keys were found — nothing to migrate.
+    NoOp,
+    /// Legacy keys were found in JSON, successfully copied to keyring, JSON cleaned.
+    Migrated { providers: Vec<&'static str> },
+    /// Legacy keys were found but writing them to keyring failed. JSON is left intact
+    /// so the user can keep working — a banner will prompt them to re-enter the keys.
+    Failed { error: String },
+}
+
+pub struct LoadResult {
+    pub settings: AppSettings,
+    pub migration: MigrationOutcome,
+}
+
+pub fn load_settings() -> LoadResult {
     let path = get_settings_path();
-    let mut settings = if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => AppSettings::default(),
-        }
+
+    // Read the raw JSON value so we can detect legacy plaintext keys that are no
+    // longer mapped on AppSettings (the fields are now #[serde(skip)]).
+    let raw_json: Option<serde_json::Value> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
     } else {
-        AppSettings::default()
+        None
     };
 
-    // Auto-fill from environment variables if keys are not set
+    let mut settings: AppSettings = raw_json
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    // 1) Load existing keys from keyring (works on fresh installs and post-migration).
+    if let Ok(Some(k)) = crate::secure_keys::load_key("deepgram") {
+        if !k.is_empty() {
+            settings.deepgram_api_key = Some(k);
+        }
+    }
+    if let Ok(Some(k)) = crate::secure_keys::load_key("groq") {
+        if !k.is_empty() {
+            settings.groq_api_key = Some(k);
+        }
+    }
+
+    // 2) Detect legacy keys present in JSON (only present on pre-2.6.0 installs).
+    let legacy_deepgram = raw_json
+        .as_ref()
+        .and_then(|v| v.get("deepgram_api_key"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let legacy_groq = raw_json
+        .as_ref()
+        .and_then(|v| v.get("groq_api_key"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let migration = if legacy_deepgram.is_some() || legacy_groq.is_some() {
+        let mut migrated_providers: Vec<&'static str> = Vec::new();
+        let mut migration_error: Option<String> = None;
+
+        if let Some(k) = &legacy_deepgram {
+            // If the key is already in keyring, don't overwrite — keyring is the truth.
+            if settings.deepgram_api_key.is_none() {
+                if let Err(e) = crate::secure_keys::save_key("deepgram", k) {
+                    migration_error = Some(e);
+                } else {
+                    settings.deepgram_api_key = Some(k.clone());
+                    migrated_providers.push("deepgram");
+                }
+            }
+        }
+        if migration_error.is_none() {
+            if let Some(k) = &legacy_groq {
+                if settings.groq_api_key.is_none() {
+                    if let Err(e) = crate::secure_keys::save_key("groq", k) {
+                        migration_error = Some(e);
+                    } else {
+                        settings.groq_api_key = Some(k.clone());
+                        migrated_providers.push("groq");
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = migration_error {
+            // Don't touch the JSON — the user still has working keys there.
+            MigrationOutcome::Failed { error: err }
+        } else {
+            // Rewrite settings.json so the legacy fields disappear (#[serde(skip)] handles it).
+            if let Err(e) = save_settings(&settings) {
+                eprintln!("warning: failed to rewrite settings.json after migration: {}", e);
+            }
+            MigrationOutcome::Migrated { providers: migrated_providers }
+        }
+    } else {
+        MigrationOutcome::NoOp
+    };
+
+    // 3) Env var fallback — runtime override only, never written to keyring.
     if settings.deepgram_api_key.is_none() {
         if let Ok(key) = std::env::var("DEEPGRAM_API_KEY") {
             if !key.is_empty() {
@@ -198,13 +293,14 @@ pub fn load_settings() -> AppSettings {
         }
     }
 
-    settings
+    LoadResult { settings, migration }
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
     let dir = get_settings_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create settings dir: {}", e))?;
+    // #[serde(skip)] on the key fields ensures they never reach the file.
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     std::fs::write(get_settings_path(), json)

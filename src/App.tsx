@@ -6,7 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.5.0";
+const APP_VERSION = "v2.6.0";
 const APP_LICENSE = "MIT";
 
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
@@ -34,12 +34,10 @@ type Language = "he" | "en" | "multi" | "auto";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "deepgram" | "groq";
 
-/** Settings sent to the backend (keys only included when user explicitly changes them). */
+/** Settings sent to the backend. API keys are managed separately via set_api_key / clear_api_key. */
 interface AppSettings {
   transcription_mode: TranscriptionMode;
   api_provider: ApiProvider;
-  deepgram_api_key: string | null;
-  groq_api_key: string | null;
   preferred_model: string;
   language: string;
   vad_enabled: boolean;
@@ -362,10 +360,25 @@ function App() {
         setShowCloseTip(true);
       }
     });
+    const unlistenMigration = listen<{ status: string; error?: string }>(
+      "key-migration",
+      (event) => {
+        if (event.payload.status === "failed") {
+          alert(
+            "לא הצלחנו להעביר אוטומטית את מפתחות ה-API לאחסון המאובטח של מערכת ההפעלה. " +
+              "המפתח הקיים שלך עדיין שמור בקובץ ההגדרות הישן ופועל. " +
+              "מומלץ להזין אותם מחדש בהגדרות כדי שייכנסו לאחסון מאובטח. " +
+              "פרטי השגיאה: " +
+              (event.payload.error || "לא ידוע")
+          );
+        }
+      }
+    );
     return () => {
       unlistenProgress.then((fn) => fn());
       unlistenClose.then((fn) => fn());
       unlistenFocus.then((fn) => fn());
+      unlistenMigration.then((fn) => fn());
       stopVadPolling();
       stopTimer();
     };
@@ -427,18 +440,10 @@ function App() {
     }
   }
 
-  /** Send null for keys unless user typed a real new value (not the placeholder). */
-  const sanitizeKey = (key: string | null): string | null => {
-    if (!key || key === "••••••••") return null;
-    return key;
-  };
-
   const persistSettings = useCallback(async (overrides: Partial<AppSettings> = {}) => {
     const settings: AppSettings = {
       transcription_mode: transcriptionMode,
       api_provider: apiProvider,
-      deepgram_api_key: sanitizeKey(deepgramKey),
-      groq_api_key: sanitizeKey(groqKey),
       preferred_model: selectedModel,
       language: language,
       vad_enabled: vadEnabled,
@@ -448,11 +453,18 @@ function App() {
       floating_toolbar_enabled: floatingToolbarEnabled,
       ...overrides,
     };
-    // Also sanitize keys in overrides
-    if (settings.deepgram_api_key === "••••••••") settings.deepgram_api_key = null;
-    if (settings.groq_api_key === "••••••••") settings.groq_api_key = null;
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, deepgramKey, groqKey, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
+
+  /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
+  const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
+    await invoke("set_api_key", { provider, key });
+  }, []);
+
+  /** Remove an API key from OS-secure storage. */
+  const clearApiKey = useCallback(async (provider: ApiProvider) => {
+    await invoke("clear_api_key", { provider });
+  }, []);
 
   async function handleTestApiKey() {
     const activeKey = apiProvider === "groq" ? groqKey : deepgramKey;
@@ -534,23 +546,23 @@ function App() {
 
     const completeOnboarding = async () => {
       if (wizardChoice === "api" && wizardApiKey) {
-        setDeepgramKey(wizardApiKey);
+        await setApiKey("deepgram", wizardApiKey);
+        setDeepgramKey("••••••••");
         setApiProvider("deepgram");
         setTranscriptionMode("api");
         await persistSettings({
           onboarding_completed: true,
-          deepgram_api_key: wizardApiKey,
           api_provider: "deepgram",
           transcription_mode: "api",
         });
       } else if (wizardChoice === "groq" && wizardApiKey) {
-        setGroqKey(wizardApiKey);
+        await setApiKey("groq", wizardApiKey);
+        setGroqKey("••••••••");
         setApiProvider("groq");
         setTranscriptionMode("api");
         setStreamingEnabled(false);
         await persistSettings({
           onboarding_completed: true,
-          groq_api_key: wizardApiKey,
           api_provider: "groq",
           transcription_mode: "api",
           streaming_enabled: false,
@@ -955,11 +967,19 @@ function App() {
                   else setDeepgramKey(e.target.value);
                   setApiKeyValid(null);
                 }}
-                onBlur={() => persistSettings(
-                  apiProvider === "groq"
-                    ? { groq_api_key: groqKey || null }
-                    : { deepgram_api_key: deepgramKey || null }
-                )}
+                onBlur={async () => {
+                  const provider = apiProvider;
+                  const value = provider === "groq" ? groqKey : deepgramKey;
+                  // Skip the masked placeholder — that means the existing key wasn't touched.
+                  if (value === "••••••••") return;
+                  try {
+                    if (value) {
+                      await setApiKey(provider, value);
+                    } else {
+                      await clearApiKey(provider);
+                    }
+                  } catch { /* swallow — UI keeps its local state either way */ }
+                }}
                 placeholder={apiProvider === "groq" ? "gsk_..." : "API key..."}
               />
               <button

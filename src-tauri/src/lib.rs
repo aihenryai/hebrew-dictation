@@ -2,6 +2,7 @@ mod api_transcribe;
 mod audio;
 mod injector;
 mod model;
+mod secure_keys;
 mod settings;
 mod streaming;
 mod whisper;
@@ -28,6 +29,8 @@ struct AppState {
     /// Tracks whether the main window was visible when the floating toolbar
     /// took over, so we can restore it to the same state when recording stops.
     main_was_visible_before_toolbar: AtomicBool,
+    /// One-shot migration outcome (set at load time, taken at setup time, then None).
+    migration_outcome: Mutex<Option<settings::MigrationOutcome>>,
 }
 
 #[tauri::command]
@@ -316,16 +319,56 @@ fn get_settings(state: State<AppState>) -> Result<settings::RedactedSettings, St
 #[tauri::command]
 fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) -> Result<(), String> {
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-    // Preserve existing API keys unless the caller explicitly sends a new non-empty value.
     let mut merged = new_settings;
-    if merged.deepgram_api_key.as_ref().is_none_or(|k| k.is_empty()) {
-        merged.deepgram_api_key = s.deepgram_api_key.clone();
-    }
-    if merged.groq_api_key.as_ref().is_none_or(|k| k.is_empty()) {
-        merged.groq_api_key = s.groq_api_key.clone();
-    }
+    // API keys are managed via set_api_key / clear_api_key. The fields on AppSettings
+    // are an in-memory cache only and are not persisted to JSON (#[serde(skip)]).
+    // If the frontend still sends them — ignore and preserve the existing cache so a
+    // legacy code path can never accidentally overwrite a securely stored key.
+    merged.deepgram_api_key = s.deepgram_api_key.clone();
+    merged.groq_api_key = s.groq_api_key.clone();
     settings::save_settings(&merged)?;
     *s = merged;
+    Ok(())
+}
+
+/// Save an API key to OS-secure storage (Windows Credential Manager / macOS Keychain)
+/// and update the in-memory cache so subsequent transcribe calls find it.
+/// `provider` must be `"deepgram"` or `"groq"`.
+#[tauri::command]
+fn set_api_key(state: State<AppState>, provider: String, key: String) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("מפתח ריק — אם ברצונך למחוק, השתמש ב-clear_api_key".to_string());
+    }
+    let provider_id: &'static str = match provider.as_str() {
+        "deepgram" => "deepgram",
+        "groq" => "groq",
+        other => return Err(format!("ספק לא נתמך: {}", other)),
+    };
+    secure_keys::save_key(provider_id, &key)?;
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    match provider_id {
+        "deepgram" => s.deepgram_api_key = Some(key),
+        "groq" => s.groq_api_key = Some(key),
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Remove an API key from OS-secure storage and clear the in-memory cache.
+#[tauri::command]
+fn clear_api_key(state: State<AppState>, provider: String) -> Result<(), String> {
+    let provider_id: &'static str = match provider.as_str() {
+        "deepgram" => "deepgram",
+        "groq" => "groq",
+        other => return Err(format!("ספק לא נתמך: {}", other)),
+    };
+    secure_keys::delete_key(provider_id)?;
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    match provider_id {
+        "deepgram" => s.deepgram_api_key = None,
+        "groq" => s.groq_api_key = None,
+        _ => unreachable!(),
+    }
     Ok(())
 }
 
@@ -575,16 +618,55 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(AppState {
-            recorder: Mutex::new(AudioRecorder::new()),
-            whisper_engine: Mutex::new(None),
-            settings: Mutex::new(settings::load_settings()),
-            streaming: tokio::sync::Mutex::new(None),
-            main_was_visible_before_toolbar: AtomicBool::new(false),
+        .manage({
+            let load_result = settings::load_settings();
+            AppState {
+                recorder: Mutex::new(AudioRecorder::new()),
+                whisper_engine: Mutex::new(None),
+                settings: Mutex::new(load_result.settings),
+                streaming: tokio::sync::Mutex::new(None),
+                main_was_visible_before_toolbar: AtomicBool::new(false),
+                migration_outcome: Mutex::new(Some(load_result.migration)),
+            }
         })
         .setup(|app| {
             setup_global_shortcuts(app.handle());
             let _ = setup_tray(app.handle());
+
+            // Surface the one-shot key migration result (if any) to the frontend.
+            // Only ever fires once per app launch — we `take()` the value here.
+            let outcome = {
+                let state = app.state::<AppState>();
+                let mut guard = state
+                    .migration_outcome
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.take()
+            };
+            if let Some(outcome) = outcome {
+                use settings::MigrationOutcome;
+                match outcome {
+                    MigrationOutcome::Migrated { providers } => {
+                        let _ = app.emit(
+                            "key-migration",
+                            serde_json::json!({
+                                "status": "migrated",
+                                "providers": providers,
+                            }),
+                        );
+                    }
+                    MigrationOutcome::Failed { error } => {
+                        let _ = app.emit(
+                            "key-migration",
+                            serde_json::json!({
+                                "status": "failed",
+                                "error": error,
+                            }),
+                        );
+                    }
+                    MigrationOutcome::NoOp => {}
+                }
+            }
 
             use tauri_plugin_autostart::ManagerExt;
             let autostart = app.autolaunch();
@@ -644,6 +726,8 @@ pub fn run() {
             get_all_models_status,
             get_settings,
             update_settings,
+            set_api_key,
+            clear_api_key,
             test_api_key,
             inject_text,
             get_audio_devices,

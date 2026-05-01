@@ -1890,13 +1890,14 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "hebrew-dictation"
-version = "2.5.0"
+version = "2.6.0"
 dependencies = [
  "arboard",
  "cpal",
  "dirs 6.0.0",
  "enigo",
  "futures-util",
+ "keyring",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2451,6 +2452,16 @@ dependencies = [
  "bitflags 2.11.0",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "keyring"
+version = "3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
+dependencies = [
+ "log",
+ "zeroize",
 ]
 
 [[package]]
