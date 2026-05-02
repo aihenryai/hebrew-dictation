@@ -6,12 +6,17 @@ use std::time::Instant;
 /// Threshold tuned for multi-channel mics that interleave mostly-silent channels.
 /// 4-channel mics dilute per-frame RMS by √4 compared to mono, so we set this low.
 const SILENCE_THRESHOLD: f32 = 0.002;
-const SILENCE_DURATION_SECS: f32 = 4.5;
+/// Default silence-to-stop duration. Configurable from Settings via `set_silence_duration_secs`.
+const DEFAULT_SILENCE_DURATION_SECS: f32 = 4.5;
 const MIN_SPEECH_DURATION_SECS: f32 = 0.5;
 const VAD_CHECK_INTERVAL_MS: u64 = 100;
 
-/// Default maximum recording duration in seconds (local mode)
+/// Default maximum recording duration in seconds. Configurable from Settings via
+/// `set_max_recording_secs`. Effective ceiling is enforced in the setter.
 const DEFAULT_MAX_RECORDING_SECS: f32 = 60.0;
+/// Hard ceiling for any recording, even when the user picks "unlimited" — protects
+/// RAM and keeps API costs bounded. 1 hour is more than any reasonable dictation.
+const MAX_RECORDING_CEILING_SECS: f32 = 3600.0;
 
 /// Callback invoked from the CPAL audio thread with 16kHz mono f32 samples.
 /// Used by streaming mode to push chunks to a WebSocket writer.
@@ -36,6 +41,14 @@ pub struct AudioRecorder {
     vad_thread: Option<std::thread::JoinHandle<()>>,
     /// Max recording duration (configurable per mode)
     max_recording_secs: Arc<Mutex<f32>>,
+    /// Silence duration (in seconds) before VAD auto-stop fires.
+    silence_duration_secs: Arc<Mutex<f32>>,
+    /// Preferred input device name (None = system default).
+    preferred_device: Arc<Mutex<Option<String>>>,
+    /// When true, the recorder discards incoming audio (samples are not appended,
+    /// and the streaming callback is not invoked). VAD timeout/silence checks also
+    /// pause so the user can take an indefinite break without losing the buffer.
+    is_paused: Arc<Mutex<bool>>,
     /// Optional callback — when set, each audio chunk is also forwarded (16kHz mono) to the callback.
     chunk_callback: Arc<Mutex<Option<ChunkCallback>>>,
 }
@@ -54,6 +67,9 @@ impl AudioRecorder {
             vad_enabled: Arc::new(Mutex::new(true)),
             vad_thread: None,
             max_recording_secs: Arc::new(Mutex::new(DEFAULT_MAX_RECORDING_SECS)),
+            silence_duration_secs: Arc::new(Mutex::new(DEFAULT_SILENCE_DURATION_SECS)),
+            preferred_device: Arc::new(Mutex::new(None)),
+            is_paused: Arc::new(Mutex::new(false)),
             chunk_callback: Arc::new(Mutex::new(None)),
         }
     }
@@ -77,16 +93,47 @@ impl AudioRecorder {
 
     pub fn set_max_recording_secs(&self, secs: f32) {
         if let Ok(mut max) = self.max_recording_secs.lock() {
-            *max = secs.clamp(1.0, 300.0);
+            *max = secs.clamp(1.0, MAX_RECORDING_CEILING_SECS);
+        }
+    }
+
+    /// Configure the silence-to-stop duration in seconds. Clamped to [0.5, 30].
+    pub fn set_silence_duration_secs(&self, secs: f32) {
+        if let Ok(mut s) = self.silence_duration_secs.lock() {
+            *s = secs.clamp(0.5, 30.0);
+        }
+    }
+
+    /// Choose a preferred input device by name. Pass `None` to fall back to the
+    /// system default. The change applies to the next recording — does not interrupt
+    /// an active stream.
+    pub fn set_preferred_device(&self, device: Option<String>) {
+        if let Ok(mut d) = self.preferred_device.lock() {
+            *d = device.filter(|s| !s.is_empty());
         }
     }
 
     pub fn start_recording(&mut self) -> Result<(), String> {
         // Query device info on the main thread (this is safe)
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or("No input device available")?;
+        let preferred = self
+            .preferred_device
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        let device = match preferred {
+            Some(name) => host
+                .input_devices()
+                .ok()
+                .and_then(|mut devs| {
+                    devs.find(|d| d.name().ok().as_deref() == Some(name.as_str()))
+                })
+                .or_else(|| host.default_input_device())
+                .ok_or("No input device available")?,
+            None => host
+                .default_input_device()
+                .ok_or("No input device available")?,
+        };
 
         let default_config = device
             .default_input_config()
@@ -123,13 +170,27 @@ impl AudioRecorder {
         // Create and own the stream in a dedicated thread (avoids unsafe Send)
         let samples_clone = self.samples.clone();
         let is_recording_clone = self.is_recording.clone();
+        let is_paused_clone = self.is_paused.clone();
         let chunk_callback_clone = self.chunk_callback.clone();
+        // Capture the chosen device name so the stream-owner thread picks the same one.
+        // `Device` itself isn't `Send`, so we re-resolve by name inside the thread.
+        let chosen_device_name = device.name().ok();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
         let handle = std::thread::spawn(move || {
             let host = cpal::default_host();
-            let device = match host.default_input_device() {
+            let device = match chosen_device_name.as_ref() {
+                Some(name) => host
+                    .input_devices()
+                    .ok()
+                    .and_then(|mut devs| {
+                        devs.find(|d| d.name().ok().as_deref() == Some(name.as_str()))
+                    })
+                    .or_else(|| host.default_input_device()),
+                None => host.default_input_device(),
+            };
+            let device = match device {
                 Some(d) => d,
                 None => {
                     let _ = ready_tx.send(Err("No input device".to_string()));
@@ -145,12 +206,20 @@ impl AudioRecorder {
 
             let samples = samples_clone;
             let is_recording = is_recording_clone;
+            let is_paused = is_paused_clone;
             let chunk_callback = chunk_callback_clone;
 
             let stream = match device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let is_rec = is_recording.lock().map(|r| *r).unwrap_or(false);
+                    let paused = is_paused.lock().map(|p| *p).unwrap_or(false);
+
+                    // While paused, drop the audio — neither buffer nor stream callback.
+                    // VAD also skips pause time so the user can resume after a break.
+                    if paused {
+                        return;
+                    }
 
                     // Local-mode samples rely on is_recording for trimming the tail.
                     if is_rec {
@@ -218,6 +287,8 @@ impl AudioRecorder {
         let timeout_reached = self.timeout_reached.clone();
         let vad_enabled = self.vad_enabled.clone();
         let max_recording_secs = self.max_recording_secs.clone();
+        let silence_duration_secs = self.silence_duration_secs.clone();
+        let is_paused = self.is_paused.clone();
 
         let samples_per_check =
             (sample_rate as f32 * (VAD_CHECK_INTERVAL_MS as f32 / 1000.0)) as usize
@@ -238,6 +309,13 @@ impl AudioRecorder {
                     }
                 } else {
                     break;
+                }
+
+                // Skip the entire VAD/timeout pass while paused — the user is
+                // taking a break, don't auto-stop or count time against them.
+                if is_paused.lock().map(|p| *p).unwrap_or(false) {
+                    silence_start = None; // reset silence on resume
+                    continue;
                 }
 
                 let (total_samples, rms) = {
@@ -284,7 +362,11 @@ impl AudioRecorder {
 
                 if had_speech {
                     if let Some(start) = silence_start {
-                        if start.elapsed().as_secs_f32() >= SILENCE_DURATION_SECS {
+                        let threshold = silence_duration_secs
+                            .lock()
+                            .map(|s| *s)
+                            .unwrap_or(DEFAULT_SILENCE_DURATION_SECS);
+                        if start.elapsed().as_secs_f32() >= threshold {
                             if let Ok(mut silence) = silence_detected.lock() {
                                 *silence = true;
                             }
@@ -302,6 +384,10 @@ impl AudioRecorder {
         {
             let mut recording = self.is_recording.lock().map_err(|e| e.to_string())?;
             *recording = false;
+        }
+        // Reset pause state so the next recording starts clean.
+        if let Ok(mut p) = self.is_paused.lock() {
+            *p = false;
         }
 
         if let Some(handle) = self.vad_thread.take() {
@@ -346,6 +432,19 @@ impl AudioRecorder {
         if let Ok(mut vad) = self.vad_enabled.lock() {
             *vad = enabled;
         }
+    }
+
+    /// Pause / resume sample capture without dropping the accumulated buffer.
+    /// While paused, the CPAL callback discards incoming audio and the VAD
+    /// monitor skips silence/timeout checks.
+    pub fn set_paused(&self, paused: bool) {
+        if let Ok(mut p) = self.is_paused.lock() {
+            *p = paused;
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.is_paused.lock().map(|p| *p).unwrap_or(false)
     }
 }
 

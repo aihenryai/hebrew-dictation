@@ -1437,3 +1437,37 @@ body:has(.toolbar-view) #root {
   background: rgba(255, 59, 92, 0.55);
 }
 
+.toolbar-pause {
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  color: #fff;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease;
+}
+
+.toolbar-pause:hover {
+  background: rgba(255, 200, 80, 0.35);
+}
+
+.toolbar-pause:active {
+  background: rgba(255, 200, 80, 0.55);
+}
+
+/* Paused state — dim the dot animation, color the live text */
+.toolbar-view.paused .toolbar-dot {
+  animation: none;
+  background: rgba(255, 200, 80, 0.85);
+  box-shadow: 0 0 6px rgba(255, 200, 80, 0.6);
+}
+.toolbar-view.paused .toolbar-live {
+  color: rgba(255, 200, 80, 0.95);
+}
+

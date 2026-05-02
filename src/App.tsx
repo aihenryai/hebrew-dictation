@@ -6,7 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.6.0";
+const APP_VERSION = "v2.7.0";
 const APP_LICENSE = "MIT";
 
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
@@ -30,7 +30,7 @@ const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
 
 type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loading-model";
 type AppView = "main" | "settings" | "onboarding";
-type Language = "he" | "en" | "multi" | "auto";
+type Language = "he" | "en" | "multi";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "deepgram" | "groq";
 
@@ -48,6 +48,11 @@ interface AppSettings {
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
+  hotkey?: string;
+  vad_silence_secs?: number;
+  max_recording_secs?: number;
+  unlimited_recording?: boolean;
+  preferred_audio_device?: string | null;
 }
 
 /** Redacted settings returned from the backend (keys replaced with booleans). */
@@ -66,6 +71,11 @@ interface RedactedSettings {
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
+  hotkey?: string;
+  vad_silence_secs?: number;
+  max_recording_secs?: number;
+  unlimited_recording?: boolean;
+  preferred_audio_device?: string | null;
 }
 
 interface InterimPayload {
@@ -84,6 +94,79 @@ interface ModelInfo {
 const MIN_TRANSCRIBE_SAMPLES = 8000;
 const MAX_RECORDING_LOCAL = 60;
 const MAX_RECORDING_API = 120; // 2 minutes max for API
+
+/** Human-readable label for a hotkey combo string (e.g. "alt+d" → "Alt + D"). */
+function formatHotkey(combo: string): string {
+  if (!combo) return "";
+  return combo
+    .split("+")
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return "";
+      return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
+    })
+    .filter(Boolean)
+    .join(" + ");
+}
+
+/** Build a Tauri-compatible combo string from a keyboard event. Returns null
+ * for modifier-only presses (no main key yet) — caller keeps capturing. */
+function buildComboFromKeyEvent(e: KeyboardEvent): string | null {
+  const modifiers: string[] = [];
+  if (e.ctrlKey) modifiers.push("ctrl");
+  if (e.altKey) modifiers.push("alt");
+  if (e.shiftKey) modifiers.push("shift");
+  if (e.metaKey) modifiers.push("super");
+
+  const key = e.key;
+  // Modifier-only press — keep capturing until a real key arrives.
+  if (["Control", "Alt", "Shift", "Meta", "Dead"].includes(key)) return null;
+
+  // Normalize the main key:
+  // - Single letters → lowercase ("d", not "D")
+  // - F-keys → "f1".."f24"
+  // - Arrow keys, Enter, Escape, etc. → lowercase token Tauri accepts
+  let mainKey: string;
+  if (key.length === 1) {
+    mainKey = key.toLowerCase();
+  } else if (/^F\d{1,2}$/.test(key)) {
+    mainKey = key.toLowerCase();
+  } else {
+    const map: Record<string, string> = {
+      ArrowUp: "up",
+      ArrowDown: "down",
+      ArrowLeft: "left",
+      ArrowRight: "right",
+      Enter: "enter",
+      Escape: "escape",
+      Backspace: "backspace",
+      Tab: "tab",
+      " ": "space",
+      Spacebar: "space",
+      Insert: "insert",
+      Delete: "delete",
+      Home: "home",
+      End: "end",
+      PageUp: "pageup",
+      PageDown: "pagedown",
+    };
+    mainKey = map[key] ?? key.toLowerCase();
+  }
+
+  // Reject combos without any modifier — too easy to trigger by accident
+  // (typing "d" anywhere on the desktop). Unless it's an F-key.
+  if (modifiers.length === 0 && !/^f\d{1,2}$/.test(mainKey)) return null;
+
+  return [...modifiers, mainKey].join("+");
+}
+
+/** Render a duration in seconds as a Hebrew label: "30s", "2 דקות", "10 דקות". */
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const mins = secs / 60;
+  if (Number.isInteger(mins)) return mins === 1 ? "דקה" : `${mins} דקות`;
+  return `${mins.toFixed(1)} דקות`;
+}
 
 let historyIdCounter = 0;
 function App() {
@@ -123,6 +206,14 @@ function App() {
   const [autostartEnabled, setAutostartEnabled] = useState(true);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
   const [floatingToolbarEnabled, setFloatingToolbarEnabled] = useState(true);
+  // v2.7.0 — configurable behavior
+  const [hotkey, setHotkey] = useState<string>("alt+d");
+  const [hotkeyCapturing, setHotkeyCapturing] = useState(false);
+  const [hotkeyError, setHotkeyError] = useState<string | null>(null);
+  const [vadSilenceSecs, setVadSilenceSecs] = useState<number>(4.5);
+  const [maxRecordingSecs, setMaxRecordingSecs] = useState<number>(60);
+  const [unlimitedRecording, setUnlimitedRecording] = useState<boolean>(false);
+  const [preferredAudioDevice, setPreferredAudioDevice] = useState<string | null>(null);
   const [livePreview, setLivePreview] = useState("");
   const [copiedHistoryId, setCopiedHistoryId] = useState<number | null>(null);
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string } | null>(null);
@@ -145,7 +236,17 @@ function App() {
   useEffect(() => { transcriptionModeRef.current = transcriptionMode; }, [transcriptionMode]);
   useEffect(() => { streamingEnabledRef.current = streamingEnabled; }, [streamingEnabled]);
 
-  const getMaxRecordingSecs = () => transcriptionModeRef.current === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
+  const maxRecordingSecsRef = useRef(60);
+  const unlimitedRecordingRef = useRef(false);
+  useEffect(() => { maxRecordingSecsRef.current = maxRecordingSecs; }, [maxRecordingSecs]);
+  useEffect(() => { unlimitedRecordingRef.current = unlimitedRecording; }, [unlimitedRecording]);
+
+  // User override → unlimited (mapped to backend's hard ceiling) → mode-based default.
+  const getMaxRecordingSecs = () => {
+    if (unlimitedRecordingRef.current) return 3600;
+    if (maxRecordingSecsRef.current > 0) return maxRecordingSecsRef.current;
+    return transcriptionModeRef.current === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
+  };
 
   const stopVadPolling = useCallback(() => {
     if (vadPollRef.current) {
@@ -170,12 +271,20 @@ function App() {
     }
   }, []);
 
-  const stopAndTranscribe = useCallback(async () => {
+  const stopAndTranscribe = useCallback(async (fromToolbar: boolean = false) => {
     if (statusRef.current !== "recording") return;
 
     setStatus("transcribing");
     stopVadPolling();
     stopTimer();
+
+    // Snappy UX when the user clicked the toolbar's stop button: dismiss the
+    // floating bar and surface the main window immediately, BEFORE we kick off
+    // transcription (which can take a few seconds on slower machines / API).
+    // The main window's "⏳ מתמלל..." status carries the user through the wait.
+    if (fromToolbar) {
+      await invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
+    }
 
     try {
       if (streamingEnabledRef.current) {
@@ -193,7 +302,15 @@ function App() {
       } else {
         const samples = await invoke("stop_recording") as number[];
         if (samples.length < MIN_TRANSCRIBE_SAMPLES) {
+          // Too short to transcribe — but still close the toolbar / restore main
+          // (early-return here used to leave the floating bar stuck on screen).
+          // For fromToolbar==true the early hide above already ran; this is the
+          // safety net for the Alt+D / auto-stop / button paths.
+          if (!fromToolbar) {
+            await invoke("hide_toolbar_window", { forceShowMain: false }).catch(() => {});
+          }
           setStatus("idle");
+          setRecordingTime(0);
           return;
         }
 
@@ -209,7 +326,11 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-    await invoke("hide_toolbar_window").catch(() => {});
+    // For fromToolbar==true the toolbar was already hidden up top (snappy UX).
+    // For Alt+D / button / auto-stop, hide it now after transcription completes.
+    if (!fromToolbar) {
+      await invoke("hide_toolbar_window", { forceShowMain: false }).catch(() => {});
+    }
     setStatus("idle");
     setRecordingTime(0);
   }, [stopVadPolling, stopTimer, injectText]);
@@ -255,10 +376,11 @@ function App() {
 
   // Hotkey handler
   useEffect(() => {
-    const unlistenHotkey = listen("hotkey-pressed", async () => {
+    const unlistenHotkey = listen<string>("hotkey-pressed", async (event) => {
+      const fromToolbar = event.payload === "toolbar";
       const currentStatus = statusRef.current;
       if (currentStatus === "recording") {
-        stopAndTranscribe();
+        stopAndTranscribe(fromToolbar);
       } else if (currentStatus === "idle") {
         await beginRecording();
       }
@@ -391,7 +513,13 @@ function App() {
       const settings = await invoke("get_settings") as RedactedSettings;
       setTranscriptionMode(settings.transcription_mode);
       setApiProvider(settings.api_provider);
-      setLanguage(settings.language as Language);
+      // Defensive: legacy "auto" language is migrated to "he" by the backend,
+      // but if any code path slips through, normalize here too.
+      const lang = (settings.language === "auto" ? "he" : settings.language) as Language;
+      setLanguage(lang);
+      if (settings.language === "auto") {
+        persistSettings({ language: "he" });
+      }
       setVadEnabled(settings.vad_enabled);
       // Keys are redacted — just track whether they exist on the backend.
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
@@ -406,6 +534,13 @@ function App() {
         }
       }
       if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
+      if (typeof settings.hotkey === "string" && settings.hotkey) setHotkey(settings.hotkey);
+      if (typeof settings.vad_silence_secs === "number") setVadSilenceSecs(settings.vad_silence_secs);
+      if (typeof settings.max_recording_secs === "number") setMaxRecordingSecs(settings.max_recording_secs);
+      if (typeof settings.unlimited_recording === "boolean") setUnlimitedRecording(settings.unlimited_recording);
+      if (typeof settings.preferred_audio_device !== "undefined") {
+        setPreferredAudioDevice(settings.preferred_audio_device ?? null);
+      }
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
@@ -451,10 +586,15 @@ function App() {
       autostart_enabled: autostartEnabled,
       streaming_enabled: streamingEnabled,
       floating_toolbar_enabled: floatingToolbarEnabled,
+      hotkey: hotkey,
+      vad_silence_secs: vadSilenceSecs,
+      max_recording_secs: maxRecordingSecs,
+      unlimited_recording: unlimitedRecording,
+      preferred_audio_device: preferredAudioDevice,
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -464,6 +604,26 @@ function App() {
   /** Remove an API key from OS-secure storage. */
   const clearApiKey = useCallback(async (provider: ApiProvider) => {
     await invoke("clear_api_key", { provider });
+  }, []);
+
+  /** Apply a new global hotkey at runtime. Throws on parse error / OS conflict. */
+  const applyHotkey = useCallback(async (combo: string) => {
+    await invoke("set_hotkey", { combo });
+  }, []);
+
+  /** Push the silence-to-stop duration to the running recorder. */
+  const applySilenceDuration = useCallback(async (secs: number) => {
+    await invoke("set_silence_duration_secs", { secs }).catch(() => {});
+  }, []);
+
+  /** Push the max recording duration to the running recorder. */
+  const applyMaxRecording = useCallback(async (secs: number) => {
+    await invoke("set_max_recording_secs", { secs }).catch(() => {});
+  }, []);
+
+  /** Push the preferred audio device to the running recorder. */
+  const applyPreferredDevice = useCallback(async (device: string | null) => {
+    await invoke("set_preferred_audio_device", { device }).catch(() => {});
   }, []);
 
   async function handleTestApiKey() {
@@ -522,13 +682,18 @@ function App() {
 
   // Computed
   const downloadedCount = models.filter((m) => m.downloaded).length;
-  const maxRecordingSecs = transcriptionMode === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API;
-  const timeRemaining = maxRecordingSecs - recordingTime;
-  const showTimeWarning = status === "recording" && timeRemaining <= 10;
+  // User override takes precedence; unlimited disables the countdown entirely.
+  const effectiveMaxRecordingSecs = unlimitedRecording
+    ? Infinity
+    : (maxRecordingSecs > 0
+        ? maxRecordingSecs
+        : (transcriptionMode === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API));
+  const timeRemaining = unlimitedRecording ? Infinity : (effectiveMaxRecordingSecs - recordingTime);
+  const showTimeWarning = status === "recording" && Number.isFinite(timeRemaining) && timeRemaining <= 10;
   const activeApiKey = apiProvider === "groq" ? groqKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
-  const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית", auto: "אוטומטי" };
+  const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית" };
   const modeLabel = transcriptionMode === "api" ? "API" : transcriptionMode === "local" ? "מקומי" : "אוטומטי";
 
   // ---- ONBOARDING WIZARD ----
@@ -1015,7 +1180,7 @@ function App() {
         <div className="settings-section">
           <h3>שפה</h3>
           <div className="settings-row">
-            {(["he", "en", "multi", "auto"] as Language[]).map((lang) => (
+            {(["he", "en", "multi"] as Language[]).map((lang) => (
               <button
                 key={lang}
                 className={`btn-option ${language === lang ? "active" : ""}`}
@@ -1027,9 +1192,59 @@ function App() {
           </div>
         </div>
 
-        {/* VAD */}
+        {/* Hotkey — configurable global shortcut (v2.7.0) */}
         <div className="settings-section">
-          <h3>עצירה אוטומטית</h3>
+          <h3>קיצור מקלדת להפעלה</h3>
+          <p className="settings-hint">
+            לחץ על השדה ואז על השילוב הרצוי (למשל: Ctrl+Shift+D, Alt+Q, F8). חייב לכלול לפחות מקש פעיל.
+          </p>
+          <div className="settings-row" style={{ alignItems: "center", gap: 12 }}>
+            <input
+              type="text"
+              readOnly
+              value={hotkeyCapturing ? "לחץ על השילוב הרצוי..." : formatHotkey(hotkey)}
+              className={`hotkey-input ${hotkeyCapturing ? "capturing" : ""}`}
+              onFocus={() => { setHotkeyCapturing(true); setHotkeyError(null); }}
+              onBlur={() => setHotkeyCapturing(false)}
+              onKeyDown={async (e) => {
+                if (!hotkeyCapturing) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const combo = buildComboFromKeyEvent(e.nativeEvent);
+                if (!combo) return; // modifier-only press — keep waiting
+                try {
+                  await applyHotkey(combo);
+                  setHotkey(combo);
+                  setHotkeyError(null);
+                  setHotkeyCapturing(false);
+                  (e.target as HTMLInputElement).blur();
+                } catch (err) {
+                  setHotkeyError(String(err));
+                }
+              }}
+              placeholder="Alt+D"
+            />
+            <button
+              className="btn-secondary"
+              onClick={async () => {
+                try {
+                  await applyHotkey("alt+d");
+                  setHotkey("alt+d");
+                  setHotkeyError(null);
+                } catch (err) {
+                  setHotkeyError(String(err));
+                }
+              }}
+            >
+              איפוס ל-Alt+D
+            </button>
+          </div>
+          {hotkeyError && <p className="settings-error">{hotkeyError}</p>}
+        </div>
+
+        {/* VAD — toggle + duration slider (v2.7.0) */}
+        <div className="settings-section">
+          <h3>עצירה אוטומטית בשקט</h3>
           <label className="toggle-label">
             <input
               type="checkbox"
@@ -1041,8 +1256,100 @@ function App() {
                 persistSettings({ vad_enabled: newVal });
               }}
             />
-            <span className="toggle-text">עצור כשמפסיקים לדבר (4.5 שניות שקט)</span>
+            <span className="toggle-text">
+              עצור כשמפסיקים לדבר {vadEnabled ? `(${vadSilenceSecs.toFixed(1)} שניות שקט)` : ""}
+            </span>
           </label>
+          {vadEnabled && (
+            <div className="settings-slider-row">
+              <input
+                type="range"
+                min={1}
+                max={10}
+                step={0.5}
+                value={vadSilenceSecs}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setVadSilenceSecs(v);
+                  applySilenceDuration(v);
+                }}
+                onMouseUp={() => persistSettings({ vad_silence_secs: vadSilenceSecs })}
+                onTouchEnd={() => persistSettings({ vad_silence_secs: vadSilenceSecs })}
+              />
+              <span className="settings-slider-value">{vadSilenceSecs.toFixed(1)}s</span>
+            </div>
+          )}
+        </div>
+
+        {/* Max recording length — checkbox + slider (v2.7.0) */}
+        <div className="settings-section">
+          <h3>אורך הקלטה מקסימלי</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={unlimitedRecording}
+              onChange={() => {
+                const v = !unlimitedRecording;
+                setUnlimitedRecording(v);
+                // Push the effective value (3600 = 1h ceiling) to the running recorder.
+                applyMaxRecording(v ? 3600 : maxRecordingSecs);
+                persistSettings({ unlimited_recording: v });
+              }}
+            />
+            <span className="toggle-text">ללא הגבלת זמן</span>
+          </label>
+          {!unlimitedRecording && (
+            <>
+              <div className="settings-slider-row">
+                <input
+                  type="range"
+                  min={10}
+                  max={600}
+                  step={10}
+                  value={maxRecordingSecs}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    setMaxRecordingSecs(v);
+                    applyMaxRecording(v);
+                  }}
+                  onMouseUp={() => persistSettings({ max_recording_secs: maxRecordingSecs })}
+                  onTouchEnd={() => persistSettings({ max_recording_secs: maxRecordingSecs })}
+                />
+                <span className="settings-slider-value">{formatDuration(maxRecordingSecs)}</span>
+              </div>
+              <p className="settings-hint">
+                הקלטה תיעצר אוטומטית כשהזמן ייגמר. רלוונטי בעיקר כדי למנוע הקלטות אינסופיות אם שכחת את המיקרופון פתוח.
+              </p>
+            </>
+          )}
+          {unlimitedRecording && (
+            <p className="settings-hint">
+              הקלטות ארוכות עלולות לצרוך הרבה RAM (במצב מקומי) או קרדיט (ב-API). תקרה קשיחה: שעה אחת.
+            </p>
+          )}
+        </div>
+
+        {/* Microphone picker (v2.7.0) */}
+        <div className="settings-section">
+          <h3>מיקרופון</h3>
+          <select
+            className="settings-select"
+            value={preferredAudioDevice ?? ""}
+            onChange={async (e) => {
+              const v = e.target.value === "" ? null : e.target.value;
+              setPreferredAudioDevice(v);
+              await applyPreferredDevice(v);
+              persistSettings({ preferred_audio_device: v });
+            }}
+          >
+            <option value="">ברירת מחדל של מערכת ההפעלה</option>
+            {devices.map((d) => (
+              <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
+          <p className="settings-hint">
+            השינוי חל בהקלטה הבאה — הקלטה פעילה לא נקטעת.
+          </p>
         </div>
 
         {/* Streaming — simultaneous transcription via Deepgram WebSocket */}
@@ -1343,11 +1650,11 @@ function App() {
         </button>
       </div>
 
-      {/* Recording progress bar */}
-      {status === "recording" && (
+      {/* Recording progress bar — hidden in unlimited mode */}
+      {status === "recording" && !unlimitedRecording && (
         <div className="recording-progress">
           <div className="progress-bar">
-            <div className={`progress-fill ${showTimeWarning ? "warning" : ""}`} style={{ width: `${(recordingTime / maxRecordingSecs) * 100}%` }} />
+            <div className={`progress-fill ${showTimeWarning ? "warning" : ""}`} style={{ width: `${(recordingTime / effectiveMaxRecordingSecs) * 100}%` }} />
           </div>
         </div>
       )}
@@ -1412,7 +1719,7 @@ function App() {
       )}
 
       <div className="footer">
-        <span>Alt+D · {langLabels[language]} · {vadEnabled ? "אוטומטי" : "ידני"}</span>
+        <span>{formatHotkey(hotkey)} · {langLabels[language]} · {vadEnabled ? "עצירה אוטומטית" : "עצירה ידנית"}</span>
         <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="footer-brand">BinTech AI</a>
       </div>
     </main>
@@ -1428,6 +1735,7 @@ export default App;
  */
 export function ToolbarApp() {
   const [livePreview, setLivePreview] = useState("");
+  const [paused, setPaused] = useState(false);
   const liveFinalRef = useRef("");
 
   useEffect(() => {
@@ -1448,6 +1756,7 @@ export function ToolbarApp() {
     const unlistenReset = listen("toolbar-reset", () => {
       liveFinalRef.current = "";
       setLivePreview("");
+      setPaused(false);
     });
     return () => {
       unlistenInterim.then((fn) => fn());
@@ -1460,12 +1769,33 @@ export function ToolbarApp() {
     await emit("hotkey-pressed", "toolbar");
   }, []);
 
+  const handlePauseToggle = useCallback(async () => {
+    try {
+      if (paused) {
+        await invoke("resume_recording");
+        setPaused(false);
+      } else {
+        await invoke("pause_recording");
+        setPaused(true);
+      }
+    } catch { /* keep state in sync if backend rejected */ }
+  }, [paused]);
+
   return (
-    <div className="toolbar-view" dir="rtl">
+    <div className={`toolbar-view ${paused ? "paused" : ""}`} dir="rtl">
       <span className="toolbar-dot" aria-hidden="true" />
       <span className="toolbar-live" dir="auto">
-        {livePreview || "מקליט..."}
+        {paused ? "⏸ הושהה" : (livePreview || "מקליט...")}
       </span>
+      <button
+        type="button"
+        className="toolbar-pause"
+        onClick={handlePauseToggle}
+        title={paused ? "המשך" : "השהה"}
+        aria-label={paused ? "המשך" : "השהה"}
+      >
+        {paused ? "▶" : "⏸"}
+      </button>
       <button
         type="button"
         className="toolbar-stop"

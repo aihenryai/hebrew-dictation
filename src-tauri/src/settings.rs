@@ -80,6 +80,16 @@ pub struct AppSettings {
     pub streaming_enabled: bool,
     #[serde(default = "default_true")]
     pub floating_toolbar_enabled: bool,
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
+    #[serde(default = "default_silence_duration_secs")]
+    pub vad_silence_secs: f32,
+    #[serde(default = "default_max_recording_secs")]
+    pub max_recording_secs: f32,
+    #[serde(default)]
+    pub unlimited_recording: bool,
+    #[serde(default)]
+    pub preferred_audio_device: Option<String>,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -99,6 +109,11 @@ pub struct RedactedSettings {
     pub autostart_enabled: bool,
     pub streaming_enabled: bool,
     pub floating_toolbar_enabled: bool,
+    pub hotkey: String,
+    pub vad_silence_secs: f32,
+    pub max_recording_secs: f32,
+    pub unlimited_recording: bool,
+    pub preferred_audio_device: Option<String>,
 }
 
 impl AppSettings {
@@ -118,6 +133,11 @@ impl AppSettings {
             autostart_enabled: self.autostart_enabled,
             streaming_enabled: self.streaming_enabled,
             floating_toolbar_enabled: self.floating_toolbar_enabled,
+            hotkey: self.hotkey.clone(),
+            vad_silence_secs: self.vad_silence_secs,
+            max_recording_secs: self.max_recording_secs,
+            unlimited_recording: self.unlimited_recording,
+            preferred_audio_device: self.preferred_audio_device.clone(),
         }
     }
 }
@@ -132,6 +152,18 @@ fn default_language() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_hotkey() -> String {
+    "alt+d".to_string()
+}
+
+fn default_silence_duration_secs() -> f32 {
+    4.5
+}
+
+fn default_max_recording_secs() -> f32 {
+    60.0
 }
 
 impl Default for AppSettings {
@@ -151,6 +183,11 @@ impl Default for AppSettings {
             autostart_enabled: true,
             streaming_enabled: true,
             floating_toolbar_enabled: true,
+            hotkey: default_hotkey(),
+            vad_silence_secs: default_silence_duration_secs(),
+            max_recording_secs: default_max_recording_secs(),
+            unlimited_recording: false,
+            preferred_audio_device: None,
         }
     }
 }
@@ -208,6 +245,20 @@ pub fn load_settings() -> LoadResult {
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+
+    // Backward-compat: if onboarding was completed in a previous version, the
+    // user already accepted the terms once via the wizard (or skipped them in
+    // a pre-2.4.0 install but is now grandfathered). Don't keep prompting on
+    // every upgrade — auto-mark as accepted.
+    if settings.onboarding_completed && !settings.terms_accepted {
+        settings.terms_accepted = true;
+    }
+
+    // Backward-compat: "auto" was an old language option that doesn't map to a
+    // valid Deepgram/Groq value. Migrate to "he" (Hebrew default).
+    if settings.language == "auto" {
+        settings.language = "he".to_string();
+    }
 
     // 1) Load existing keys from keyring (works on fresh installs and post-migration).
     if let Ok(Some(k)) = crate::secure_keys::load_key("deepgram") {

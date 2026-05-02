@@ -51,6 +51,25 @@ fn is_recording(state: State<AppState>) -> bool {
 }
 
 #[tauri::command]
+fn pause_recording(state: State<AppState>) -> Result<(), String> {
+    let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    recorder.set_paused(true);
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_recording(state: State<AppState>) -> Result<(), String> {
+    let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    recorder.set_paused(false);
+    Ok(())
+}
+
+#[tauri::command]
+fn is_paused(state: State<AppState>) -> bool {
+    state.recorder.lock().map(|r| r.is_paused()).unwrap_or(false)
+}
+
+#[tauri::command]
 fn check_silence(state: State<AppState>) -> bool {
     state.recorder.lock().map(|r| r.is_silence_detected()).unwrap_or(false)
 }
@@ -71,6 +90,77 @@ fn set_vad_enabled(state: State<AppState>, enabled: bool) -> Result<(), String> 
 fn set_max_recording_secs(state: State<AppState>, secs: f32) -> Result<(), String> {
     let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
     recorder.set_max_recording_secs(secs);
+    Ok(())
+}
+
+/// Configure the silence-to-stop duration. Frontend slider value flows here.
+#[tauri::command]
+fn set_silence_duration_secs(state: State<AppState>, secs: f32) -> Result<(), String> {
+    let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    recorder.set_silence_duration_secs(secs);
+    Ok(())
+}
+
+/// Choose the input device by name. `device` is `None` (or absent) for system default.
+#[tauri::command]
+fn set_preferred_audio_device(
+    state: State<AppState>,
+    device: Option<String>,
+) -> Result<(), String> {
+    let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    recorder.set_preferred_device(device);
+    Ok(())
+}
+
+/// Re-register the global toggle hotkey at runtime. On success, persists the new
+/// combo to settings.json. On failure, the previous registration is gone — caller
+/// must ask the user to retry, or we fall back below.
+#[tauri::command]
+fn set_hotkey(app: AppHandle, state: State<AppState>, combo: String) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let trimmed = combo.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Err("קיצור ריק — בחר שילוב מקשים תקין".to_string());
+    }
+
+    // Drop the old registration before installing the new one so we don't
+    // double-fire on the previous combo.
+    let _ = app.global_shortcut().unregister_all();
+
+    if let Err(e) = register_toggle_shortcut(&app, &trimmed) {
+        // Try to bring back the previous shortcut from settings so the app is
+        // never left without any toggle.
+        let prev = state
+            .settings
+            .lock()
+            .map(|s| s.hotkey.clone())
+            .unwrap_or_else(|_| "alt+d".to_string());
+        let _ = register_toggle_shortcut(&app, &prev);
+        return Err(e);
+    }
+
+    // Persist on success.
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    s.hotkey = trimmed;
+    settings::save_settings(&s)?;
+    Ok(())
+}
+
+/// Stop the floating toolbar AND show the main window — used when the user
+/// clicks the toolbar's stop button (vs. pressing the hotkey from another app).
+#[tauri::command]
+fn stop_via_toolbar(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if let Some(t) = app.get_webview_window("toolbar") {
+        let _ = t.hide();
+    }
+    state
+        .main_was_visible_before_toolbar
+        .store(false, Ordering::Relaxed);
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
     Ok(())
 }
 
@@ -524,17 +614,29 @@ fn show_toolbar_window(
 /// Hide the floating toolbar and restore the main window if it was visible
 /// before the toolbar took over.
 #[tauri::command]
-fn hide_toolbar_window(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+fn hide_toolbar_window(
+    app: AppHandle,
+    state: State<AppState>,
+    force_show_main: Option<bool>,
+) -> Result<(), String> {
     if let Some(t) = app.get_webview_window("toolbar") {
         let _ = t.hide();
     }
 
-    if state
+    let was_visible = state
         .main_was_visible_before_toolbar
-        .swap(false, Ordering::Relaxed)
-    {
+        .swap(false, Ordering::Relaxed);
+    let force = force_show_main.unwrap_or(false);
+
+    // Force is set when the user clicked the toolbar's stop button — they want
+    // to see the transcription, so promote the main window even if it wasn't
+    // visible before. Alt+D toggling preserves the original behavior.
+    if was_visible || force {
         if let Some(main) = app.get_webview_window("main") {
             let _ = main.show();
+            if force {
+                let _ = main.set_focus();
+            }
         }
     }
 
@@ -553,20 +655,35 @@ fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn setup_global_shortcuts(app: &AppHandle) {
-    let toggle_shortcut: Shortcut = "alt+d".parse().unwrap();
+/// Try to register the toggle hotkey on the global shortcut manager. The combo
+/// string follows the `tauri_plugin_global_shortcut` syntax — "alt+d", "ctrl+shift+f1",
+/// etc. Returns a Hebrew error string on parse failure or OS-level conflict.
+fn register_toggle_shortcut(app: &AppHandle, combo: &str) -> Result<(), String> {
+    let parsed: Shortcut = combo
+        .parse()
+        .map_err(|e| format!("פורמט קיצור לא תקין ('{}'): {}", combo, e))?;
 
     let app_handle = app.clone();
     app.global_shortcut()
-        .on_shortcut(toggle_shortcut, move |_app, shortcut, event| {
+        .on_shortcut(parsed, move |_app, shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 // Emit event without showing/focusing the window — keeps focus in the text field
                 let _ = app_handle.emit("hotkey-pressed", shortcut.to_string());
             }
         })
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to register shortcut: {}", e);
-        });
+        .map_err(|e| format!("רישום הקיצור נכשל ('{}'): {}", combo, e))
+}
+
+/// Apply the user's preferred hotkey on startup. Falls back to "alt+d" if
+/// registration fails (e.g. a corrupted settings.json picks a combo Windows
+/// already grabbed) so the app is never left without any way to toggle it.
+fn setup_global_shortcuts(app: &AppHandle, combo: &str) {
+    if let Err(e) = register_toggle_shortcut(app, combo) {
+        eprintln!("Hotkey '{}' failed to register: {}. Falling back to alt+d.", combo, e);
+        if let Err(e2) = register_toggle_shortcut(app, "alt+d") {
+            eprintln!("Fallback alt+d also failed: {}", e2);
+        }
+    }
 }
 
 fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -630,7 +747,39 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            setup_global_shortcuts(app.handle());
+            // Apply persisted recorder settings BEFORE wiring shortcuts so the very
+            // first hotkey press uses the user's configured behavior.
+            {
+                let state = app.state::<AppState>();
+                let s = state
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let recorder = state
+                    .recorder
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                recorder.set_vad_enabled(s.vad_enabled);
+                recorder.set_silence_duration_secs(s.vad_silence_secs);
+                let effective_max = if s.unlimited_recording {
+                    3600.0
+                } else {
+                    s.max_recording_secs
+                };
+                recorder.set_max_recording_secs(effective_max);
+                recorder.set_preferred_device(s.preferred_audio_device.clone());
+            }
+
+            // Read the user's preferred hotkey and register it (with fallback).
+            let combo = {
+                let state = app.state::<AppState>();
+                let s = state
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                s.hotkey.clone()
+            };
+            setup_global_shortcuts(app.handle(), &combo);
             let _ = setup_tray(app.handle());
 
             // Surface the one-shot key migration result (if any) to the frontend.
@@ -709,10 +858,17 @@ pub fn run() {
             start_recording,
             stop_recording,
             is_recording,
+            pause_recording,
+            resume_recording,
+            is_paused,
             check_silence,
             check_timeout,
             set_vad_enabled,
             set_max_recording_secs,
+            set_silence_duration_secs,
+            set_preferred_audio_device,
+            set_hotkey,
+            stop_via_toolbar,
             transcribe,
             start_streaming_transcription,
             stop_streaming_transcription,
