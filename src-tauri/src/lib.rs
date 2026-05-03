@@ -1,5 +1,6 @@
 mod api_transcribe;
 mod audio;
+mod export;
 mod injector;
 mod model;
 mod secure_keys;
@@ -124,25 +125,85 @@ fn set_hotkey(app: AppHandle, state: State<AppState>, combo: String) -> Result<(
         return Err("קיצור ריק — בחר שילוב מקשים תקין".to_string());
     }
 
-    // Drop the old registration before installing the new one so we don't
-    // double-fire on the previous combo.
+    // Capture pause combo so we can restore it after unregister_all wipes everything.
+    let pause_combo = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|s| s.pause_hotkey.clone());
+
     let _ = app.global_shortcut().unregister_all();
 
     if let Err(e) = register_toggle_shortcut(&app, &trimmed) {
-        // Try to bring back the previous shortcut from settings so the app is
-        // never left without any toggle.
         let prev = state
             .settings
             .lock()
             .map(|s| s.hotkey.clone())
             .unwrap_or_else(|_| "alt+d".to_string());
         let _ = register_toggle_shortcut(&app, &prev);
+        if let Some(p) = &pause_combo {
+            if !p.eq_ignore_ascii_case(&prev) {
+                let _ = register_pause_shortcut(&app, p);
+            }
+        }
         return Err(e);
     }
 
-    // Persist on success.
+    // Re-register pause shortcut if it was active and doesn't conflict with the new toggle.
+    if let Some(p) = &pause_combo {
+        if !p.eq_ignore_ascii_case(&trimmed) {
+            if let Err(e) = register_pause_shortcut(&app, p) {
+                eprintln!("Could not restore pause shortcut '{}': {}", p, e);
+            }
+        }
+    }
+
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
     s.hotkey = trimmed;
+    settings::save_settings(&s)?;
+    Ok(())
+}
+
+/// Re-register or disable the Pause hotkey at runtime. `combo = None` clears the
+/// pause hotkey entirely. Conflicts with the toggle hotkey are rejected.
+#[tauri::command]
+fn set_pause_hotkey(
+    app: AppHandle,
+    state: State<AppState>,
+    combo: Option<String>,
+) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let normalized = combo.map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty());
+
+    let toggle_combo = state
+        .settings
+        .lock()
+        .map(|s| s.hotkey.clone())
+        .unwrap_or_else(|_| "alt+d".to_string());
+
+    if let Some(c) = &normalized {
+        if c.eq_ignore_ascii_case(&toggle_combo) {
+            return Err("קיצור ההשהיה זהה לקיצור הראשי — בחר שילוב אחר".to_string());
+        }
+    }
+
+    // Re-register everything so changing the pause hotkey doesn't leave a stale
+    // listener on the previous combo.
+    let _ = app.global_shortcut().unregister_all();
+    if let Err(e) = register_toggle_shortcut(&app, &toggle_combo) {
+        return Err(format!("רענון הקיצור הראשי נכשל: {}", e));
+    }
+
+    if let Some(c) = &normalized {
+        if let Err(e) = register_pause_shortcut(&app, c) {
+            // Toggle still works — surface the error to the UI but don't roll back.
+            return Err(e);
+        }
+    }
+
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    s.pause_hotkey = normalized;
     settings::save_settings(&s)?;
     Ok(())
 }
@@ -522,6 +583,63 @@ fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     result
 }
 
+/// Export the user's dictation history to a TXT or DOCX file. The frontend
+/// passes the items so the backend doesn't need to manage history persistence.
+/// `format` must be "txt" or "docx".
+#[tauri::command]
+async fn export_history(
+    app: AppHandle,
+    items: Vec<export::HistoryItem>,
+    format: String,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    if items.is_empty() {
+        return Err("אין פריטים להיסטוריה — הקלט קודם מספר תמלולים.".to_string());
+    }
+
+    let format_lc = format.to_lowercase();
+    let (extension, dialog_label) = match format_lc.as_str() {
+        "txt" => ("txt", "קובץ טקסט"),
+        "docx" => ("docx", "מסמך Word"),
+        _ => return Err(format!("פורמט לא נתמך: {}", format)),
+    };
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M");
+    let default_name = format!("hebrew-dictation-history_{}.{}", timestamp, extension);
+
+    // tauri-plugin-dialog `save` is callback-based — wrap it in a oneshot channel.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+    app.dialog()
+        .file()
+        .set_title(&format!("שמור את ההיסטוריה כ{}", dialog_label))
+        .set_file_name(&default_name)
+        .add_filter(dialog_label, &[extension])
+        .save_file(move |result| {
+            // FilePath -> PathBuf via Display (cross-platform-safe enough for our case).
+            let path = result.and_then(|fp| {
+                fp.into_path().ok()
+            });
+            let _ = tx.send(path);
+        });
+
+    let path = rx
+        .await
+        .map_err(|_| "דיאלוג השמירה נסגר ללא תגובה".to_string())?;
+    let path = match path {
+        Some(p) => p,
+        None => return Err("הייצוא בוטל".to_string()),
+    };
+
+    match format_lc.as_str() {
+        "txt" => export::write_txt(&path, &items)?,
+        "docx" => export::write_docx(&path, &items)?,
+        _ => unreachable!(),
+    }
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn get_audio_devices() -> Result<Vec<String>, String> {
     use cpal::traits::{DeviceTrait, HostTrait};
@@ -674,14 +792,42 @@ fn register_toggle_shortcut(app: &AppHandle, combo: &str) -> Result<(), String> 
         .map_err(|e| format!("רישום הקיצור נכשל ('{}'): {}", combo, e))
 }
 
-/// Apply the user's preferred hotkey on startup. Falls back to "alt+d" if
-/// registration fails (e.g. a corrupted settings.json picks a combo Windows
-/// already grabbed) so the app is never left without any way to toggle it.
-fn setup_global_shortcuts(app: &AppHandle, combo: &str) {
+/// Register a Pause/Resume hotkey. Emits `pause-pressed` to the frontend, which
+/// decides whether to call `pause_recording` or `resume_recording`. Independent
+/// of the toggle hotkey — only fires while a recording is active.
+fn register_pause_shortcut(app: &AppHandle, combo: &str) -> Result<(), String> {
+    let parsed: Shortcut = combo
+        .parse()
+        .map_err(|e| format!("פורמט קיצור לא תקין ('{}'): {}", combo, e))?;
+
+    let app_handle = app.clone();
+    app.global_shortcut()
+        .on_shortcut(parsed, move |_app, shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = app_handle.emit("pause-pressed", shortcut.to_string());
+            }
+        })
+        .map_err(|e| format!("רישום קיצור ההשהיה נכשל ('{}'): {}", combo, e))
+}
+
+/// Apply the user's preferred hotkeys on startup. Falls back to "alt+d" for the
+/// toggle if its registration fails (a corrupted settings.json picks a combo
+/// Windows already grabbed). Pause hotkey failure is non-fatal — the toolbar
+/// still has its own Pause button.
+fn setup_global_shortcuts(app: &AppHandle, combo: &str, pause_combo: Option<&str>) {
     if let Err(e) = register_toggle_shortcut(app, combo) {
         eprintln!("Hotkey '{}' failed to register: {}. Falling back to alt+d.", combo, e);
         if let Err(e2) = register_toggle_shortcut(app, "alt+d") {
             eprintln!("Fallback alt+d also failed: {}", e2);
+        }
+    }
+    if let Some(pause) = pause_combo {
+        // Skip silently if pause matches toggle — already-registered will error,
+        // and the user can clear it from settings.
+        if pause.eq_ignore_ascii_case(combo) {
+            eprintln!("Pause hotkey same as toggle — skipping registration");
+        } else if let Err(e) = register_pause_shortcut(app, pause) {
+            eprintln!("Pause hotkey '{}' failed to register: {}", pause, e);
         }
     }
 }
@@ -735,6 +881,8 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage({
             let load_result = settings::load_settings();
             AppState {
@@ -768,18 +916,21 @@ pub fn run() {
                 };
                 recorder.set_max_recording_secs(effective_max);
                 recorder.set_preferred_device(s.preferred_audio_device.clone());
+                // Wire the AppHandle so the VAD monitor thread can emit
+                // `audio-level` and `vad-state` events to the floating toolbar.
+                recorder.set_app_handle(app.handle().clone());
             }
 
-            // Read the user's preferred hotkey and register it (with fallback).
-            let combo = {
+            // Read the user's preferred hotkeys and register them (toggle + optional pause).
+            let (combo, pause_combo) = {
                 let state = app.state::<AppState>();
                 let s = state
                     .settings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                s.hotkey.clone()
+                (s.hotkey.clone(), s.pause_hotkey.clone())
             };
-            setup_global_shortcuts(app.handle(), &combo);
+            setup_global_shortcuts(app.handle(), &combo, pause_combo.as_deref());
             let _ = setup_tray(app.handle());
 
             // Surface the one-shot key migration result (if any) to the frontend.
@@ -868,6 +1019,7 @@ pub fn run() {
             set_silence_duration_secs,
             set_preferred_audio_device,
             set_hotkey,
+            set_pause_hotkey,
             stop_via_toolbar,
             transcribe,
             start_streaming_transcription,
@@ -886,6 +1038,7 @@ pub fn run() {
             clear_api_key,
             test_api_key,
             inject_text,
+            export_history,
             get_audio_devices,
             set_window_always_on_top,
             set_autostart_enabled,

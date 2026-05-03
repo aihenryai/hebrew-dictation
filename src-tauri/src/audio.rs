@@ -1,6 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 /// VAD (Voice Activity Detection) configuration
 /// Threshold tuned for multi-channel mics that interleave mostly-silent channels.
@@ -51,6 +52,9 @@ pub struct AudioRecorder {
     is_paused: Arc<Mutex<bool>>,
     /// Optional callback — when set, each audio chunk is also forwarded (16kHz mono) to the callback.
     chunk_callback: Arc<Mutex<Option<ChunkCallback>>>,
+    /// AppHandle used by the VAD monitor thread to emit `audio-level` and `vad-state`
+    /// events to the floating toolbar. Set once at app setup; `None` in tests / standalone.
+    app_handle: Arc<Mutex<Option<AppHandle>>>,
 }
 
 impl AudioRecorder {
@@ -71,6 +75,15 @@ impl AudioRecorder {
             preferred_device: Arc::new(Mutex::new(None)),
             is_paused: Arc::new(Mutex::new(false)),
             chunk_callback: Arc::new(Mutex::new(None)),
+            app_handle: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Wire an AppHandle so the VAD monitor thread can emit `audio-level`
+    /// and `vad-state` events. Called once during app setup.
+    pub fn set_app_handle(&self, handle: AppHandle) {
+        if let Ok(mut g) = self.app_handle.lock() {
+            *g = Some(handle);
         }
     }
 
@@ -289,6 +302,11 @@ impl AudioRecorder {
         let max_recording_secs = self.max_recording_secs.clone();
         let silence_duration_secs = self.silence_duration_secs.clone();
         let is_paused = self.is_paused.clone();
+        let app_handle = self
+            .app_handle
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
 
         let samples_per_check =
             (sample_rate as f32 * (VAD_CHECK_INTERVAL_MS as f32 / 1000.0)) as usize
@@ -299,6 +317,11 @@ impl AudioRecorder {
         let handle = std::thread::spawn(move || {
             let mut silence_start: Option<Instant> = None;
             let mut had_speech = false;
+            // Throttle UI emits — VAD wakes every 100ms but we don't need to spam
+            // the webview that often. ~10 emits/sec is plenty for a smooth bar.
+            let mut last_level_emit = Instant::now();
+            let mut last_vad_state: Option<&'static str> = None;
+            let mut last_vad_emit = Instant::now();
 
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(VAD_CHECK_INTERVAL_MS));
@@ -315,6 +338,13 @@ impl AudioRecorder {
                 // taking a break, don't auto-stop or count time against them.
                 if is_paused.lock().map(|p| *p).unwrap_or(false) {
                     silence_start = None; // reset silence on resume
+                    // Emit a 0 level so the bar visibly drops while paused.
+                    if let Some(app) = &app_handle {
+                        if last_level_emit.elapsed() >= Duration::from_millis(100) {
+                            let _ = app.emit("audio-level", 0.0_f32);
+                            last_level_emit = Instant::now();
+                        }
+                    }
                     continue;
                 }
 
@@ -334,6 +364,17 @@ impl AudioRecorder {
                     }
                 };
 
+                // Emit volume level (audio-level) — throttled to ~80ms cadence.
+                if let Some(app) = &app_handle {
+                    if last_level_emit.elapsed() >= Duration::from_millis(80) {
+                        // Normalize RMS to a 0..1 range that "looks right" on a bar.
+                        // 0.15 RMS is a strong shout — clamp at that and scale linearly.
+                        let level = (rms / 0.15).clamp(0.0, 1.0);
+                        let _ = app.emit("audio-level", level);
+                        last_level_emit = Instant::now();
+                    }
+                }
+
                 // Check max recording timeout (always active, regardless of VAD)
                 let current_max = max_recording_secs.lock().map(|m| *m).unwrap_or(DEFAULT_MAX_RECORDING_SECS);
                 let max_samples = (current_max * sample_rate as f32) as usize * channels as usize;
@@ -345,10 +386,25 @@ impl AudioRecorder {
                 }
 
                 // VAD silence detection (only if enabled)
-                if let Ok(enabled) = vad_enabled.lock() {
-                    if !*enabled {
-                        continue;
+                let vad_on = vad_enabled.lock().map(|v| *v).unwrap_or(true);
+                if !vad_on {
+                    // Surface that VAD is off so the toolbar shows the right indicator.
+                    if let Some(app) = &app_handle {
+                        if last_vad_state != Some("off") || last_vad_emit.elapsed() >= Duration::from_secs(2) {
+                            let _ = app.emit(
+                                "vad-state",
+                                serde_json::json!({
+                                    "state": "speaking",
+                                    "silent_secs": 0.0,
+                                    "silence_total": 0.0,
+                                    "vad_off": true,
+                                }),
+                            );
+                            last_vad_state = Some("off");
+                            last_vad_emit = Instant::now();
+                        }
                     }
+                    continue;
                 }
 
                 if rms > SILENCE_THRESHOLD {
@@ -360,13 +416,35 @@ impl AudioRecorder {
                     silence_start = Some(Instant::now());
                 }
 
+                // VAD state emit (throttled to 500ms).
+                let silence_total = silence_duration_secs
+                    .lock()
+                    .map(|s| *s)
+                    .unwrap_or(DEFAULT_SILENCE_DURATION_SECS);
+                if let Some(app) = &app_handle {
+                    let (state_str, silent_secs) = match silence_start {
+                        Some(s) => ("silent", s.elapsed().as_secs_f32()),
+                        None => ("speaking", 0.0),
+                    };
+                    let force = last_vad_state != Some(state_str);
+                    if force || last_vad_emit.elapsed() >= Duration::from_millis(500) {
+                        let _ = app.emit(
+                            "vad-state",
+                            serde_json::json!({
+                                "state": state_str,
+                                "silent_secs": silent_secs,
+                                "silence_total": silence_total,
+                                "vad_off": false,
+                            }),
+                        );
+                        last_vad_state = Some(state_str);
+                        last_vad_emit = Instant::now();
+                    }
+                }
+
                 if had_speech {
                     if let Some(start) = silence_start {
-                        let threshold = silence_duration_secs
-                            .lock()
-                            .map(|s| *s)
-                            .unwrap_or(DEFAULT_SILENCE_DURATION_SECS);
-                        if start.elapsed().as_secs_f32() >= threshold {
+                        if start.elapsed().as_secs_f32() >= silence_total {
                             if let Ok(mut silence) = silence_detected.lock() {
                                 *silence = true;
                             }

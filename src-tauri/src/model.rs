@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_notification::NotificationExt;
 
 /// (name, url, expected_size, sha256_hex)
 const MODELS: &[(&str, &str, u64, &str)] = &[
@@ -142,13 +143,15 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
 
     let model_path = get_model_path(&model_name);
 
-    // Check if already downloaded and valid
+    // Check if already downloaded and valid — no notification, the user already has it.
     if model_path.exists() {
         let metadata = std::fs::metadata(&model_path).map_err(|e| e.to_string())?;
         if metadata.len() == *expected_size {
             return Ok(model_path.to_string_lossy().to_string());
         }
     }
+
+    let label_for_notification = friendly_model_label(&model_name);
 
     // Create directory
     let models_dir = get_models_dir();
@@ -218,5 +221,28 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
     std::fs::rename(&tmp_path, &model_path)
         .map_err(|e| format!("Failed to finalize download: {}", e))?;
 
+    // OS-level notification — most users start a download and switch to other work
+    // while it runs in the background. Surfacing completion via the system tray
+    // means they don't need to keep the settings panel open.
+    let _ = app
+        .notification()
+        .builder()
+        .title("הכתבה בעברית — מודל מוכן")
+        .body(format!("המודל \"{}\" הורד בהצלחה והוא מוכן לשימוש.", label_for_notification))
+        .show();
+
     Ok(model_path.to_string_lossy().to_string())
+}
+
+/// Friendly Hebrew label for the model name used in user-facing notifications.
+fn friendly_model_label(name: &str) -> String {
+    match name {
+        "tiny" => "Tiny — מהיר".to_string(),
+        "base" => "Base — בסיסי".to_string(),
+        "small" => "Small — מאוזן".to_string(),
+        "medium" => "Medium — מדויק".to_string(),
+        "large-v3-turbo" => "Large v3 Turbo".to_string(),
+        "ivrit-large-v3-turbo" => "ivrit.ai (מותאם לעברית)".to_string(),
+        other => other.to_string(),
+    }
 }

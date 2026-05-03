@@ -6,7 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.7.0";
+const APP_VERSION = "v2.8.0";
 const APP_LICENSE = "MIT";
 
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
@@ -49,6 +49,7 @@ interface AppSettings {
   streaming_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
+  pause_hotkey?: string | null;
   vad_silence_secs?: number;
   max_recording_secs?: number;
   unlimited_recording?: boolean;
@@ -72,10 +73,25 @@ interface RedactedSettings {
   streaming_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
+  pause_hotkey?: string | null;
   vad_silence_secs?: number;
   max_recording_secs?: number;
   unlimited_recording?: boolean;
   preferred_audio_device?: string | null;
+}
+
+/** VAD state payload pushed from the backend ~every 500ms while recording. */
+interface VadStatePayload {
+  state: "speaking" | "silent";
+  silent_secs: number;
+  silence_total: number;
+  vad_off: boolean;
+}
+
+/** History item shape sent to backend `export_history`. Mirrors `export.rs::HistoryItem`. */
+interface ExportHistoryItem {
+  text: string;
+  timestamp?: string;
 }
 
 interface InterimPayload {
@@ -174,7 +190,7 @@ function App() {
   const [view, setView] = useState<AppView>("main");
   const [transcript, setTranscript] = useState("");
   const [editableTranscript, setEditableTranscript] = useState("");
-  const [history, setHistory] = useState<{ id: number; text: string }[]>([]);
+  const [history, setHistory] = useState<{ id: number; text: string; timestamp: string }[]>([]);
   const [whisperLoaded, setWhisperLoaded] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
@@ -210,6 +226,12 @@ function App() {
   const [hotkey, setHotkey] = useState<string>("alt+d");
   const [hotkeyCapturing, setHotkeyCapturing] = useState(false);
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
+  // v2.8.0 — separate Pause/Resume hotkey, history export.
+  const [pauseHotkey, setPauseHotkey] = useState<string | null>("alt+p");
+  const [pauseHotkeyCapturing, setPauseHotkeyCapturing] = useState(false);
+  const [pauseHotkeyError, setPauseHotkeyError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<"txt" | "docx" | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [vadSilenceSecs, setVadSilenceSecs] = useState<number>(4.5);
   const [maxRecordingSecs, setMaxRecordingSecs] = useState<number>(60);
   const [unlimitedRecording, setUnlimitedRecording] = useState<boolean>(false);
@@ -297,7 +319,7 @@ function App() {
         if (text && text.trim()) {
           setTranscript(text);
           setEditableTranscript(text);
-          setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
+          setHistory((prev) => [{ id: ++historyIdCounter, text, timestamp: new Date().toISOString() }, ...prev].slice(0, 20));
         }
       } else {
         const samples = await invoke("stop_recording") as number[];
@@ -318,7 +340,7 @@ function App() {
         if (text && text.trim()) {
           setTranscript(text);
           setEditableTranscript(text);
-          setHistory((prev) => [{ id: ++historyIdCounter, text }, ...prev].slice(0, 20));
+          setHistory((prev) => [{ id: ++historyIdCounter, text, timestamp: new Date().toISOString() }, ...prev].slice(0, 20));
           // Auto-inject into focused field
           await injectText(text);
         }
@@ -385,7 +407,25 @@ function App() {
         await beginRecording();
       }
     });
-    return () => { unlistenHotkey.then((fn) => fn()); };
+    // Separate Pause hotkey — only acts while a recording is active. Toggles
+    // pause/resume on the backend, no UI focus change.
+    const unlistenPause = listen<string>("pause-pressed", async () => {
+      if (statusRef.current !== "recording") return;
+      try {
+        const isPausedNow = await invoke("is_paused") as boolean;
+        if (isPausedNow) {
+          await invoke("resume_recording");
+        } else {
+          await invoke("pause_recording");
+        }
+      } catch {
+        /* state mismatch — ignore, the toolbar's own button is the fallback */
+      }
+    });
+    return () => {
+      unlistenHotkey.then((fn) => fn());
+      unlistenPause.then((fn) => fn());
+    };
   }, [stopAndTranscribe, beginRecording]);
 
   // Live transcription events (streaming mode). Accumulates final segments and
@@ -535,6 +575,9 @@ function App() {
       }
       if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
       if (typeof settings.hotkey === "string" && settings.hotkey) setHotkey(settings.hotkey);
+      if (typeof settings.pause_hotkey === "string" || settings.pause_hotkey === null) {
+        setPauseHotkey(settings.pause_hotkey ?? null);
+      }
       if (typeof settings.vad_silence_secs === "number") setVadSilenceSecs(settings.vad_silence_secs);
       if (typeof settings.max_recording_secs === "number") setMaxRecordingSecs(settings.max_recording_secs);
       if (typeof settings.unlimited_recording === "boolean") setUnlimitedRecording(settings.unlimited_recording);
@@ -587,6 +630,7 @@ function App() {
       streaming_enabled: streamingEnabled,
       floating_toolbar_enabled: floatingToolbarEnabled,
       hotkey: hotkey,
+      pause_hotkey: pauseHotkey,
       vad_silence_secs: vadSilenceSecs,
       max_recording_secs: maxRecordingSecs,
       unlimited_recording: unlimitedRecording,
@@ -594,7 +638,7 @@ function App() {
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -610,6 +654,37 @@ function App() {
   const applyHotkey = useCallback(async (combo: string) => {
     await invoke("set_hotkey", { combo });
   }, []);
+
+  /** Apply a new Pause hotkey (or `null` to disable). Throws on parse / conflict. */
+  const applyPauseHotkey = useCallback(async (combo: string | null) => {
+    await invoke("set_pause_hotkey", { combo });
+  }, []);
+
+  /**
+   * Save the current dictation history to a TXT or DOCX file.
+   * Opens an OS save dialog. The saved path is surfaced as a toast.
+   */
+  const exportHistory = useCallback(async (format: "txt" | "docx") => {
+    if (history.length === 0) {
+      setError("אין פריטים להיסטוריה — הקלט קודם מספר תמלולים.");
+      return;
+    }
+    setExporting(format);
+    setExportNotice(null);
+    try {
+      const items: ExportHistoryItem[] = history.map((h) => ({ text: h.text, timestamp: h.timestamp }));
+      const path = await invoke<string>("export_history", { items, format });
+      setExportNotice(`✅ נשמר: ${path}`);
+      window.setTimeout(() => setExportNotice(null), 6000);
+    } catch (e) {
+      const msg = String(e);
+      if (msg !== "הייצוא בוטל") {
+        setError(`ייצוא ההיסטוריה נכשל: ${msg}`);
+      }
+    } finally {
+      setExporting(null);
+    }
+  }, [history]);
 
   /** Push the silence-to-stop duration to the running recorder. */
   const applySilenceDuration = useCallback(async (secs: number) => {
@@ -1242,6 +1317,75 @@ function App() {
           {hotkeyError && <p className="settings-error">{hotkeyError}</p>}
         </div>
 
+        {/* Pause hotkey — separate global shortcut for Pause/Resume (v2.8.0) */}
+        <div className="settings-section">
+          <h3>קיצור מקלדת להשהיה (Pause)</h3>
+          <p className="settings-hint">
+            פועל רק בזמן הקלטה פעילה. שימושי כשמכתיבים בתוך Word/דפדפן ורוצים להשהות בלי לעזוב את החלון.
+          </p>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={pauseHotkey !== null}
+              onChange={async () => {
+                const next = pauseHotkey === null ? "alt+p" : null;
+                try {
+                  await applyPauseHotkey(next);
+                  setPauseHotkey(next);
+                  setPauseHotkeyError(null);
+                } catch (err) {
+                  setPauseHotkeyError(String(err));
+                }
+              }}
+            />
+            <span className="toggle-text">הפעל קיצור Pause</span>
+          </label>
+          {pauseHotkey !== null && (
+            <div className="settings-row" style={{ alignItems: "center", gap: 12 }}>
+              <input
+                type="text"
+                readOnly
+                value={pauseHotkeyCapturing ? "לחץ על השילוב הרצוי..." : formatHotkey(pauseHotkey)}
+                className={`hotkey-input ${pauseHotkeyCapturing ? "capturing" : ""}`}
+                onFocus={() => { setPauseHotkeyCapturing(true); setPauseHotkeyError(null); }}
+                onBlur={() => setPauseHotkeyCapturing(false)}
+                onKeyDown={async (e) => {
+                  if (!pauseHotkeyCapturing) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const combo = buildComboFromKeyEvent(e.nativeEvent);
+                  if (!combo) return;
+                  try {
+                    await applyPauseHotkey(combo);
+                    setPauseHotkey(combo);
+                    setPauseHotkeyError(null);
+                    setPauseHotkeyCapturing(false);
+                    (e.target as HTMLInputElement).blur();
+                  } catch (err) {
+                    setPauseHotkeyError(String(err));
+                  }
+                }}
+                placeholder="Alt+P"
+              />
+              <button
+                className="btn-secondary"
+                onClick={async () => {
+                  try {
+                    await applyPauseHotkey("alt+p");
+                    setPauseHotkey("alt+p");
+                    setPauseHotkeyError(null);
+                  } catch (err) {
+                    setPauseHotkeyError(String(err));
+                  }
+                }}
+              >
+                איפוס ל-Alt+P
+              </button>
+            </div>
+          )}
+          {pauseHotkeyError && <p className="settings-error">{pauseHotkeyError}</p>}
+        </div>
+
         {/* VAD — toggle + duration slider (v2.7.0) */}
         <div className="settings-section">
           <h3>עצירה אוטומטית בשקט</h3>
@@ -1689,11 +1833,34 @@ function App() {
       )}
 
       {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
+      {exportNotice && <p className="success-note" style={{ wordBreak: "break-all" }}>{exportNotice}</p>}
 
-      {history.length > 1 && (
+      {history.length > 0 && (
         <div className="history-section">
-          <h3>היסטוריה:</h3>
-          {history.slice(1).map((h) => (
+          <div className="history-header">
+            <h3>היסטוריה:</h3>
+            <div className="history-actions">
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={() => exportHistory("txt")}
+                disabled={exporting !== null}
+                title="ייצוא כקובץ טקסט"
+              >
+                {exporting === "txt" ? "..." : "📄 TXT"}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                onClick={() => exportHistory("docx")}
+                disabled={exporting !== null}
+                title="ייצוא כמסמך Word"
+              >
+                {exporting === "docx" ? "..." : "📝 Word"}
+              </button>
+            </div>
+          </div>
+          {history.length > 1 && history.slice(1).map((h) => (
             <div key={h.id} className="history-item">
               <span className="history-item-text">{h.text}</span>
               <button
@@ -1736,6 +1903,13 @@ export default App;
 export function ToolbarApp() {
   const [livePreview, setLivePreview] = useState("");
   const [paused, setPaused] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [vadState, setVadState] = useState<VadStatePayload>({
+    state: "speaking",
+    silent_secs: 0,
+    silence_total: 0,
+    vad_off: false,
+  });
   const liveFinalRef = useRef("");
 
   useEffect(() => {
@@ -1757,10 +1931,19 @@ export function ToolbarApp() {
       liveFinalRef.current = "";
       setLivePreview("");
       setPaused(false);
+      setAudioLevel(0);
+    });
+    const unlistenLevel = listen<number>("audio-level", (event) => {
+      setAudioLevel(event.payload);
+    });
+    const unlistenVad = listen<VadStatePayload>("vad-state", (event) => {
+      setVadState(event.payload);
     });
     return () => {
       unlistenInterim.then((fn) => fn());
       unlistenReset.then((fn) => fn());
+      unlistenLevel.then((fn) => fn());
+      unlistenVad.then((fn) => fn());
     };
   }, []);
 
@@ -1781,11 +1964,34 @@ export function ToolbarApp() {
     } catch { /* keep state in sync if backend rejected */ }
   }, [paused]);
 
+  // VAD indicator label — mirrors backend states.
+  let vadLabel: string;
+  if (vadState.vad_off) {
+    vadLabel = "VAD כבוי";
+  } else if (vadState.state === "silent" && vadState.silence_total > 0) {
+    const remaining = Math.max(0, vadState.silence_total - vadState.silent_secs);
+    vadLabel = `💤 ${remaining.toFixed(1)} שנ׳`;
+  } else {
+    vadLabel = "🎙 מאזין";
+  }
+
+  // Clamp + percent for the volume bar; while paused, show empty.
+  const levelPct = paused ? 0 : Math.max(0, Math.min(1, audioLevel)) * 100;
+
   return (
     <div className={`toolbar-view ${paused ? "paused" : ""}`} dir="rtl">
       <span className="toolbar-dot" aria-hidden="true" />
       <span className="toolbar-live" dir="auto">
         {paused ? "⏸ הושהה" : (livePreview || "מקליט...")}
+      </span>
+      <div className="toolbar-meter" aria-hidden="true">
+        <div className="toolbar-meter-fill" style={{ width: `${levelPct}%` }} />
+      </div>
+      <span
+        className={`toolbar-vad ${vadState.vad_off ? "off" : vadState.state}`}
+        title={vadState.vad_off ? "עצירה אוטומטית כבויה" : ""}
+      >
+        {vadLabel}
       </span>
       <button
         type="button"

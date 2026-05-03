@@ -82,6 +82,10 @@ pub struct AppSettings {
     pub floating_toolbar_enabled: bool,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    /// Optional second global shortcut for Pause/Resume during active recording.
+    /// `None` = feature disabled. Default `Some("alt+p")`.
+    #[serde(default = "default_pause_hotkey")]
+    pub pause_hotkey: Option<String>,
     #[serde(default = "default_silence_duration_secs")]
     pub vad_silence_secs: f32,
     #[serde(default = "default_max_recording_secs")]
@@ -110,6 +114,7 @@ pub struct RedactedSettings {
     pub streaming_enabled: bool,
     pub floating_toolbar_enabled: bool,
     pub hotkey: String,
+    pub pause_hotkey: Option<String>,
     pub vad_silence_secs: f32,
     pub max_recording_secs: f32,
     pub unlimited_recording: bool,
@@ -134,6 +139,7 @@ impl AppSettings {
             streaming_enabled: self.streaming_enabled,
             floating_toolbar_enabled: self.floating_toolbar_enabled,
             hotkey: self.hotkey.clone(),
+            pause_hotkey: self.pause_hotkey.clone(),
             vad_silence_secs: self.vad_silence_secs,
             max_recording_secs: self.max_recording_secs,
             unlimited_recording: self.unlimited_recording,
@@ -156,6 +162,10 @@ fn default_true() -> bool {
 
 fn default_hotkey() -> String {
     "alt+d".to_string()
+}
+
+fn default_pause_hotkey() -> Option<String> {
+    Some("alt+p".to_string())
 }
 
 fn default_silence_duration_secs() -> f32 {
@@ -184,6 +194,7 @@ impl Default for AppSettings {
             streaming_enabled: true,
             floating_toolbar_enabled: true,
             hotkey: default_hotkey(),
+            pause_hotkey: default_pause_hotkey(),
             vad_silence_secs: default_silence_duration_secs(),
             max_recording_secs: default_max_recording_secs(),
             unlimited_recording: false,

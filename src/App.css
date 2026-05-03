@@ -223,6 +223,26 @@ button {
   text-align: right;
 }
 
+/* Header row inside the history section: title + export buttons (v2.8.0) */
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.history-header h3 {
+  margin: 0;
+}
+.history-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+.btn-sm {
+  font-size: 0.78rem;
+  padding: 0.3rem 0.65rem;
+}
+
 .history-item {
   display: flex;
   align-items: flex-start;
@@ -1469,5 +1489,46 @@ body:has(.toolbar-view) #root {
 }
 .toolbar-view.paused .toolbar-live {
   color: rgba(255, 200, 80, 0.95);
+}
+
+/* Volume meter — visual feedback that the mic is hearing audio (v2.8.0) */
+.toolbar-meter {
+  flex: 0 0 60px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.toolbar-meter-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4ade80 0%, #facc15 70%, #ef4444 100%);
+  border-radius: 2px;
+  transition: width 0.08s linear;
+}
+.toolbar-view.paused .toolbar-meter-fill {
+  background: rgba(255, 200, 80, 0.5);
+}
+
+/* VAD indicator — listening / silence countdown / off (v2.8.0) */
+.toolbar-vad {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.6);
+  white-space: nowrap;
+  min-width: 70px;
+  text-align: center;
+}
+.toolbar-vad.speaking {
+  color: rgba(74, 222, 128, 0.95);
+}
+.toolbar-vad.silent {
+  color: rgba(250, 204, 21, 0.95);
+}
+.toolbar-vad.off {
+  color: rgba(255, 255, 255, 0.4);
+  font-style: italic;
+}
+.toolbar-view.paused .toolbar-vad {
+  color: rgba(255, 200, 80, 0.55);
 }
 
