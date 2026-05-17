@@ -19,12 +19,26 @@ pub fn save_key(provider: &str, key: &str) -> Result<(), String> {
 }
 
 pub fn load_key(provider: &str) -> Result<Option<String>, String> {
-    let entry = Entry::new(SERVICE, provider)
-        .map_err(|e| format!("שגיאת גישה לאחסון מאובטח: {}", e))?;
+    let entry = Entry::new(SERVICE, provider).map_err(|e| {
+        // Surface backend init failures to the log so users hitting "API key
+        // valid in test, invalid on use" + "wizard runs every launch" have a
+        // diagnostic trail. Historically these were swallowed silently.
+        eprintln!(
+            "[secure_keys] Entry::new failed for provider='{}' service='{}': {}",
+            provider, SERVICE, e
+        );
+        format!("שגיאת גישה לאחסון מאובטח: {}", e)
+    })?;
     match entry.get_password() {
         Ok(s) => Ok(Some(s)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("נכשלה קריאת מפתח מהאחסון המאובטח: {}", e)),
+        Err(e) => {
+            eprintln!(
+                "[secure_keys] get_password failed for provider='{}': {}",
+                provider, e
+            );
+            Err(format!("נכשלה קריאת מפתח מהאחסון המאובטח: {}", e))
+        }
     }
 }
 

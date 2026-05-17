@@ -1376,14 +1376,17 @@ button {
 
 /* Body must be transparent for the rounded-pill layout to show through. */
 html:has(.toolbar-view),
-body:has(.toolbar-view) {
+body:has(.toolbar-view),
+html:has(.toolbar-idle),
+body:has(.toolbar-idle) {
   background: transparent !important;
   margin: 0;
   padding: 0;
   overflow: hidden;
 }
 
-body:has(.toolbar-view) #root {
+body:has(.toolbar-view) #root,
+body:has(.toolbar-idle) #root {
   height: 100vh;
   display: flex;
   align-items: center;
@@ -1393,27 +1396,51 @@ body:has(.toolbar-view) #root {
 
 .toolbar-view {
   display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  width: calc(100% - 8px);
-  height: calc(100% - 8px);
-  padding: 0.4rem 0.9rem;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.25rem;
+  width: calc(100% - 6px);
+  height: calc(100% - 6px);
+  padding: 0.35rem 0.7rem;
   box-sizing: border-box;
   background: rgba(22, 22, 34, 0.94);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 28px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  border-radius: 16px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
   color: #e8e8e8;
   -webkit-user-select: none;
   user-select: none;
+  /* The whole bar is grabbable except for buttons (handled in onMouseDown).
+     Show a grab cursor by default; buttons re-set to pointer below. */
+  cursor: grab;
+}
+
+.toolbar-view:active {
+  cursor: grabbing;
+}
+
+/* Top row — dot + meter + VAD + buttons */
+.toolbar-row-top {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 0 0 auto;
+}
+
+/* Bottom row — live transcription text */
+.toolbar-row-bottom {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-width: 0;
 }
 
 .toolbar-dot {
-  width: 10px;
-  height: 10px;
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
   background: #ff3b5c;
-  box-shadow: 0 0 6px rgba(255, 59, 92, 0.6);
+  box-shadow: 0 0 5px rgba(255, 59, 92, 0.6);
   flex: 0 0 auto;
   animation: toolbar-pulse 1.2s ease-in-out infinite;
 }
@@ -1424,13 +1451,14 @@ body:has(.toolbar-view) #root {
 }
 
 .toolbar-live {
-  flex: 1 1 auto;
+  width: 100%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   color: #d8d8d8;
+  text-align: right;
 }
 
 .toolbar-stop {
@@ -1438,15 +1466,16 @@ body:has(.toolbar-view) #root {
   background: rgba(255, 255, 255, 0.08);
   border: none;
   color: #fff;
-  width: 32px;
-  height: 32px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
-  font-size: 0.95rem;
+  font-size: 0.8rem;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: background 0.15s ease;
+  padding: 0;
 }
 
 .toolbar-stop:hover {
@@ -1462,15 +1491,16 @@ body:has(.toolbar-view) #root {
   background: rgba(255, 255, 255, 0.08);
   border: none;
   color: #fff;
-  width: 32px;
-  height: 32px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
-  font-size: 0.95rem;
+  font-size: 0.8rem;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: background 0.15s ease;
+  padding: 0;
 }
 
 .toolbar-pause:hover {
@@ -1491,9 +1521,11 @@ body:has(.toolbar-view) #root {
   color: rgba(255, 200, 80, 0.95);
 }
 
-/* Volume meter — visual feedback that the mic is hearing audio (v2.8.0) */
+/* Volume meter — visual feedback that the mic is hearing audio (v2.8.0).
+   In the 2-row layout it fills the free space in the top row. */
 .toolbar-meter {
-  flex: 0 0 60px;
+  flex: 1 1 auto;
+  min-width: 24px;
   height: 4px;
   background: rgba(255, 255, 255, 0.1);
   border-radius: 2px;
@@ -1512,10 +1544,10 @@ body:has(.toolbar-view) #root {
 /* VAD indicator — listening / silence countdown / off (v2.8.0) */
 .toolbar-vad {
   flex: 0 0 auto;
-  font-size: 0.7rem;
+  font-size: 0.66rem;
   color: rgba(255, 255, 255, 0.6);
   white-space: nowrap;
-  min-width: 70px;
+  min-width: 46px;
   text-align: center;
 }
 .toolbar-vad.speaking {
@@ -1530,5 +1562,74 @@ body:has(.toolbar-view) #root {
 }
 .toolbar-view.paused .toolbar-vad {
   color: rgba(255, 200, 80, 0.55);
+}
+
+/* ── v2.8.1 — idle floating button (same `toolbar` window, circular mode) ── */
+
+/* Soft scale+fade entrance so swapping idle↔recording isn't a hard jump. */
+@keyframes toolbar-pop {
+  from { opacity: 0; transform: scale(0.82); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.toolbar-view {
+  animation: toolbar-pop 0.18s ease-out;
+}
+
+.toolbar-idle {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* The app icon is itself a circular blue badge — let it be the design.
+     The container is just a clean frame: thin ring + depth shadow. */
+  background: #0e1020;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 6px 16px rgba(0, 0, 0, 0.5),
+    0 0 0 4px rgba(56, 120, 230, 0.12);
+  cursor: pointer;
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  animation: idle-pulse 2.6s ease-in-out infinite, toolbar-pop 0.2s ease-out;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+.toolbar-idle:hover {
+  transform: scale(1.08);
+  border-color: rgba(120, 170, 255, 0.55);
+  box-shadow:
+    0 8px 20px rgba(0, 0, 0, 0.55),
+    0 0 0 5px rgba(56, 120, 230, 0.28);
+}
+.toolbar-idle:active {
+  transform: scale(0.93);
+}
+.toolbar-idle-logo {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  pointer-events: none;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+/* Soft blue "alive" halo, tuned to the logo's accent colour. */
+@keyframes idle-pulse {
+  0%, 100% { box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5), 0 0 0 4px rgba(56, 120, 230, 0.12); }
+  50%      { box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5), 0 0 0 10px rgba(56, 120, 230, 0.03); }
+}
+
+/* Accessibility — respect the OS "reduce motion" preference. */
+@media (prefers-reduced-motion: reduce) {
+  .toolbar-dot,
+  .toolbar-idle,
+  .toolbar-view,
+  .toolbar-meter-fill {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 

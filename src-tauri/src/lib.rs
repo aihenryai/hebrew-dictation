@@ -660,8 +660,160 @@ fn set_window_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String>
     Ok(())
 }
 
+/// Logical dimensions of the toolbar window — must match `tauri.conf.json`.
+const TOOLBAR_W: f64 = 220.0;
+const TOOLBAR_H: f64 = 76.0;
+
+/// Logical dimensions of the idle floating button (same window, circular mode).
+const IDLE_W: f64 = 56.0;
+const IDLE_H: f64 = 56.0;
+
+/// Compute the on-screen logical position for a floating window of size `w`×`h`.
+/// Honors the user's saved drag position when it stays on the active monitor,
+/// else falls back to bottom-center, 80px above the bottom edge. Shared by the
+/// recording toolbar and the idle button so both stick to the same spot.
+fn resolve_float_position(
+    app: &AppHandle,
+    saved_pos: Option<settings::ToolbarPosition>,
+    w: f64,
+    h: f64,
+) -> Option<(f64, f64)> {
+    let main = app.get_webview_window("main");
+    let toolbar = app.get_webview_window("toolbar")?;
+    let monitor = main
+        .as_ref()
+        .and_then(|win| win.current_monitor().ok().flatten())
+        .or_else(|| toolbar.primary_monitor().ok().flatten())?;
+
+    let scale = monitor.scale_factor();
+    let mon_size = monitor.size();
+    let mon_pos = monitor.position();
+    let logical_w = mon_size.width as f64 / scale;
+    let logical_h = mon_size.height as f64 / scale;
+    let logical_x = mon_pos.x as f64 / scale;
+    let logical_y = mon_pos.y as f64 / scale;
+
+    let default_x = logical_x + (logical_w - w) / 2.0;
+    let default_y = logical_y + logical_h - h - 80.0;
+
+    let (x, y) = match saved_pos {
+        Some(p) => {
+            let min_x = logical_x - w + 40.0;
+            let max_x = logical_x + logical_w - 40.0;
+            let min_y = logical_y - h + 20.0;
+            let max_y = logical_y + logical_h - 20.0;
+            if p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y {
+                (default_x, default_y)
+            } else {
+                (p.x, p.y)
+            }
+        }
+        None => (default_x, default_y),
+    };
+    Some((x, y))
+}
+
+/// Show the small floating idle button by reusing the `toolbar` window in a
+/// 56×56 circular mode. The `toolbar-mode` event tells the webview to render
+/// the circle instead of the recording bar.
+///
+/// Enforces the core invariant *idle circle visible ⟺ main window hidden*:
+/// the circle and the main window must never be on screen at the same time,
+/// so we defensively hide main here. All real callers already run with main
+/// hidden, so this is a no-op in practice — it just closes any future gap.
+fn show_idle_button_inner(app: &AppHandle, saved_pos: Option<settings::ToolbarPosition>) {
+    let Some(toolbar) = app.get_webview_window("toolbar") else {
+        return;
+    };
+    if let Some(main) = app.get_webview_window("main") {
+        if main.is_visible().unwrap_or(false) {
+            let _ = main.hide();
+        }
+    }
+    if let Some((x, y)) = resolve_float_position(app, saved_pos, IDLE_W, IDLE_H) {
+        let _ = toolbar.set_position(tauri::LogicalPosition::new(x, y));
+    }
+    let _ = toolbar.set_size(tauri::LogicalSize::new(IDLE_W, IDLE_H));
+    let _ = toolbar.set_always_on_top(true);
+    let _ = app.emit("toolbar-mode", "idle");
+    let _ = toolbar.show();
+}
+
+/// Re-evaluate whether the idle button should be on screen: show it when the
+/// feature is on and the main window is hidden; otherwise hide the toolbar
+/// window (covers the idle circle — same window). Skipped while a recording
+/// is active so the recording bar is never yanked out from under the user.
+fn refresh_idle_button(app: &AppHandle, state: &AppState) {
+    let recording = state
+        .recorder
+        .lock()
+        .map(|r| r.is_recording())
+        .unwrap_or(false);
+    if recording {
+        return;
+    }
+    let (enabled, saved_pos) = {
+        let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        (s.idle_button_enabled, s.toolbar_position)
+    };
+    let main_visible = app
+        .get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    if enabled && !main_visible {
+        show_idle_button_inner(app, saved_pos);
+    } else if let Some(t) = app.get_webview_window("toolbar") {
+        let _ = t.hide();
+    }
+}
+
+/// Bring the main window back from the idle button (right-click on the
+/// circle). Hides the floating window — same one — and surfaces + focuses
+/// main so the user can reach settings / history without the tray.
+#[tauri::command]
+fn open_main_window(app: AppHandle) -> Result<(), String> {
+    if let Some(t) = app.get_webview_window("toolbar") {
+        let _ = t.hide();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    Ok(())
+}
+
+/// Command wrapper — show the idle button now (no-op unless enabled).
+#[tauri::command]
+fn show_idle_button(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let (enabled, saved_pos) = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        (s.idle_button_enabled, s.toolbar_position)
+    };
+    if enabled {
+        show_idle_button_inner(&app, saved_pos);
+    }
+    Ok(())
+}
+
+/// Persist the idle-button toggle and immediately reflect it on screen.
+#[tauri::command]
+fn set_idle_button_enabled(
+    app: AppHandle,
+    state: State<AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+        s.idle_button_enabled = enabled;
+        settings::save_settings(&s)?;
+    }
+    refresh_idle_button(&app, &state);
+    Ok(())
+}
+
 /// Show the floating toolbar at the bottom-center of the active monitor
-/// and hide the main window (remembered for restore on hide).
+/// (or at the user's saved drag position) and hide the main window (remembered
+/// for restore on hide).
 ///
 /// `streaming` forces main to hide even when the toolbar itself is disabled —
 /// this keeps focus on the user's target app so live injection lands there,
@@ -672,12 +824,16 @@ fn show_toolbar_window(
     state: State<AppState>,
     streaming: bool,
 ) -> Result<(), String> {
-    let toolbar_enabled = {
+    let (toolbar_enabled, idle_enabled, saved_pos) = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
-        s.floating_toolbar_enabled
+        (s.floating_toolbar_enabled, s.idle_button_enabled, s.toolbar_position)
     };
 
-    let should_hide_main = toolbar_enabled || streaming;
+    // When the idle button is on, the toolbar window is already on screen as a
+    // circle — recording must grow it into the bar even if the user disabled
+    // the floating toolbar for the main-window flow.
+    let show_bar = toolbar_enabled || idle_enabled;
+    let should_hide_main = show_bar || streaming;
     if !should_hide_main {
         return Ok(());
     }
@@ -695,30 +851,15 @@ fn show_toolbar_window(
         .main_was_visible_before_toolbar
         .store(was_visible, Ordering::Relaxed);
 
-    if toolbar_enabled {
-        // Bottom-center of the monitor containing main (fallback: primary).
-        let monitor = main
-            .as_ref()
-            .and_then(|w| w.current_monitor().ok().flatten())
-            .or_else(|| toolbar.primary_monitor().ok().flatten());
-
-        if let Some(mon) = monitor {
-            let scale = mon.scale_factor();
-            let mon_size = mon.size();
-            let mon_pos = mon.position();
-            let logical_w = mon_size.width as f64 / scale;
-            let logical_h = mon_size.height as f64 / scale;
-            let logical_x = mon_pos.x as f64 / scale;
-            let logical_y = mon_pos.y as f64 / scale;
-
-            let toolbar_w = 360.0_f64;
-            let toolbar_h = 56.0_f64;
-            let x = logical_x + (logical_w - toolbar_w) / 2.0;
-            let y = logical_y + logical_h - toolbar_h - 80.0;
+    if show_bar {
+        if let Some((x, y)) = resolve_float_position(&app, saved_pos, TOOLBAR_W, TOOLBAR_H) {
             let _ = toolbar.set_position(tauri::LogicalPosition::new(x, y));
         }
-
+        // Grow from idle-circle size back to the full recording bar and tell
+        // the webview to render the recording layout.
+        let _ = toolbar.set_size(tauri::LogicalSize::new(TOOLBAR_W, TOOLBAR_H));
         let _ = toolbar.set_always_on_top(true);
+        let _ = app.emit("toolbar-mode", "recording");
         let _ = toolbar.show();
     }
 
@@ -726,6 +867,16 @@ fn show_toolbar_window(
         let _ = w.hide();
     }
 
+    Ok(())
+}
+
+/// Persist the toolbar's screen position after the user drags it. Called from
+/// the ToolbarApp's `tauri://move` event handler (debounced on the JS side).
+#[tauri::command]
+fn set_toolbar_position(state: State<AppState>, x: f64, y: f64) -> Result<(), String> {
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    s.toolbar_position = Some(settings::ToolbarPosition { x, y });
+    settings::save_settings(&s)?;
     Ok(())
 }
 
@@ -749,7 +900,18 @@ fn hide_toolbar_window(
     // Force is set when the user clicked the toolbar's stop button — they want
     // to see the transcription, so promote the main window even if it wasn't
     // visible before. Alt+D toggling preserves the original behavior.
-    if was_visible || force {
+    let (idle_enabled, saved_pos) = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        (s.idle_button_enabled, s.toolbar_position)
+    };
+
+    if idle_enabled && !was_visible {
+        // The dictation session ran from the idle circle (main was never up).
+        // Return to the circle instead of yanking the main window into the
+        // user's face — this also avoids stealing focus from their target
+        // app right after the text was injected.
+        show_idle_button_inner(&app, saved_pos);
+    } else if was_visible || force {
         if let Some(main) = app.get_webview_window("main") {
             let _ = main.show();
             if force {
@@ -849,6 +1011,10 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
+                // Main is back — the idle circle (same window) must step aside.
+                if let Some(t) = app.get_webview_window("toolbar") {
+                    let _ = t.hide();
+                }
             }
             "quit" => {
                 app.exit(0);
@@ -862,6 +1028,9 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(window) = app_clone.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
+                }
+                if let Some(t) = app_clone.get_webview_window("toolbar") {
+                    let _ = t.hide();
                 }
             }
         });
@@ -984,12 +1153,24 @@ pub fn run() {
 
             let start_minimized = std::env::args().any(|a| a == "--minimized");
 
+            let (idle_enabled, idle_saved_pos) = {
+                let state = app.state::<AppState>();
+                let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                (s.idle_button_enabled, s.toolbar_position)
+            };
+
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_always_on_top(always_on_top_wanted);
                 if start_minimized {
                     let _ = window.hide();
+                    // Autostart launched us hidden — the #1 "I don't know it's
+                    // running" fix: surface the idle button right away.
+                    if idle_enabled {
+                        show_idle_button_inner(app.handle(), idle_saved_pos);
+                    }
                 }
                 let w = window.clone();
+                let app_for_close = app.handle().clone();
                 let notif_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(close_notif_shown));
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -999,6 +1180,16 @@ pub fn run() {
                             let _ = w.emit("window-close-attempted", ());
                         }
                         let _ = w.hide();
+                        // Closed to tray — keep an on-screen affordance so the
+                        // user can still start dictation with one click.
+                        let state = app_for_close.state::<AppState>();
+                        let (enabled, saved_pos) = {
+                            let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                            (s.idle_button_enabled, s.toolbar_position)
+                        };
+                        if enabled {
+                            show_idle_button_inner(&app_for_close, saved_pos);
+                        }
                     }
                 });
             }
@@ -1044,6 +1235,10 @@ pub fn run() {
             set_autostart_enabled,
             show_toolbar_window,
             hide_toolbar_window,
+            set_toolbar_position,
+            show_idle_button,
+            set_idle_button_enabled,
+            open_main_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

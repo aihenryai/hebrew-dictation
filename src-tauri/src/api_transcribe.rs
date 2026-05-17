@@ -1,5 +1,6 @@
 use crate::settings::ApiProvider;
 use reqwest::multipart;
+use std::fmt;
 use std::time::Duration;
 
 /// Convert f32 samples (16kHz mono) to a WAV byte buffer (PCM16).
@@ -42,24 +43,97 @@ fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-fn api_error(e: &reqwest::Error) -> String {
-    if e.is_timeout() {
-        "פג תוקף הבקשה — נסה הקלטה קצרה יותר או בדוק את החיבור".to_string()
-    } else if e.is_connect() {
-        "אין חיבור לאינטרנט — בדוק את החיבור ונסה שוב".to_string()
-    } else {
-        format!("שגיאת רשת: {}", e)
+/// Categorized API error — kept stable across UI string changes so callers like
+/// `test_api_key` can branch on the *kind* of failure, not on a Hebrew substring
+/// (which historically caused false positives — see v2.8.0 bug report).
+#[derive(Debug, Clone)]
+pub enum ApiError {
+    /// 401 / 403 — bad or missing key. The key itself should be considered invalid.
+    Unauthorized,
+    /// 402 — provider says the account is out of credit / requires billing.
+    /// The KEY is still valid.
+    InsufficientCredit,
+    /// 429 — rate limit exceeded. Key is valid.
+    RateLimited,
+    /// 400 — request was malformed (often: silent or empty audio). Key is valid.
+    BadRequest(String),
+    /// Network-level failure (no internet, DNS, TLS handshake etc.). Key validity unknown.
+    Network(String),
+    /// Request timed out. Key validity unknown.
+    Timeout,
+    /// 5xx — provider server error. Key is presumed valid (we just couldn't reach service).
+    Server,
+    /// Anything else (4xx not covered above, JSON parse errors, multipart issues, etc.).
+    /// Key validity unknown — we don't claim either way.
+    Other(String),
+}
+
+impl ApiError {
+    /// Whether this error means the key itself is bad.
+    /// Used by `test_api_key` to decide whether to fail validation.
+    pub fn is_key_problem(&self) -> bool {
+        matches!(self, ApiError::Unauthorized)
+    }
+
+    /// Whether this error means we couldn't reach the service at all.
+    /// `test_api_key` surfaces this to the user since it's not a key validity verdict.
+    pub fn is_network_problem(&self) -> bool {
+        matches!(self, ApiError::Network(_) | ApiError::Timeout)
     }
 }
 
-fn status_error(status: reqwest::StatusCode, body: &str) -> String {
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApiError::Unauthorized => {
+                write!(f, "מפתח ה-API לא תקין — עדכן אותו בהגדרות")
+            }
+            ApiError::InsufficientCredit => write!(
+                f,
+                "נגמר הקרדיט אצל ספק ה-API — החלף ספק בהגדרות או הוסף קרדיט בלוח הבקרה"
+            ),
+            ApiError::RateLimited => write!(f, "חרגת ממגבלת השימוש — נסה שוב בעוד רגע"),
+            ApiError::BadRequest(body) => write!(
+                f,
+                "בקשה לא תקינה ל-API — ייתכן שההקלטה ריקה או קצרה מדי ({})",
+                body
+            ),
+            ApiError::Network(detail) => {
+                write!(f, "אין חיבור לאינטרנט — בדוק את החיבור ונסה שוב ({})", detail)
+            }
+            ApiError::Timeout => {
+                write!(f, "פג תוקף הבקשה — נסה הקלטה קצרה יותר או בדוק את החיבור")
+            }
+            ApiError::Server => {
+                write!(f, "שרת ה-API לא זמין כרגע — נסה שוב בעוד רגע")
+            }
+            ApiError::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+fn classify_request_error(e: &reqwest::Error) -> ApiError {
+    if e.is_timeout() {
+        ApiError::Timeout
+    } else if e.is_connect() {
+        ApiError::Network(e.to_string())
+    } else {
+        ApiError::Other(format!("שגיאת רשת: {}", e))
+    }
+}
+
+fn classify_status(status: reqwest::StatusCode, body: &str) -> ApiError {
     match status.as_u16() {
-        401 | 403 => "מפתח ה-API לא תקין — עדכן אותו בהגדרות".to_string(),
-        402 => "נגמר הקרדיט אצל ספק ה-API — החלף ספק בהגדרות או הוסף קרדיט בלוח הבקרה".to_string(),
-        429 => "חרגת ממגבלת השימוש — נסה שוב בעוד רגע".to_string(),
-        400 => format!("בקשה לא תקינה ל-API — ייתכן שההקלטה ריקה או קצרה מדי ({})", truncate_body(body)),
-        500..=599 => "שרת ה-API לא זמין כרגע — נסה שוב בעוד רגע".to_string(),
-        _ => format!("שגיאת API ({}): {}", status.as_u16(), truncate_body(body)),
+        401 | 403 => ApiError::Unauthorized,
+        402 => ApiError::InsufficientCredit,
+        429 => ApiError::RateLimited,
+        400 => ApiError::BadRequest(truncate_body(body)),
+        500..=599 => ApiError::Server,
+        _ => ApiError::Other(format!(
+            "שגיאת API ({}): {}",
+            status.as_u16(),
+            truncate_body(body)
+        )),
     }
 }
 
@@ -78,17 +152,17 @@ fn truncate_body(body: &str) -> String {
 // OpenAI-compatible endpoint, much cheaper (~$0.04/hr vs Deepgram $4/hr).
 // Batch only — no streaming support.
 
-pub async fn transcribe_groq(
+async fn transcribe_groq_inner(
     samples: &[f32],
     api_key: &str,
     language: &str,
-) -> Result<String, String> {
+) -> Result<String, ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
 
     let file_part = multipart::Part::bytes(wav_data)
         .file_name("audio.wav")
         .mime_str("audio/wav")
-        .map_err(|e| format!("Failed to create multipart: {}", e))?;
+        .map_err(|e| ApiError::Other(format!("Failed to create multipart: {}", e)))?;
 
     let mut form = multipart::Form::new()
         .part("file", file_part)
@@ -107,33 +181,30 @@ pub async fn transcribe_groq(
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| api_error(&e))?;
+        .map_err(|e| classify_request_error(&e))?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(status_error(status, &body));
+        return Err(classify_status(status, &body));
     }
 
-    let body: serde_json::Value = response.json().await
-        .map_err(|e| format!("Failed to parse Groq response: {}", e))?;
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Other(format!("Failed to parse Groq response: {}", e)))?;
 
-    let transcript = body["text"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
+    let transcript = body["text"].as_str().unwrap_or("").trim().to_string();
     Ok(transcript)
 }
 
 // ── Deepgram Nova-3 API ──
 
-pub async fn transcribe_deepgram(
+async fn transcribe_deepgram_inner(
     samples: &[f32],
     api_key: &str,
     language: &str,
-) -> Result<String, String> {
+) -> Result<String, ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
 
     // "auto" → default to Hebrew (single-language). "multi" → Nova-3 code-switching (Hebrew+English mid-sentence).
@@ -151,16 +222,18 @@ pub async fn transcribe_deepgram(
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| api_error(&e))?;
+        .map_err(|e| classify_request_error(&e))?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(status_error(status, &body));
+        return Err(classify_status(status, &body));
     }
 
-    let body: serde_json::Value = response.json().await
-        .map_err(|e| format!("Failed to parse Deepgram response: {}", e))?;
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Other(format!("Failed to parse Deepgram response: {}", e)))?;
 
     let transcript = body["results"]["channels"][0]["alternatives"][0]["transcript"]
         .as_str()
@@ -187,27 +260,48 @@ fn validate_language(language: &str) -> Result<&str, String> {
     }
 }
 
+async fn transcribe_api_inner(
+    provider: &ApiProvider,
+    samples: &[f32],
+    api_key: &str,
+    language: &str,
+) -> Result<String, ApiError> {
+    let lang = validate_language(language).map_err(ApiError::Other)?;
+    match provider {
+        ApiProvider::Deepgram => transcribe_deepgram_inner(samples, api_key, lang).await,
+        ApiProvider::Groq => transcribe_groq_inner(samples, api_key, lang).await,
+    }
+}
+
 pub async fn transcribe_api(
     provider: &ApiProvider,
     samples: &[f32],
     api_key: &str,
     language: &str,
 ) -> Result<String, String> {
-    let lang = validate_language(language)?;
-    match provider {
-        ApiProvider::Deepgram => transcribe_deepgram(samples, api_key, lang).await,
-        ApiProvider::Groq => transcribe_groq(samples, api_key, lang).await,
-    }
+    transcribe_api_inner(provider, samples, api_key, language)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Verify that the API key works for the given provider.
+///
+/// Returns Err **only** when we have positive evidence the key is bad, or when
+/// we couldn't reach the network at all. Other errors (400 because we sent
+/// silent audio, 402 insufficient credit, 429 rate-limit, 5xx) are treated as
+/// "key is valid, the issue is elsewhere" — these are surfaced naturally on the
+/// real recording path and shouldn't fail the test button.
+///
+/// Bug fix (v2.8.0 → v2.8.1): the previous implementation matched on English
+/// substrings ("API key invalid", "Cannot connect") that never appeared because
+/// the runtime error messages were Hebrew. The result was that ANY 4xx/5xx
+/// status was reported as ✓ valid — so users could enter a bogus key, see ✓,
+/// and only discover the truth when they tried to actually record.
 pub async fn test_api_key(provider: &ApiProvider, api_key: &str) -> Result<(), String> {
     let silence = vec![0.0f32; 8000]; // 0.5s at 16kHz
-    match transcribe_api(provider, &silence, api_key, "he").await {
+    match transcribe_api_inner(provider, &silence, api_key, "he").await {
         Ok(_) => Ok(()),
-        Err(e) if e.contains("API key invalid") => Err(e),
-        Err(e) if e.contains("Cannot connect") => Err(e),
-        // API may reject silent audio — key is still valid
+        Err(e) if e.is_key_problem() || e.is_network_problem() => Err(e.to_string()),
         Err(_) => Ok(()),
     }
 }

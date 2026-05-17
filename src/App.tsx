@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.8.0";
+const APP_VERSION = "v2.8.1";
 const APP_LICENSE = "MIT";
 
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
@@ -54,6 +55,9 @@ interface AppSettings {
   max_recording_secs?: number;
   unlimited_recording?: boolean;
   preferred_audio_device?: string | null;
+  audio_feedback_enabled?: boolean;
+  idle_button_enabled?: boolean;
+  audio_volume?: number;
 }
 
 /** Redacted settings returned from the backend (keys replaced with booleans). */
@@ -78,6 +82,9 @@ interface RedactedSettings {
   max_recording_secs?: number;
   unlimited_recording?: boolean;
   preferred_audio_device?: string | null;
+  audio_feedback_enabled?: boolean;
+  idle_button_enabled?: boolean;
+  audio_volume?: number;
 }
 
 /** VAD state payload pushed from the backend ~every 500ms while recording. */
@@ -126,7 +133,15 @@ function formatHotkey(combo: string): string {
 }
 
 /** Build a Tauri-compatible combo string from a keyboard event. Returns null
- * for modifier-only presses (no main key yet) — caller keeps capturing. */
+ * for modifier-only presses (no main key yet) — caller keeps capturing.
+ *
+ * Uses `event.code` (layout-independent physical key) rather than `event.key`
+ * (Unicode character produced by the active layout). On Hebrew keyboard
+ * layouts, pressing the physical "D" key gives `event.key === "ד"` which
+ * Tauri's Shortcut::parse rejects. With `event.code === "KeyD"`, the combo is
+ * always stored as "alt+d" regardless of which layout was active when the
+ * user captured it — and the OS-level shortcut fires on the same physical
+ * key whatever layout is active later. */
 function buildComboFromKeyEvent(e: KeyboardEvent): string | null {
   const modifiers: string[] = [];
   if (e.ctrlKey) modifiers.push("ctrl");
@@ -134,19 +149,20 @@ function buildComboFromKeyEvent(e: KeyboardEvent): string | null {
   if (e.shiftKey) modifiers.push("shift");
   if (e.metaKey) modifiers.push("super");
 
-  const key = e.key;
   // Modifier-only press — keep capturing until a real key arrives.
-  if (["Control", "Alt", "Shift", "Meta", "Dead"].includes(key)) return null;
+  // event.key is fine for detecting modifier-only since it's locale-stable for these.
+  if (["Control", "Alt", "Shift", "Meta", "Dead"].includes(e.key)) return null;
 
-  // Normalize the main key:
-  // - Single letters → lowercase ("d", not "D")
-  // - F-keys → "f1".."f24"
-  // - Arrow keys, Enter, Escape, etc. → lowercase token Tauri accepts
-  let mainKey: string;
-  if (key.length === 1) {
-    mainKey = key.toLowerCase();
-  } else if (/^F\d{1,2}$/.test(key)) {
-    mainKey = key.toLowerCase();
+  const code = e.code;
+  let mainKey: string | null = null;
+  if (/^Key[A-Z]$/.test(code)) {
+    mainKey = code.slice(3).toLowerCase(); // KeyD → "d"
+  } else if (/^Digit\d$/.test(code)) {
+    mainKey = code.slice(5); // Digit5 → "5"
+  } else if (/^Numpad\d$/.test(code)) {
+    mainKey = `num${code.slice(6)}`; // Numpad5 → "num5"
+  } else if (/^F\d{1,2}$/.test(code)) {
+    mainKey = code.toLowerCase(); // F8 → "f8"
   } else {
     const map: Record<string, string> = {
       ArrowUp: "up",
@@ -154,20 +170,32 @@ function buildComboFromKeyEvent(e: KeyboardEvent): string | null {
       ArrowLeft: "left",
       ArrowRight: "right",
       Enter: "enter",
+      NumpadEnter: "enter",
       Escape: "escape",
       Backspace: "backspace",
       Tab: "tab",
-      " ": "space",
-      Spacebar: "space",
+      Space: "space",
       Insert: "insert",
       Delete: "delete",
       Home: "home",
       End: "end",
       PageUp: "pageup",
       PageDown: "pagedown",
+      Minus: "minus",
+      Equal: "equal",
+      BracketLeft: "[",
+      BracketRight: "]",
+      Backslash: "\\",
+      Semicolon: ";",
+      Quote: "'",
+      Comma: ",",
+      Period: ".",
+      Slash: "/",
     };
-    mainKey = map[key] ?? key.toLowerCase();
+    mainKey = map[code] ?? null;
   }
+
+  if (!mainKey) return null;
 
   // Reject combos without any modifier — too easy to trigger by accident
   // (typing "d" anywhere on the desktop). Unless it's an F-key.
@@ -182,6 +210,81 @@ function formatDuration(secs: number): string {
   const mins = secs / 60;
   if (Number.isInteger(mins)) return mins === 1 ? "דקה" : `${mins} דקות`;
   return `${mins.toFixed(1)} דקות`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Audio feedback — short tones on record start/stop.
+ * Sine wave, low volume (0.08), short duration (~80ms). Created via Web Audio
+ * API so no asset files are needed. AudioContext is lazy: built on first use
+ * and reused. The default browser autoplay policy permits AudioContext use
+ * after any user-driven event, which the hotkey/button paths qualify as.
+ * ---------------------------------------------------------------------------*/
+let _audioCtx: AudioContext | null = null;
+function getAudioCtx(): AudioContext | null {
+  if (_audioCtx) return _audioCtx;
+  try {
+    const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) return null;
+    _audioCtx = new Ctor();
+    return _audioCtx;
+  } catch {
+    return null;
+  }
+}
+
+// Loudness for all feedback tones (0.0–1.0). Kept at module scope so the
+// top-level play* helpers can read it; the React app syncs it from the
+// `audio_volume` setting via `setToneVolume`.
+let toneVolume = 0.6;
+function setToneVolume(v: number) {
+  toneVolume = Math.max(0, Math.min(1, v));
+}
+
+function playTone(frequency: number, durationSecs: number, volume?: number) {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  // Suspended (some Chromium policies) — try to resume; if it fails we skip.
+  if (ctx.state === "suspended") {
+    ctx.resume().catch(() => {});
+  }
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = frequency;
+  // Gentle attack + release so it doesn't click. 0.08 is the reference peak
+  // at full volume; the user's volume setting scales it down.
+  const peak = 0.08 * (volume ?? toneVolume);
+  const now = ctx.currentTime;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(peak, now + 0.01);
+  gain.gain.linearRampToValueAtTime(0, now + durationSecs);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + durationSecs + 0.02);
+}
+
+/** Two-tone arpeggio rising — "recording started". */
+function playStartTone() {
+  playTone(660, 0.07);          // E5
+  setTimeout(() => playTone(880, 0.09), 70); // A5
+}
+
+/** Low descending two-tone — "something went wrong" (transcription error). */
+function playErrorTone() {
+  playTone(330, 0.10);          // E4
+  setTimeout(() => playTone(220, 0.16), 90); // A3
+}
+
+/** Single soft high blip — "copied to clipboard". */
+function playCopyTone() {
+  playTone(990, 0.045);
+}
+
+/** Two-tone arpeggio falling — "recording stopped". */
+function playStopTone() {
+  playTone(880, 0.07);          // A5
+  setTimeout(() => playTone(550, 0.10), 70); // C#5
 }
 
 let historyIdCounter = 0;
@@ -236,6 +339,12 @@ function App() {
   const [maxRecordingSecs, setMaxRecordingSecs] = useState<number>(60);
   const [unlimitedRecording, setUnlimitedRecording] = useState<boolean>(false);
   const [preferredAudioDevice, setPreferredAudioDevice] = useState<string | null>(null);
+  // v2.8.1 — short tone on record start/stop so user gets feedback even when
+  // their target app obscures the floating toolbar.
+  const [audioFeedbackEnabled, setAudioFeedbackEnabled] = useState<boolean>(true);
+  // v2.8.1 — always-floating idle button (discoverability) + tone loudness.
+  const [idleButtonEnabled, setIdleButtonEnabled] = useState<boolean>(false);
+  const [audioVolume, setAudioVolume] = useState<number>(0.6);
   const [livePreview, setLivePreview] = useState("");
   const [copiedHistoryId, setCopiedHistoryId] = useState<number | null>(null);
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string } | null>(null);
@@ -257,6 +366,10 @@ function App() {
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { transcriptionModeRef.current = transcriptionMode; }, [transcriptionMode]);
   useEffect(() => { streamingEnabledRef.current = streamingEnabled; }, [streamingEnabled]);
+  const audioFeedbackEnabledRef = useRef(audioFeedbackEnabled);
+  useEffect(() => { audioFeedbackEnabledRef.current = audioFeedbackEnabled; }, [audioFeedbackEnabled]);
+  const audioVolumeRef = useRef(audioVolume);
+  useEffect(() => { audioVolumeRef.current = audioVolume; setToneVolume(audioVolume); }, [audioVolume]);
 
   const maxRecordingSecsRef = useRef(60);
   const unlimitedRecordingRef = useRef(false);
@@ -299,6 +412,10 @@ function App() {
     setStatus("transcribing");
     stopVadPolling();
     stopTimer();
+    // Audio feedback — short descending arpeggio when mic closes. Fires
+    // BEFORE transcription so the user gets feedback immediately rather than
+    // after the 1–5s transcribe wait.
+    if (audioFeedbackEnabledRef.current) playStopTone();
 
     // Snappy UX when the user clicked the toolbar's stop button: dismiss the
     // floating bar and surface the main window immediately, BEFORE we kick off
@@ -347,6 +464,9 @@ function App() {
       }
     } catch (e) {
       setError(String(e));
+      // Audible cue so the user notices a failure even when their target app
+      // covers the toolbar / main window (bad key, no credit, offline).
+      if (audioFeedbackEnabledRef.current) playErrorTone();
     }
     // For fromToolbar==true the toolbar was already hidden up top (snappy UX).
     // For Alt+D / button / auto-stop, hide it now after transcription completes.
@@ -371,6 +491,8 @@ function App() {
       } else {
         await invoke("start_recording");
       }
+      // Audio feedback — short ascending arpeggio when mic opens.
+      if (audioFeedbackEnabledRef.current) playStartTone();
       // Only swap to the toolbar once the backend accepted the start — avoids
       // leaving the main window hidden behind a toolbar if start_* fails.
       await emit("toolbar-reset").catch(() => {});
@@ -405,6 +527,12 @@ function App() {
         stopAndTranscribe(fromToolbar);
       } else if (currentStatus === "idle") {
         await beginRecording();
+      } else if (currentStatus === "transcribing" && fromToolbar) {
+        // Race condition: VAD/timeout auto-stopped recording the same instant
+        // the user clicked Stop on the toolbar. Status is already "transcribing"
+        // and the toolbar would otherwise stay visible because the listener used
+        // to no-op here. Force the toolbar away and surface the main window.
+        await invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
       }
     });
     // Separate Pause hotkey — only acts while a recording is active. Toggles
@@ -584,6 +712,15 @@ function App() {
       if (typeof settings.preferred_audio_device !== "undefined") {
         setPreferredAudioDevice(settings.preferred_audio_device ?? null);
       }
+      if (typeof settings.audio_feedback_enabled === "boolean") {
+        setAudioFeedbackEnabled(settings.audio_feedback_enabled);
+      }
+      if (typeof settings.idle_button_enabled === "boolean") {
+        setIdleButtonEnabled(settings.idle_button_enabled);
+      }
+      if (typeof settings.audio_volume === "number") {
+        setAudioVolume(Math.max(0, Math.min(1, settings.audio_volume)));
+      }
       if (settings.preferred_model) {
         preferredModelName = settings.preferred_model;
         setSelectedModel(preferredModelName);
@@ -635,10 +772,13 @@ function App() {
       max_recording_secs: maxRecordingSecs,
       unlimited_recording: unlimitedRecording,
       preferred_audio_device: preferredAudioDevice,
+      audio_feedback_enabled: audioFeedbackEnabled,
+      idle_button_enabled: idleButtonEnabled,
+      audio_volume: audioVolume,
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -785,36 +925,56 @@ function App() {
     };
 
     const completeOnboarding = async () => {
-      if (wizardChoice === "api" && wizardApiKey) {
-        await setApiKey("deepgram", wizardApiKey);
-        setDeepgramKey("••••••••");
+      // Persist key first, but never let a keyring failure trap the user inside
+      // the wizard on every launch. v2.8.x bug: setApiKey would throw on a
+      // locked-down Credential Manager / antivirus block, the wizard would
+      // abort before persistSettings, onboarding_completed stayed false, and
+      // the wizard re-ran every launch. Now: capture the error, finish the
+      // wizard, and surface a toast on the main view.
+      let keyError: string | null = null;
+      try {
+        if (wizardChoice === "api" && wizardApiKey) {
+          await setApiKey("deepgram", wizardApiKey);
+          setDeepgramKey("••••••••");
+        } else if (wizardChoice === "groq" && wizardApiKey) {
+          await setApiKey("groq", wizardApiKey);
+          setGroqKey("••••••••");
+        }
+      } catch (e) {
+        keyError = String(e);
+      }
+
+      // Apply chosen mode regardless of key save outcome.
+      const overrides: Partial<AppSettings> = { onboarding_completed: true };
+      if (wizardChoice === "api") {
         setApiProvider("deepgram");
         setTranscriptionMode("api");
-        await persistSettings({
-          onboarding_completed: true,
-          api_provider: "deepgram",
-          transcription_mode: "api",
-        });
-      } else if (wizardChoice === "groq" && wizardApiKey) {
-        await setApiKey("groq", wizardApiKey);
-        setGroqKey("••••••••");
+        overrides.api_provider = "deepgram";
+        overrides.transcription_mode = "api";
+      } else if (wizardChoice === "groq") {
         setApiProvider("groq");
         setTranscriptionMode("api");
         setStreamingEnabled(false);
-        await persistSettings({
-          onboarding_completed: true,
-          api_provider: "groq",
-          transcription_mode: "api",
-          streaming_enabled: false,
-        });
+        overrides.api_provider = "groq";
+        overrides.transcription_mode = "api";
+        overrides.streaming_enabled = false;
       } else if (wizardChoice === "local") {
         setTranscriptionMode("local");
-        await persistSettings({ onboarding_completed: true, transcription_mode: "local" });
-      } else {
-        await persistSettings({ onboarding_completed: true });
+        overrides.transcription_mode = "local";
       }
+
+      // ALWAYS persist onboarding_completed=true — even if setApiKey above
+      // failed. The user can re-enter the key from Settings; we don't want them
+      // stuck in the wizard forever.
+      try { await persistSettings(overrides); } catch { /* swallow — best effort */ }
       try { await invoke("accept_terms"); } catch { /* ok */ }
       setView("main");
+
+      if (keyError) {
+        setError(
+          `המפתח לא נשמר באחסון המאובטח (Credential Manager). נסה שוב מההגדרות. פרטים: ${keyError}`
+        );
+      }
     };
 
     const termsAccepted = wizardTermsAsIs && wizardTermsKeys;
@@ -1099,6 +1259,20 @@ function App() {
                 <span>ודבר בעברית</span>
               </div>
               <p className="wizard-note" style={{ fontSize: "0.7rem" }}>התוכנה רצה ברקע. גם בסגירת החלון Alt+D ממשיך לעבוד.</p>
+
+              <label className="toggle-label wizard-idle-toggle">
+                <input
+                  type="checkbox"
+                  checked={idleButtonEnabled}
+                  onChange={() => {
+                    const v = !idleButtonEnabled;
+                    setIdleButtonEnabled(v);
+                    invoke("set_idle_button_enabled", { enabled: v }).catch(() => {});
+                    persistSettings({ idle_button_enabled: v });
+                  }}
+                />
+                <span className="toggle-text">כפתור צף תמידי — לחיצה אחת להכתבה, בלי לזכור קיצור</span>
+              </label>
 
               <div className="wizard-cta-block">
                 <p className="wizard-cta-title">אהבתם? עקבו לעוד כלי AI מעולים בעברית</p>
@@ -1551,6 +1725,66 @@ function App() {
           </label>
         </div>
 
+        {/* Idle floating button (v2.8.1) */}
+        <div className="settings-section">
+          <h3>כפתור צף תמידי</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={idleButtonEnabled}
+              onChange={() => {
+                const v = !idleButtonEnabled;
+                setIdleButtonEnabled(v);
+                invoke("set_idle_button_enabled", { enabled: v }).catch(() => {});
+                persistSettings({ idle_button_enabled: v });
+              }}
+            />
+            <span className="toggle-text">כפתור עגול קטן שתמיד צף — לחיצה אחת מתחילה הכתבה, בלי לזכור קיצור מקלדת</span>
+          </label>
+          <p className="settings-hint">
+            מופיע כשהחלון הראשי מוסתר (למשל אחרי הפעלה אוטומטית בהדלקת המחשב). אפשר לגרור אותו לכל מקום במסך.
+          </p>
+        </div>
+
+        {/* Audio feedback */}
+        <div className="settings-section">
+          <h3>צליל בהתחלה ובסיום</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={audioFeedbackEnabled}
+              onChange={() => {
+                const v = !audioFeedbackEnabled;
+                setAudioFeedbackEnabled(v);
+                persistSettings({ audio_feedback_enabled: v });
+                // Demo the tone the first time the user turns it on so they hear what they're getting.
+                if (v) playStartTone();
+              }}
+            />
+            <span className="toggle-text">השמע צליל קצר כשההקלטה מתחילה ומסתיימת</span>
+          </label>
+          {audioFeedbackEnabled && (
+            <>
+              <div className="settings-slider-row">
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={Math.round(audioVolume * 100)}
+                  onChange={(e) => {
+                    setAudioVolume(parseInt(e.target.value, 10) / 100);
+                  }}
+                  onMouseUp={() => { persistSettings({ audio_volume: audioVolume }); playStartTone(); }}
+                  onTouchEnd={() => { persistSettings({ audio_volume: audioVolume }); playStartTone(); }}
+                />
+                <span className="settings-slider-value">{Math.round(audioVolume * 100)}%</span>
+              </div>
+              <p className="settings-hint">עוצמת הצלילים (התחלה, סיום, שגיאה, העתקה).</p>
+            </>
+          )}
+        </div>
+
         {/* Autostart */}
         <div className="settings-section">
           <h3>הפעלה אוטומטית בהדלקה</h3>
@@ -1869,6 +2103,7 @@ function App() {
                 onClick={async () => {
                   try {
                     await navigator.clipboard.writeText(h.text);
+                    if (audioFeedbackEnabledRef.current) playCopyTone();
                     setCopiedHistoryId(h.id);
                     window.setTimeout(() => {
                       setCopiedHistoryId((cur) => (cur === h.id ? null : cur));
@@ -1904,6 +2139,9 @@ export function ToolbarApp() {
   const [livePreview, setLivePreview] = useState("");
   const [paused, setPaused] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
+  // "recording" = full bar; "idle" = small floating circle (one click to
+  // start dictation). Backend emits `toolbar-mode` to switch between them.
+  const [mode, setMode] = useState<"idle" | "recording">("recording");
   const [vadState, setVadState] = useState<VadStatePayload>({
     state: "speaking",
     silent_secs: 0,
@@ -1911,6 +2149,34 @@ export function ToolbarApp() {
     vad_off: false,
   });
   const liveFinalRef = useRef("");
+  // Click-vs-drag discrimination for the idle circle: remember the mousedown
+  // screen point; movement beyond ~5px = drag, otherwise = click (start rec).
+  const idleDownRef = useRef<{ x: number; y: number } | null>(null);
+  const idleDraggingRef = useRef(false);
+  // Pending single-click timer — lets us tell a single click (start dictation)
+  // from a double click (open the full window).
+  const idleClickTimerRef = useRef<number | null>(null);
+
+  // Mount-time mode detection. The backend emits `toolbar-mode` when it shows
+  // the window, but on a cold autostart-minimized launch that emit can fire
+  // before this webview has attached its listener. The window's own size is
+  // the source of truth: a ~56px window is the idle circle.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    win
+      .innerSize()
+      .then(async (sz) => {
+        const sf = await win.scaleFactor().catch(() => 1);
+        const logicalW = sz.width / (sf || 1);
+        setMode(logicalW < 100 ? "idle" : "recording");
+      })
+      .catch(() => {});
+    return () => {
+      if (idleClickTimerRef.current !== null) {
+        window.clearTimeout(idleClickTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const unlistenInterim = listen<InterimPayload>("transcription-interim", (event) => {
@@ -1939,17 +2205,119 @@ export function ToolbarApp() {
     const unlistenVad = listen<VadStatePayload>("vad-state", (event) => {
       setVadState(event.payload);
     });
+    const unlistenMode = listen<string>("toolbar-mode", (event) => {
+      setMode(event.payload === "idle" ? "idle" : "recording");
+    });
+
+    // Persist drag position so the toolbar reappears where the user left it.
+    // Debounced so we don't hammer the disk on every pixel of a drag.
+    let saveTimer: number | null = null;
+    let scaleFactor = 1;
+    const tauriWindow = getCurrentWindow();
+    tauriWindow.scaleFactor().then((s) => { scaleFactor = s || 1; }).catch(() => {});
+    const unlistenMove = tauriWindow.onMoved(({ payload }) => {
+      // payload is in physical pixels; convert to logical for cross-DPI consistency.
+      const logicalX = payload.x / scaleFactor;
+      const logicalY = payload.y / scaleFactor;
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(() => {
+        invoke("set_toolbar_position", { x: logicalX, y: logicalY }).catch(() => {});
+        saveTimer = null;
+      }, 500);
+    });
+
     return () => {
       unlistenInterim.then((fn) => fn());
       unlistenReset.then((fn) => fn());
       unlistenLevel.then((fn) => fn());
       unlistenVad.then((fn) => fn());
+      unlistenMode.then((fn) => fn());
+      unlistenMove.then((fn) => fn());
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
     };
   }, []);
 
   const handleStop = useCallback(async () => {
-    // Re-use main's hotkey handler — it already toggles recording state.
+    // 1) Re-use main's hotkey handler — it already toggles recording state and
+    //    runs the full transcribe → inject → history pipeline.
     await emit("hotkey-pressed", "toolbar");
+    // 2) Safety fallback — if main's listener no-ops (e.g. status was neither
+    //    "recording" nor "idle" at click time, like a status flicker between
+    //    paths), the toolbar would have stayed visible forever. Force-hide it
+    //    after a short window. If main already handled the click, this call
+    //    is a no-op (window is already hidden).
+    setTimeout(() => {
+      invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
+    }, 400);
+  }, []);
+
+  // Mouse-down drag handler for the toolbar window.
+  //
+  // `data-tauri-drag-region` alone doesn't reliably work on transparent +
+  // focus:false windows on Windows (the OS routes mouse messages differently
+  // when the window can't take focus). The Window.startDragging() API works
+  // regardless of focus state — it invokes the OS-level drag loop directly.
+  //
+  // We skip the drag if the user clicked on a button (so pause/stop still
+  // fire), and we don't preventDefault on those targets so React onClick
+  // continues to fire.
+  const handleDragMouseDown = useCallback(async (e: React.MouseEvent) => {
+    if (e.button !== 0) return; // left button only
+    const target = e.target as HTMLElement;
+    if (target.tagName === "BUTTON" || target.closest("button")) return;
+    e.preventDefault();
+    try { await getCurrentWindow().startDragging(); } catch { /* ok */ }
+  }, []);
+
+  // Idle circle interaction. We DON'T call startDragging() on mousedown
+  // (that hands the OS the mouse and we'd never tell a click from a drag).
+  // Instead: track the down point, start the OS drag only once movement
+  // exceeds ~5px, and treat a release with no drag as a click → start rec.
+  const handleIdleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    idleDownRef.current = { x: e.screenX, y: e.screenY };
+    idleDraggingRef.current = false;
+  }, []);
+
+  const handleIdleMouseMove = useCallback(async (e: React.MouseEvent) => {
+    const start = idleDownRef.current;
+    if (!start || idleDraggingRef.current) return;
+    if (Math.hypot(e.screenX - start.x, e.screenY - start.y) > 5) {
+      idleDraggingRef.current = true;
+      try { await getCurrentWindow().startDragging(); } catch { /* ok */ }
+    }
+  }, []);
+
+  const handleIdleMouseUp = useCallback(async () => {
+    const start = idleDownRef.current;
+    idleDownRef.current = null;
+    if (!start) return;
+    if (idleDraggingRef.current) { idleDraggingRef.current = false; return; }
+    // Second click within the window → double-click → open the full window.
+    if (idleClickTimerRef.current !== null) {
+      window.clearTimeout(idleClickTimerRef.current);
+      idleClickTimerRef.current = null;
+      await invoke("open_main_window").catch(() => {});
+      return;
+    }
+    // First click → wait briefly; if no second click lands, it's a single
+    // click → start dictation (reuse main's hotkey handler: status "idle" →
+    // beginRecording → show_toolbar_window swaps this window to the bar).
+    idleClickTimerRef.current = window.setTimeout(() => {
+      idleClickTimerRef.current = null;
+      emit("hotkey-pressed", "toolbar").catch(() => {});
+    }, 240);
+  }, []);
+
+  // Right-click the circle also opens the full window (power-user shortcut).
+  const handleIdleContextMenu = useCallback(async (e: React.MouseEvent) => {
+    e.preventDefault();
+    idleDownRef.current = null;
+    if (idleClickTimerRef.current !== null) {
+      window.clearTimeout(idleClickTimerRef.current);
+      idleClickTimerRef.current = null;
+    }
+    await invoke("open_main_window").catch(() => {});
   }, []);
 
   const handlePauseToggle = useCallback(async () => {
@@ -1978,39 +2346,71 @@ export function ToolbarApp() {
   // Clamp + percent for the volume bar; while paused, show empty.
   const levelPct = paused ? 0 : Math.max(0, Math.min(1, audioLevel)) * 100;
 
-  return (
-    <div className={`toolbar-view ${paused ? "paused" : ""}`} dir="rtl">
-      <span className="toolbar-dot" aria-hidden="true" />
-      <span className="toolbar-live" dir="auto">
-        {paused ? "⏸ הושהה" : (livePreview || "מקליט...")}
-      </span>
-      <div className="toolbar-meter" aria-hidden="true">
-        <div className="toolbar-meter-fill" style={{ width: `${levelPct}%` }} />
+  if (mode === "idle") {
+    return (
+      <div
+        className="toolbar-idle"
+        role="button"
+        tabIndex={0}
+        dir="rtl"
+        title="לחיצה — התחל הכתבה · דאבל-קליק — פתח חלון · גרירה — הזז"
+        aria-label="התחל הכתבה (לחיצה כפולה פותחת את החלון המלא)"
+        onMouseDown={handleIdleMouseDown}
+        onMouseMove={handleIdleMouseMove}
+        onMouseUp={handleIdleMouseUp}
+        onContextMenu={handleIdleContextMenu}
+      >
+        <img className="toolbar-idle-logo" src="/app-icon.png" alt="" draggable={false} />
       </div>
-      <span
-        className={`toolbar-vad ${vadState.vad_off ? "off" : vadState.state}`}
-        title={vadState.vad_off ? "עצירה אוטומטית כבויה" : ""}
-      >
-        {vadLabel}
-      </span>
-      <button
-        type="button"
-        className="toolbar-pause"
-        onClick={handlePauseToggle}
-        title={paused ? "המשך" : "השהה"}
-        aria-label={paused ? "המשך" : "השהה"}
-      >
-        {paused ? "▶" : "⏸"}
-      </button>
-      <button
-        type="button"
-        className="toolbar-stop"
-        onClick={handleStop}
-        title="עצור"
-        aria-label="עצור"
-      >
-        ⏹
-      </button>
+    );
+  }
+
+  return (
+    <div
+      className={`toolbar-view ${paused ? "paused" : ""}`}
+      dir="rtl"
+      onMouseDown={handleDragMouseDown}
+      title="גרור כדי להזיז"
+    >
+      {/* Top row — recording dot + level meter + VAD indicator + buttons.
+          The whole bar is a drag handle except for the buttons (handled in
+          handleDragMouseDown via closest('button')). */}
+      <div className="toolbar-row-top">
+        <span className="toolbar-dot" aria-hidden="true" />
+        <div className="toolbar-meter" aria-hidden="true">
+          <div className="toolbar-meter-fill" style={{ width: `${levelPct}%` }} />
+        </div>
+        <span
+          className={`toolbar-vad ${vadState.vad_off ? "off" : vadState.state}`}
+          title={vadState.vad_off ? "עצירה אוטומטית כבויה" : ""}
+        >
+          {vadLabel}
+        </span>
+        <button
+          type="button"
+          className="toolbar-pause"
+          onClick={handlePauseToggle}
+          title={paused ? "המשך" : "השהה"}
+          aria-label={paused ? "המשך" : "השהה"}
+        >
+          {paused ? "▶" : "⏸"}
+        </button>
+        <button
+          type="button"
+          className="toolbar-stop"
+          onClick={handleStop}
+          title="עצור"
+          aria-label="עצור"
+        >
+          ⏹
+        </button>
+      </div>
+      {/* Bottom row — live transcription preview (or status text). */}
+      <div className="toolbar-row-bottom">
+        <span className="toolbar-live" dir="auto">
+          {paused ? "⏸ הושהה" : (livePreview || "מקליט...")}
+        </span>
+      </div>
     </div>
   );
 }

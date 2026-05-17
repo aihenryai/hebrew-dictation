@@ -18,6 +18,15 @@ impl Default for TranscriptionMode {
     }
 }
 
+/// Saved screen position of the floating toolbar window. Lets the user drag the
+/// toolbar to where they want it and have it stick across recording sessions.
+/// Logical (DPI-independent) coordinates relative to the virtual screen origin.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ToolbarPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiProvider {
@@ -94,6 +103,24 @@ pub struct AppSettings {
     pub unlimited_recording: bool,
     #[serde(default)]
     pub preferred_audio_device: Option<String>,
+    /// Last position the user dragged the floating toolbar to. `None` =
+    /// fall back to the default bottom-center placement on the active monitor.
+    #[serde(default)]
+    pub toolbar_position: Option<ToolbarPosition>,
+    /// Play a short tone when recording starts / stops. Default true.
+    /// Helps users know the mic actually opened — especially when the user is
+    /// in another app and can't see the floating toolbar appear.
+    #[serde(default = "default_true")]
+    pub audio_feedback_enabled: bool,
+    /// Show a small always-floating circular button when the main window is
+    /// hidden (autostart / closed-to-tray). One click starts dictation — the
+    /// main discoverability fix for non-technical users who don't know the app
+    /// is running. Default false (opt-in via wizard / settings).
+    #[serde(default)]
+    pub idle_button_enabled: bool,
+    /// Loudness of the audio-feedback tones, 0.0–1.0. Default 0.6.
+    #[serde(default = "default_audio_volume")]
+    pub audio_volume: f32,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -119,6 +146,10 @@ pub struct RedactedSettings {
     pub max_recording_secs: f32,
     pub unlimited_recording: bool,
     pub preferred_audio_device: Option<String>,
+    pub toolbar_position: Option<ToolbarPosition>,
+    pub audio_feedback_enabled: bool,
+    pub idle_button_enabled: bool,
+    pub audio_volume: f32,
 }
 
 impl AppSettings {
@@ -144,6 +175,10 @@ impl AppSettings {
             max_recording_secs: self.max_recording_secs,
             unlimited_recording: self.unlimited_recording,
             preferred_audio_device: self.preferred_audio_device.clone(),
+            toolbar_position: self.toolbar_position,
+            audio_feedback_enabled: self.audio_feedback_enabled,
+            idle_button_enabled: self.idle_button_enabled,
+            audio_volume: self.audio_volume,
         }
     }
 }
@@ -176,6 +211,10 @@ fn default_max_recording_secs() -> f32 {
     60.0
 }
 
+fn default_audio_volume() -> f32 {
+    0.6
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -199,6 +238,10 @@ impl Default for AppSettings {
             max_recording_secs: default_max_recording_secs(),
             unlimited_recording: false,
             preferred_audio_device: None,
+            toolbar_position: None,
+            audio_feedback_enabled: true,
+            idle_button_enabled: false,
+            audio_volume: default_audio_volume(),
         }
     }
 }
@@ -272,15 +315,18 @@ pub fn load_settings() -> LoadResult {
     }
 
     // 1) Load existing keys from keyring (works on fresh installs and post-migration).
-    if let Ok(Some(k)) = crate::secure_keys::load_key("deepgram") {
-        if !k.is_empty() {
-            settings.deepgram_api_key = Some(k);
-        }
+    //    Errors are logged (the keyring backend may be unavailable on locked-down
+    //    systems / antivirus blocking DPAPI) so we have a trail when users report
+    //    "key disappeared between launches".
+    match crate::secure_keys::load_key("deepgram") {
+        Ok(Some(k)) if !k.is_empty() => settings.deepgram_api_key = Some(k),
+        Ok(_) => {}
+        Err(e) => eprintln!("[settings] keyring read failed for deepgram: {}", e),
     }
-    if let Ok(Some(k)) = crate::secure_keys::load_key("groq") {
-        if !k.is_empty() {
-            settings.groq_api_key = Some(k);
-        }
+    match crate::secure_keys::load_key("groq") {
+        Ok(Some(k)) if !k.is_empty() => settings.groq_api_key = Some(k),
+        Ok(_) => {}
+        Err(e) => eprintln!("[settings] keyring read failed for groq: {}", e),
     }
 
     // 2) Detect legacy keys present in JSON (only present on pre-2.6.0 installs).
