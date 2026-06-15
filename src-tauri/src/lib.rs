@@ -1,5 +1,6 @@
 mod api_transcribe;
 mod audio;
+mod enhance;
 mod export;
 mod injector;
 mod model;
