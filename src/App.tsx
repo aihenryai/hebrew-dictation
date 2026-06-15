@@ -29,7 +29,7 @@ const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
     "\n"
 )}`;
 
-type AppStatus = "idle" | "recording" | "transcribing" | "downloading" | "loading-model";
+type AppStatus = "idle" | "recording" | "transcribing" | "enhancing" | "downloading" | "loading-model";
 type AppView = "main" | "settings" | "onboarding";
 type Language = "he" | "en" | "multi";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
@@ -58,6 +58,8 @@ interface AppSettings {
   audio_feedback_enabled?: boolean;
   idle_button_enabled?: boolean;
   audio_volume?: number;
+  enhance_enabled?: boolean;
+  enhance_mode?: string;
 }
 
 /** Redacted settings returned from the backend (keys replaced with booleans). */
@@ -85,6 +87,8 @@ interface RedactedSettings {
   audio_feedback_enabled?: boolean;
   idle_button_enabled?: boolean;
   audio_volume?: number;
+  enhance_enabled?: boolean;
+  enhance_mode?: string;
 }
 
 /** VAD state payload pushed from the backend ~every 500ms while recording. */
@@ -342,6 +346,8 @@ function App() {
   // v2.8.1 — short tone on record start/stop so user gets feedback even when
   // their target app obscures the floating toolbar.
   const [audioFeedbackEnabled, setAudioFeedbackEnabled] = useState<boolean>(true);
+  const [enhanceEnabled, setEnhanceEnabled] = useState<boolean>(false);
+  const [hasGroqKey, setHasGroqKey] = useState<boolean>(false);
   // v2.8.1 — always-floating idle button (discoverability) + tone loudness.
   const [idleButtonEnabled, setIdleButtonEnabled] = useState<boolean>(false);
   const [audioVolume, setAudioVolume] = useState<number>(0.6);
@@ -368,6 +374,8 @@ function App() {
   useEffect(() => { streamingEnabledRef.current = streamingEnabled; }, [streamingEnabled]);
   const audioFeedbackEnabledRef = useRef(audioFeedbackEnabled);
   useEffect(() => { audioFeedbackEnabledRef.current = audioFeedbackEnabled; }, [audioFeedbackEnabled]);
+  const enhanceEnabledRef = useRef(enhanceEnabled);
+  useEffect(() => { enhanceEnabledRef.current = enhanceEnabled; }, [enhanceEnabled]);
   const audioVolumeRef = useRef(audioVolume);
   useEffect(() => { audioVolumeRef.current = audioVolume; setToneVolume(audioVolume); }, [audioVolume]);
 
@@ -455,11 +463,23 @@ function App() {
 
         const text = await invoke("transcribe", { samples, language: languageRef.current }) as string;
         if (text && text.trim()) {
-          setTranscript(text);
-          setEditableTranscript(text);
-          setHistory((prev) => [{ id: ++historyIdCounter, text, timestamp: new Date().toISOString() }, ...prev].slice(0, 20));
+          // Smart cleanup (opt-in): enhance the raw transcript before injecting.
+          // Fail-safe — any enhance error falls back to the raw text (never lost).
+          let finalText = text;
+          if (enhanceEnabledRef.current) {
+            setStatus("enhancing");
+            try {
+              finalText = await invoke("enhance_text", { text, mode: null }) as string;
+            } catch (err) {
+              console.error("enhance failed, injecting raw transcript:", err);
+              finalText = text;
+            }
+          }
+          setTranscript(finalText);
+          setEditableTranscript(finalText);
+          setHistory((prev) => [{ id: ++historyIdCounter, text: finalText, timestamp: new Date().toISOString() }, ...prev].slice(0, 20));
           // Auto-inject into focused field
-          await injectText(text);
+          await injectText(finalText);
         }
       }
     } catch (e) {
@@ -692,6 +712,7 @@ function App() {
       // Keys are redacted — just track whether they exist on the backend.
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
       if (settings.has_groq_key) setGroqKey("••••••••");
+      setHasGroqKey(!!settings.has_groq_key);
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
       if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
       if (typeof settings.streaming_enabled === "boolean") {
@@ -717,6 +738,9 @@ function App() {
       }
       if (typeof settings.idle_button_enabled === "boolean") {
         setIdleButtonEnabled(settings.idle_button_enabled);
+      }
+      if (typeof settings.enhance_enabled === "boolean") {
+        setEnhanceEnabled(settings.enhance_enabled);
       }
       if (typeof settings.audio_volume === "number") {
         setAudioVolume(Math.max(0, Math.min(1, settings.audio_volume)));
@@ -775,10 +799,11 @@ function App() {
       audio_feedback_enabled: audioFeedbackEnabled,
       idle_button_enabled: idleButtonEnabled,
       audio_volume: audioVolume,
+      enhance_enabled: enhanceEnabled,
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -1785,6 +1810,30 @@ function App() {
           )}
         </div>
 
+        {/* Smart cleanup (רישוף חכם) */}
+        <div className="settings-section">
+          <h3>✨ רישוף חכם</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={enhanceEnabled}
+              disabled={!hasGroqKey}
+              onChange={() => {
+                const v = !enhanceEnabled;
+                setEnhanceEnabled(v);
+                persistSettings({ enhance_enabled: v });
+              }}
+            />
+            <span className="toggle-text">נקה מילות מילוי, חזרות ופיסוק מהתמלול לפני ההזרקה (דרך Groq Llama)</span>
+          </label>
+          {!hasGroqKey && (
+            <p className="settings-hint">דרוש מפתח Groq (חינמי, ללא כרטיס אשראי) — הגדר אותו למעלה כדי להפעיל רישוף.</p>
+          )}
+          {enhanceEnabled && transcriptionMode === "local" && (
+            <p className="settings-hint">⚠️ במצב מקומי: הטקסט המתומלל (לא ההקלטה) יישלח ל-Groq לצורך הרישוף.</p>
+          )}
+        </div>
+
         {/* Autostart */}
         <div className="settings-section">
           <h3>הפעלה אוטומטית בהדלקה</h3>
@@ -2011,6 +2060,7 @@ function App() {
           {status === "idle" && (canRecord ? `מוכן — ${langLabels[language]} · ${modeLabel}` : "הגדר API / מודל")}
           {status === "recording" && `🔴 מקליט ${recordingTime.toFixed(0)}s`}
           {status === "transcribing" && "⏳ מתמלל..."}
+          {status === "enhancing" && "✨ משכתב..."}
           {status === "downloading" && "מוריד..."}
           {status === "loading-model" && "טוען מודל..."}
         </div>
@@ -2022,7 +2072,7 @@ function App() {
         <button
           onClick={handleToggleRecording}
           className={`btn-record ${status === "recording" ? "recording" : ""}`}
-          disabled={status === "transcribing" || status === "downloading" || status === "loading-model" || !canRecord}
+          disabled={status === "transcribing" || status === "enhancing" || status === "downloading" || status === "loading-model" || !canRecord}
         >
           {status === "recording" ? "⏹ עצור" : "🎤 הקלט"}
         </button>
