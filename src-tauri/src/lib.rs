@@ -273,6 +273,37 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
     }
 }
 
+/// Smart Cleanup (רישוף חכם) — opt-in post-transcription enhancement via Groq.
+/// Reads `groq_api_key` DIRECTLY (not `active_api_key()`) — enhancement is always
+/// Groq, regardless of which provider transcribed. The frontend falls back to the
+/// raw transcript on any Err, so this never blocks injection. Double-guards
+/// `enhance_enabled` so a stale frontend can't force enhancement.
+#[tauri::command]
+async fn enhance_text(
+    state: State<'_, AppState>,
+    text: String,
+    mode: Option<String>,
+) -> Result<String, String> {
+    let (enabled, mode_str, api_key) = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        (
+            s.enhance_enabled,
+            mode.unwrap_or_else(|| s.enhance_mode.clone()),
+            s.groq_api_key.clone(),
+        )
+    };
+    if !enabled {
+        return Ok(text); // no-op when the feature is off
+    }
+    let key = api_key
+        .filter(|k| !k.is_empty())
+        .ok_or("מפתח Groq לא מוגדר — נדרש לרישוף")?;
+    let m = enhance::EnhanceMode::from_str(&mode_str);
+    enhance::enhance_inner(&text, m, &key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn start_streaming_transcription(
     state: State<'_, AppState>,
@@ -1230,6 +1261,7 @@ pub fn run() {
             clear_api_key,
             test_api_key,
             inject_text,
+            enhance_text,
             export_history,
             get_audio_devices,
             set_window_always_on_top,

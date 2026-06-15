@@ -121,6 +121,13 @@ pub struct AppSettings {
     /// Loudness of the audio-feedback tones, 0.0–1.0. Default 0.6.
     #[serde(default = "default_audio_volume")]
     pub audio_volume: f32,
+    /// Opt-in smart cleanup of the transcript via Groq Llama before injection.
+    /// Default false — preserves existing behavior + privacy.
+    #[serde(default)]
+    pub enhance_enabled: bool,
+    /// Cleanup profile. Default "he_general". Unknown values fall back via EnhanceMode::from_str.
+    #[serde(default = "default_enhance_mode")]
+    pub enhance_mode: String,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -150,6 +157,8 @@ pub struct RedactedSettings {
     pub audio_feedback_enabled: bool,
     pub idle_button_enabled: bool,
     pub audio_volume: f32,
+    pub enhance_enabled: bool,
+    pub enhance_mode: String,
 }
 
 impl AppSettings {
@@ -179,6 +188,8 @@ impl AppSettings {
             audio_feedback_enabled: self.audio_feedback_enabled,
             idle_button_enabled: self.idle_button_enabled,
             audio_volume: self.audio_volume,
+            enhance_enabled: self.enhance_enabled,
+            enhance_mode: self.enhance_mode.clone(),
         }
     }
 }
@@ -215,6 +226,10 @@ fn default_audio_volume() -> f32 {
     0.6
 }
 
+fn default_enhance_mode() -> String {
+    "he_general".to_string()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -242,6 +257,8 @@ impl Default for AppSettings {
             audio_feedback_enabled: true,
             idle_button_enabled: false,
             audio_volume: default_audio_volume(),
+            enhance_enabled: false,
+            enhance_mode: default_enhance_mode(),
         }
     }
 }
