@@ -1825,6 +1825,7 @@ function App() {
             <input
               type="checkbox"
               checked={enhanceEnabled}
+              disabled={!hasGroqKey}
               onChange={() => {
                 const v = !enhanceEnabled;
                 setEnhanceEnabled(v);
@@ -1834,7 +1835,10 @@ function App() {
             <span className="toggle-text">נקה מילות מילוי, חזרות ופיסוק מהתמלול לפני ההזרקה (דרך Groq Llama)</span>
           </label>
           {!hasGroqKey && (
-            <p className="settings-hint">דרוש מפתח Groq (חינמי, ללא כרטיס אשראי) — הגדר אותו למעלה כדי להפעיל רישוף.</p>
+            <p className="settings-hint">דרוש מפתח Groq (חינמי, ללא כרטיס אשראי). בחר Groq בבורר הספק למעלה, הזן את המפתח ולחץ "בדוק" — אחר כך אפשר לחזור ל-Deepgram, ומפתח ה-Groq יישמר וישמש לרישוף.</p>
+          )}
+          {hasGroqKey && transcriptionMode !== "local" && apiProvider === "deepgram" && (
+            <p className="settings-hint">התמלול ירוץ דרך Deepgram, והרישוף דרך Groq — שני המפתחות פעילים.</p>
           )}
           {enhanceEnabled && transcriptionMode === "local" && (
             <p className="settings-hint">⚠️ במצב מקומי: הטקסט המתומלל (לא ההקלטה) יישלח ל-Groq לצורך הרישוף.</p>
