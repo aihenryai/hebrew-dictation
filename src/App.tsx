@@ -808,11 +808,16 @@ function App() {
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
     await invoke("set_api_key", { provider, key });
+    // Keep the smart-cleanup gate in sync — it needs a Groq key regardless of
+    // which provider transcribes. Without this the toggle stays locked until
+    // the next app launch (the load-time setHasGroqKey only runs on startup).
+    if (provider === "groq") setHasGroqKey(!!key);
   }, []);
 
   /** Remove an API key from OS-secure storage. */
   const clearApiKey = useCallback(async (provider: ApiProvider) => {
     await invoke("clear_api_key", { provider });
+    if (provider === "groq") setHasGroqKey(false);
   }, []);
 
   /** Apply a new global hotkey at runtime. Throws on parse error / OS conflict. */
@@ -874,6 +879,9 @@ function App() {
     try {
       await invoke("test_api_key", { provider: apiProvider, apiKey: activeKey });
       setApiKeyValid(true);
+      // Persist the key (the input onBlur may not have fired) and reflect it for
+      // the cleanup toggle — a successful test means we have a usable key.
+      await setApiKey(apiProvider, activeKey);
     } catch { setApiKeyValid(false); }
     setTestingApiKey(false);
   }
@@ -1817,7 +1825,6 @@ function App() {
             <input
               type="checkbox"
               checked={enhanceEnabled}
-              disabled={!hasGroqKey}
               onChange={() => {
                 const v = !enhanceEnabled;
                 setEnhanceEnabled(v);
