@@ -425,13 +425,13 @@ function App() {
     // after the 1–5s transcribe wait.
     if (audioFeedbackEnabledRef.current) playStopTone();
 
-    // Snappy UX when the user clicked the toolbar's stop button: dismiss the
-    // floating bar and surface the main window immediately, BEFORE we kick off
-    // transcription (which can take a few seconds on slower machines / API).
-    // The main window's "⏳ מתמלל..." status carries the user through the wait.
-    if (fromToolbar) {
-      await invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
-    }
+    // Dismiss the floating bar IMMEDIATELY on stop — BEFORE transcription +
+    // enhancement (which take a few seconds). Leaving it up makes it look like
+    // recording is still running. forceShowMain only when the stop came from the
+    // toolbar button (the user is looking at the app); on Alt+D from another app
+    // we hide the bar without stealing focus. The main window's status carries
+    // the wait either way.
+    await invoke("hide_toolbar_window", { forceShowMain: fromToolbar }).catch(() => {});
 
     try {
       if (streamingEnabledRef.current) {
@@ -449,13 +449,7 @@ function App() {
       } else {
         const samples = await invoke("stop_recording") as number[];
         if (samples.length < MIN_TRANSCRIBE_SAMPLES) {
-          // Too short to transcribe — but still close the toolbar / restore main
-          // (early-return here used to leave the floating bar stuck on screen).
-          // For fromToolbar==true the early hide above already ran; this is the
-          // safety net for the Alt+D / auto-stop / button paths.
-          if (!fromToolbar) {
-            await invoke("hide_toolbar_window", { forceShowMain: false }).catch(() => {});
-          }
+          // Too short to transcribe — the toolbar was already hidden up top.
           setStatus("idle");
           setRecordingTime(0);
           return;
@@ -488,11 +482,7 @@ function App() {
       // covers the toolbar / main window (bad key, no credit, offline).
       if (audioFeedbackEnabledRef.current) playErrorTone();
     }
-    // For fromToolbar==true the toolbar was already hidden up top (snappy UX).
-    // For Alt+D / button / auto-stop, hide it now after transcription completes.
-    if (!fromToolbar) {
-      await invoke("hide_toolbar_window", { forceShowMain: false }).catch(() => {});
-    }
+    // Toolbar was already hidden at the top of this function (snappy on every path).
     setStatus("idle");
     setRecordingTime(0);
   }, [stopVadPolling, stopTimer, injectText]);
