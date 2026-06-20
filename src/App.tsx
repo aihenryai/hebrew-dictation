@@ -315,6 +315,9 @@ function App() {
   const [groqKey, setGroqKey] = useState("");
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
   const [testingApiKey, setTestingApiKey] = useState(false);
+  // Dedicated Groq-key field for Smart Cleanup (independent of the transcription provider).
+  const [groqCleanupValid, setGroqCleanupValid] = useState<boolean | null>(null);
+  const [testingGroqCleanup, setTestingGroqCleanup] = useState(false);
   const [wizardStep, setWizardStep] = useState(1);
   const [wizardApiKey, setWizardApiKey] = useState("");
   const [wizardKeyValid, setWizardKeyValid] = useState<boolean | null>(null);
@@ -874,6 +877,20 @@ function App() {
       await setApiKey(apiProvider, activeKey);
     } catch { setApiKeyValid(false); }
     setTestingApiKey(false);
+  }
+
+  // Test the dedicated cleanup Groq key (independent of the selected transcription
+  // provider). On success, persist it — which unlocks the cleanup toggle.
+  async function handleTestGroqCleanup() {
+    if (!groqKey || groqKey === "••••••••") return;
+    setTestingGroqCleanup(true);
+    setGroqCleanupValid(null);
+    try {
+      await invoke("test_api_key", { provider: "groq", apiKey: groqKey });
+      setGroqCleanupValid(true);
+      await setApiKey("groq", groqKey);
+    } catch { setGroqCleanupValid(false); }
+    setTestingGroqCleanup(false);
   }
 
   async function loadDevices() {
@@ -1824,12 +1841,38 @@ function App() {
             />
             <span className="toggle-text">נקה מילות מילוי, חזרות ופיסוק מהתמלול לפני ההזרקה (דרך Groq Llama)</span>
           </label>
-          {!hasGroqKey && (
-            <p className="settings-hint">דרוש מפתח Groq (חינמי, ללא כרטיס אשראי). בחר Groq בבורר הספק למעלה, הזן את המפתח ולחץ "בדוק" — אחר כך אפשר לחזור ל-Deepgram, ומפתח ה-Groq יישמר וישמש לרישוף.</p>
-          )}
-          {hasGroqKey && transcriptionMode !== "local" && apiProvider === "deepgram" && (
-            <p className="settings-hint">התמלול ירוץ דרך Deepgram, והרישוף דרך Groq — שני המפתחות פעילים.</p>
-          )}
+
+          {/* Dedicated Groq key for cleanup — works regardless of the transcription provider */}
+          <p className="settings-hint">מפתח Groq לרישוף (עובד גם כשמתמללים ב-Deepgram או מקומי):</p>
+          <div className="api-key-row">
+            <input
+              type="password"
+              className="api-key-input"
+              value={groqKey}
+              placeholder="gsk_..."
+              onChange={(e) => { setGroqKey(e.target.value); setGroqCleanupValid(null); }}
+              onBlur={async () => {
+                if (groqKey === "••••••••") return;
+                try {
+                  if (groqKey) await setApiKey("groq", groqKey);
+                  else await clearApiKey("groq");
+                } catch { /* keep local state either way */ }
+              }}
+            />
+            <button
+              className={`btn-test ${groqCleanupValid === true ? "valid" : groqCleanupValid === false ? "invalid" : ""}`}
+              onClick={handleTestGroqCleanup}
+              disabled={testingGroqCleanup || !groqKey || groqKey === "••••••••"}
+            >
+              {testingGroqCleanup ? "..." : groqCleanupValid === true ? "✓" : groqCleanupValid === false ? "✗" : "בדוק"}
+            </button>
+          </div>
+          {groqCleanupValid === false && <p className="settings-note error-note">המפתח לא תקין</p>}
+          {groqCleanupValid === true && <p className="settings-note success-note">המפתח תקין — הרישוף מוכן</p>}
+          <p className="settings-note">
+            <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח Groq חינם (ללא כרטיס אשראי) → groq.com</a>
+          </p>
+
           {enhanceEnabled && transcriptionMode === "local" && (
             <p className="settings-hint">⚠️ במצב מקומי: הטקסט המתומלל (לא ההקלטה) יישלח ל-Groq לצורך הרישוף.</p>
           )}
