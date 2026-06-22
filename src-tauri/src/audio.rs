@@ -557,6 +557,48 @@ fn calculate_rms_strided(samples: &[f32], stride: usize) -> f32 {
     (sum_sq / count as f32).sqrt()
 }
 
+/// Peak absolute amplitude of the buffer (0.0..~1.0).
+pub fn peak_amplitude(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0_f32, |max, &s| max.max(s.abs()))
+}
+
+/// True when the buffer is effectively silent (peak below `threshold`) — i.e. the
+/// microphone captured nothing (muted, disabled, or no OS permission). A muted mic
+/// yields ≈0; even quiet speech peaks well above 0.02, so a 0.01 threshold cleanly
+/// separates "mic captured nothing" from real (if quiet) audio. Lets the UI tell
+/// the user to check the mic instead of silently returning no transcript.
+pub fn is_effectively_silent(samples: &[f32], threshold: f32) -> bool {
+    peak_amplitude(samples) < threshold
+}
+
+#[cfg(test)]
+mod silence_helper_tests {
+    use super::*;
+
+    #[test]
+    fn empty_buffer_is_silent() {
+        assert!(is_effectively_silent(&[], 0.01));
+    }
+
+    #[test]
+    fn zeroed_buffer_is_silent() {
+        assert!(is_effectively_silent(&vec![0.0f32; 16000], 0.01));
+    }
+
+    #[test]
+    fn tiny_noise_below_threshold_is_silent() {
+        assert!(is_effectively_silent(&vec![0.002f32; 16000], 0.01));
+    }
+
+    #[test]
+    fn speech_level_peak_is_not_silent() {
+        let mut buf = vec![0.0f32; 16000];
+        buf[100] = -0.3; // a speech-like transient (abs() handles the sign)
+        assert!(!is_effectively_silent(&buf, 0.01));
+        assert!((peak_amplitude(&buf) - 0.3).abs() < 1e-6);
+    }
+}
+
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();

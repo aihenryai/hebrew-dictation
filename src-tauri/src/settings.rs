@@ -432,3 +432,60 @@ pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
         .map_err(|e| format!("Failed to write settings: {}", e))?;
     Ok(())
 }
+
+impl AppSettings {
+    /// Overlay backend-managed fields from `self` (the authoritative in-memory
+    /// state) onto an incoming frontend `update_settings` payload.
+    ///
+    /// The frontend's `persistSettings` does NOT send these fields, so taking them
+    /// from the payload would reset them to serde defaults on every save — the
+    /// onboarding wizard would reappear, the toolbar position would be lost, and
+    /// the cached API keys would be dropped. They are managed exclusively by
+    /// dedicated commands (`set_api_key`/`clear_api_key`, `mark_onboarding_complete`,
+    /// `accept_terms`, `set_toolbar_position`, and the close-notification flow).
+    pub fn merge_frontend_update(&self, mut incoming: AppSettings) -> AppSettings {
+        incoming.deepgram_api_key = self.deepgram_api_key.clone();
+        incoming.groq_api_key = self.groq_api_key.clone();
+        incoming.onboarding_completed = self.onboarding_completed;
+        incoming.terms_accepted = self.terms_accepted;
+        incoming.close_notification_shown = self.close_notification_shown;
+        incoming.toolbar_position = self.toolbar_position;
+        incoming
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn merge_preserves_backend_managed_fields() {
+        let mut current = AppSettings::default();
+        current.onboarding_completed = true;
+        current.terms_accepted = true;
+        current.close_notification_shown = true;
+        current.toolbar_position = Some(ToolbarPosition { x: 658.0, y: 804.0 });
+        current.groq_api_key = Some("gsk_secret".to_string());
+        current.deepgram_api_key = Some("dg_secret".to_string());
+
+        // What persistSettings sends: the managed fields fall back to serde defaults.
+        let mut incoming = AppSettings::default();
+        incoming.onboarding_completed = false;
+        incoming.terms_accepted = false;
+        incoming.close_notification_shown = false;
+        incoming.toolbar_position = None;
+        incoming.audio_volume = 0.9; // a genuine user change the frontend DID send
+
+        let merged = current.merge_frontend_update(incoming);
+
+        // Managed fields preserved from `current`...
+        assert!(merged.onboarding_completed);
+        assert!(merged.terms_accepted);
+        assert!(merged.close_notification_shown);
+        assert_eq!(merged.toolbar_position, Some(ToolbarPosition { x: 658.0, y: 804.0 }));
+        assert_eq!(merged.groq_api_key.as_deref(), Some("gsk_secret"));
+        assert_eq!(merged.deepgram_api_key.as_deref(), Some("dg_secret"));
+        // ...while the genuine user change is kept.
+        assert_eq!(merged.audio_volume, 0.9);
+    }
+}

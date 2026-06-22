@@ -35,6 +35,11 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
-keyring = "3"
+# IMPORTANT: the platform backend features are REQUIRED. Without `windows-native`
+# (and `apple-native` for macOS) keyring v3 silently falls back to an in-memory
+# MOCK store — writes "succeed" but nothing reaches Windows Credential Manager /
+# Keychain, so every saved API key is lost on restart. (Bug: Groq key vanished
+# after restart; Deepgram only survived via the DEEPGRAM_API_KEY env var.)
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
 docx-rs = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

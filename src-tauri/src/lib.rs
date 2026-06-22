@@ -236,6 +236,11 @@ fn transcribe_local(state: &State<AppState>, samples: &[f32], lang: &str) -> Res
 
 #[tauri::command]
 async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Option<String>) -> Result<String, String> {
+    // Mic captured effectively nothing — muted, disabled, or no OS permission.
+    // Surface a clear, actionable message instead of silently returning no text.
+    if audio::is_effectively_silent(&samples, 0.01) {
+        return Err("לא נקלט קול מהמיקרופון. ודאו שהמיקרופון פתוח ומחובר, ושלאפליקציה יש הרשאה: הגדרות Windows ← פרטיות ← מיקרופון.".to_string());
+    }
     let lang = language.unwrap_or_else(|| "he".to_string());
     let (mode, provider, api_key) = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
@@ -502,13 +507,11 @@ fn get_settings(state: State<AppState>) -> Result<settings::RedactedSettings, St
 #[tauri::command]
 fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) -> Result<(), String> {
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-    let mut merged = new_settings;
-    // API keys are managed via set_api_key / clear_api_key. The fields on AppSettings
-    // are an in-memory cache only and are not persisted to JSON (#[serde(skip)]).
-    // If the frontend still sends them — ignore and preserve the existing cache so a
-    // legacy code path can never accidentally overwrite a securely stored key.
-    merged.deepgram_api_key = s.deepgram_api_key.clone();
-    merged.groq_api_key = s.groq_api_key.clone();
+    // Preserve backend-managed fields (API keys, onboarding/terms flags, toolbar
+    // position) — the frontend's persistSettings omits them, so trusting the
+    // payload would reset them to serde defaults on every save (wizard reappears,
+    // toolbar position lost, keys dropped). See AppSettings::merge_frontend_update.
+    let merged = s.merge_frontend_update(new_settings);
     settings::save_settings(&merged)?;
     *s = merged;
     Ok(())
