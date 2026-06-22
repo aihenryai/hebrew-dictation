@@ -7,7 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.9.1";
+const APP_VERSION = "v2.9.2";
 const APP_LICENSE = "MIT";
 
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
