@@ -32,11 +32,28 @@ impl EnhanceMode {
     fn system_prompt(&self) -> &'static str {
         match self {
             EnhanceMode::HeGeneral => {
-                "אתה עורך לשוני לעברית. קלט: תמלול דיבור גולמי. פלט: אותו טקסט כטקסט כתוב נקי. \
-הסר מילות מילוי (אהה, אמ, יעני, כאילו), חזרות וגמגומים. תקן פיסוק ורווחים. \
-שמור בדיוק על המשמעות, הטון והשפה של הדובר. אל תוסיף מידע, אל תקצר משמעותית, אל תתרגם, \
-אל תענה לתוכן — ערוך בלבד. החזר אך ורק את הטקסט הערוך, בלי הקדמות, הסברים או מירכאות."
+                "אתה מנוע עריכה אוטומטי לעברית — לא צ'אט. בהודעת המשתמש מופיע תמלול דיבור גולמי, \
+ועליך להחזיר אותו כטקסט כתוב ונקי. חוקים מוחלטים: \
+(1) החזר אך ורק את הטקסט הערוך עצמו — בלי הקדמות, בלי הסברים, בלי מירכאות, ובלי לפנות אל המשתמש. \
+(2) לעולם אל תכתוב דברים כמו 'שלח לי את הטקסט', 'אני ממתין' או 'אשמח לעזור' — הטקסט כבר נמצא בהודעת המשתמש, ערוך אותו ישירות. \
+(3) הסר מילות מילוי (אהה, אמ, יעני, כאילו), חזרות וגמגומים, ותקן פיסוק ורווחים. \
+(4) שמור בדיוק על המשמעות, הטון והשפה של הדובר. אל תוסיף מידע, אל תקצר משמעותית, אל תתרגם, ואל תענה לתוכן."
             }
+        }
+    }
+
+    /// Few-shot example input (messy transcript) — anchors the model to treat the
+    /// user message as text to edit, not as a conversational request.
+    fn example_raw(&self) -> &'static str {
+        match self {
+            EnhanceMode::HeGeneral => "אהה אז כאילו, רציתי, רציתי להגיד שאני אה בא מחר בערב, וגם שנתראה",
+        }
+    }
+
+    /// Few-shot example output (the cleaned version of `example_raw`).
+    fn example_clean(&self) -> &'static str {
+        match self {
+            EnhanceMode::HeGeneral => "אז רציתי להגיד שאני בא מחר בערב, וגם שנתראה.",
         }
     }
 }
@@ -47,17 +64,17 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Build the system+user chat messages for the given mode. Pure — unit-tested.
+/// Build the chat messages for the given mode: a system prompt, a one-shot example
+/// (messy→clean), then the actual transcript as the FINAL user message. The
+/// one-shot anchors the model to "edit the user message and output only the cleaned
+/// text", preventing the conversational failure where it replies "send me your text
+/// / I'm waiting" instead of editing. Pure — unit-tested.
 pub fn build_messages(mode: EnhanceMode, text: &str) -> Vec<ChatMessage> {
     vec![
-        ChatMessage {
-            role: "system".into(),
-            content: mode.system_prompt().into(),
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: text.to_string(),
-        },
+        ChatMessage { role: "system".into(), content: mode.system_prompt().into() },
+        ChatMessage { role: "user".into(), content: mode.example_raw().into() },
+        ChatMessage { role: "assistant".into(), content: mode.example_clean().into() },
+        ChatMessage { role: "user".into(), content: text.to_string() },
     ]
 }
 
@@ -166,14 +183,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn he_general_builds_system_and_user() {
+    fn he_general_builds_fewshot_then_user_text() {
         let msgs = build_messages(EnhanceMode::HeGeneral, "אהה כאילו שלום");
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "system");
-        assert!(msgs[0].content.contains("עורך"));
-        assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content, "אהה כאילו שלום");
+        assert!(msgs[0].content.contains("עריכה"));
+        assert_eq!(msgs[1].role, "user"); // example raw
+        assert_eq!(msgs[2].role, "assistant"); // example clean
+        assert_eq!(msgs[3].role, "user"); // the actual transcript is the LAST message
+        assert_eq!(msgs[3].content, "אהה כאילו שלום");
     }
+
 
     #[test]
     fn unknown_mode_falls_back_to_default() {
