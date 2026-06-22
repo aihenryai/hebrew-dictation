@@ -299,6 +299,11 @@ function App() {
   const [editableTranscript, setEditableTranscript] = useState("");
   const [history, setHistory] = useState<{ id: number; text: string; timestamp: string }[]>([]);
   const [whisperLoaded, setWhisperLoaded] = useState(false);
+  // Background (startup) model load — must NOT block the dictation flow. Using the
+  // global "loading-model" status froze Alt+D and the record button for the entire
+  // load of a large local model (e.g. the 1.6GB ivrit model), so the floating bar
+  // couldn't appear right after launch. This flag drives a non-blocking indicator.
+  const [modelLoading, setModelLoading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -768,7 +773,7 @@ function App() {
     const anyDownloaded = preferred || allModels.find((m) => m.downloaded);
     if (anyDownloaded) {
       setSelectedModel(anyDownloaded.name);
-      await loadWhisperModel(anyDownloaded.name);
+      await loadWhisperModel(anyDownloaded.name, true);
     }
   }
 
@@ -900,16 +905,24 @@ function App() {
     } catch (e) { setError(String(e)); }
   }
 
-  async function loadWhisperModel(modelName?: string) {
+  async function loadWhisperModel(modelName?: string, background = false) {
     const name = modelName || selectedModel;
-    setStatus("loading-model");
+    // Foreground (user-initiated model switch) blocks with a status; the background
+    // (startup) load stays OUT of the status machine so recording / Alt+D / the
+    // floating bar work immediately, even while a large model is still loading.
+    if (background) setModelLoading(true); else setStatus("loading-model");
     try {
       await invoke("load_whisper_model", { modelName: name });
       setWhisperLoaded(true);
       setActiveModel(name);
       setSelectedModel(name);
-      setStatus("idle");
-    } catch (e) { setError(String(e)); setStatus("idle"); }
+      if (!background) setStatus("idle");
+    } catch (e) {
+      setError(String(e));
+      if (!background) setStatus("idle");
+    } finally {
+      if (background) setModelLoading(false);
+    }
   }
 
   async function handleDownloadModel(modelName: string) {
@@ -2107,6 +2120,7 @@ function App() {
           {status === "enhancing" && "✨ משכתב..."}
           {status === "downloading" && "מוריד..."}
           {status === "loading-model" && "טוען מודל..."}
+          {status === "idle" && modelLoading && "טוען מודל ברקע…"}
         </div>
         {showTimeWarning && <p className="time-warning">נותרו {Math.ceil(timeRemaining)}s</p>}
       </div>
