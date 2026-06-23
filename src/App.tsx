@@ -1734,13 +1734,21 @@ function App() {
               onChange={() => {
                 const v = !streamingEnabled;
                 setStreamingEnabled(v);
-                persistSettings({ streaming_enabled: v });
+                // Streaming injects live; the batch cleanup can't run on it — the two
+                // are mutually exclusive, so enabling one turns the other off.
+                if (v && enhanceEnabled) {
+                  setEnhanceEnabled(false);
+                  persistSettings({ streaming_enabled: v, enhance_enabled: false });
+                } else {
+                  persistSettings({ streaming_enabled: v });
+                }
               }}
             />
             <span className="toggle-text">
               תמלול בזמן אמת תוך כדי דיבור (Deepgram בלבד, בלי המתנה לעיבוד בסוף)
             </span>
           </label>
+          <p className="settings-hint">לא תואם ל-✨ רישוף חכם (שפועל אחרי הדיבור) — הפעלת ההכתבה הסימולטנית תכבה את הרישוף.</p>
         </div>
 
         {/* Always on top */}
@@ -1849,11 +1857,20 @@ function App() {
               onChange={() => {
                 const v = !enhanceEnabled;
                 setEnhanceEnabled(v);
-                persistSettings({ enhance_enabled: v });
+                // Cleanup runs in batch (after Stop); it can't run during live
+                // streaming — the two are mutually exclusive, so enabling one turns
+                // the other off.
+                if (v && streamingEnabled) {
+                  setStreamingEnabled(false);
+                  persistSettings({ enhance_enabled: v, streaming_enabled: false });
+                } else {
+                  persistSettings({ enhance_enabled: v });
+                }
               }}
             />
             <span className="toggle-text">נקה מילות מילוי, חזרות ופיסוק מהתמלול לפני ההזרקה (דרך Groq Llama)</span>
           </label>
+          <p className="settings-hint">פועל אחרי שמסיימים לדבר (batch). אינו תואם להכתבה הסימולטנית — הפעלתו תכבה אותה.</p>
 
           {/* Dedicated Groq key for cleanup — works regardless of the transcription provider */}
           <p className="settings-hint">מפתח Groq לרישוף (עובד גם כשמתמללים ב-Deepgram או מקומי):</p>
