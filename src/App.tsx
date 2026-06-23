@@ -1730,25 +1730,22 @@ function App() {
             <input
               type="checkbox"
               checked={streamingEnabled}
-              disabled={apiProvider !== "deepgram"}
+              // Hard mutual-exclusion with Smart Cleanup: when cleanup is on (and this
+              // is off) the streaming toggle is LOCKED. Also Deepgram-only. The
+              // `&& !streamingEnabled` guard means an already-on toggle stays clickable
+              // so a legacy both-on state can self-heal.
+              disabled={apiProvider !== "deepgram" || (enhanceEnabled && !streamingEnabled)}
               onChange={() => {
                 const v = !streamingEnabled;
                 setStreamingEnabled(v);
-                // Streaming injects live; the batch cleanup can't run on it — the two
-                // are mutually exclusive, so enabling one turns the other off.
-                if (v && enhanceEnabled) {
-                  setEnhanceEnabled(false);
-                  persistSettings({ streaming_enabled: v, enhance_enabled: false });
-                } else {
-                  persistSettings({ streaming_enabled: v });
-                }
+                persistSettings({ streaming_enabled: v });
               }}
             />
             <span className="toggle-text">
               תמלול בזמן אמת תוך כדי דיבור (Deepgram בלבד, בלי המתנה לעיבוד בסוף)
             </span>
           </label>
-          <p className="settings-hint">לא תואם ל-✨ רישוף חכם (שפועל אחרי הדיבור) — הפעלת ההכתבה הסימולטנית תכבה את הרישוף.</p>
+          <p className="settings-hint">לא תואם ל-✨ רישוף חכם — כשהרישוף דלוק, ההכתבה הסימולטנית נעולה, וההיפך.</p>
         </div>
 
         {/* Always on top */}
@@ -1853,24 +1850,20 @@ function App() {
             <input
               type="checkbox"
               checked={enhanceEnabled}
-              disabled={!hasGroqKey}
+              // Hard mutual-exclusion with streaming: when streaming is on (and this is
+              // off) the cleanup toggle is LOCKED. Also needs a Groq key. The
+              // `&& !enhanceEnabled` guard keeps an already-on toggle clickable so a
+              // legacy both-on state can self-heal.
+              disabled={!hasGroqKey || (streamingEnabled && !enhanceEnabled)}
               onChange={() => {
                 const v = !enhanceEnabled;
                 setEnhanceEnabled(v);
-                // Cleanup runs in batch (after Stop); it can't run during live
-                // streaming — the two are mutually exclusive, so enabling one turns
-                // the other off.
-                if (v && streamingEnabled) {
-                  setStreamingEnabled(false);
-                  persistSettings({ enhance_enabled: v, streaming_enabled: false });
-                } else {
-                  persistSettings({ enhance_enabled: v });
-                }
+                persistSettings({ enhance_enabled: v });
               }}
             />
             <span className="toggle-text">נקה מילות מילוי, חזרות ופיסוק מהתמלול לפני ההזרקה (דרך Groq Llama)</span>
           </label>
-          <p className="settings-hint">פועל אחרי שמסיימים לדבר (batch). אינו תואם להכתבה הסימולטנית — הפעלתו תכבה אותה.</p>
+          <p className="settings-hint">פועל אחרי שמסיימים לדבר (batch). כשההכתבה הסימולטנית דלוקה — הרישוף נעול, וההיפך.</p>
 
           {/* Dedicated Groq key for cleanup — works regardless of the transcription provider */}
           <p className="settings-hint">מפתח Groq לרישוף (עובד גם כשמתמללים ב-Deepgram או מקומי):</p>
