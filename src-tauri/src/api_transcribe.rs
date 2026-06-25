@@ -244,6 +244,57 @@ async fn transcribe_deepgram_inner(
     Ok(transcript)
 }
 
+/// Long-file Deepgram request for batch transcription. The caller supplies a
+/// client with a long (e.g. 900s) timeout; this fn does NOT set its own timeout.
+/// Uses paragraph formatting for readable long-meeting output, falling back to the
+/// flat transcript. `language` should be "he" — Deepgram nova-3 multilingual does
+/// NOT include Hebrew (spec §14.1-A), so never pass "multi" for Hebrew.
+pub(crate) async fn transcribe_deepgram_batch(
+    client: &reqwest::Client,
+    samples: &[f32],
+    api_key: &str,
+    language: &str,
+) -> Result<String, ApiError> {
+    let wav_data = samples_to_wav(samples, 16000);
+    let lang = if language == "auto" { "he" } else { language };
+    let url = format!(
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true",
+        lang
+    );
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Token {}", api_key))
+        .header("Content-Type", "audio/wav")
+        .body(wav_data)
+        .send()
+        .await
+        .map_err(|e| classify_request_error(&e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_status(status, &body));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Other(format!("Failed to parse Deepgram response: {}", e)))?;
+
+    let alt = &body["results"]["channels"][0]["alternatives"][0];
+    // paragraphs=true gives a newline-formatted transcript; fall back to the flat one.
+    let transcript = alt["paragraphs"]["transcript"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| alt["transcript"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(transcript)
+}
+
 // ── Unified entry point ──
 
 /// Languages accepted by the transcription APIs.

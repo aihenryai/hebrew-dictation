@@ -1,5 +1,6 @@
 mod api_transcribe;
 mod audio;
+mod batch;
 mod decode;
 mod enhance;
 mod export;
@@ -34,6 +35,13 @@ struct AppState {
     main_was_visible_before_toolbar: AtomicBool,
     /// One-shot migration outcome (set at load time, taken at setup time, then None).
     migration_outcome: Mutex<Option<settings::MigrationOutcome>>,
+    /// Set true to abort the in-flight batch (decode + local whisper read it; the
+    /// cloud path races against `batch_cancel_notify`).
+    batch_cancel: Arc<AtomicBool>,
+    /// Wakes the cloud request's `select!` so cancel drops the in-flight HTTP future.
+    batch_cancel_notify: Arc<tokio::sync::Notify>,
+    /// Guards against two concurrent batch jobs.
+    batch_in_progress: Arc<AtomicBool>,
 }
 
 #[tauri::command]
@@ -308,6 +316,179 @@ async fn enhance_text(
     enhance::enhance_inner(&text, m, &key)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ── Batch transcription (file upload → cloud Deepgram / local whisper) ──
+
+#[tauri::command]
+async fn transcribe_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    file_path: String,
+    opts: batch::BatchOpts,
+) -> Result<String, String> {
+    // One batch at a time.
+    if state.batch_in_progress.swap(true, Ordering::SeqCst) {
+        return Err("תמלול ארוך כבר רץ — המתן לסיומו או בטל אותו".to_string());
+    }
+    state.batch_cancel.store(false, Ordering::SeqCst);
+    let result = run_transcribe_file(&app, &state, file_path, opts).await;
+    state.batch_in_progress.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn run_transcribe_file(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    file_path: String,
+    opts: batch::BatchOpts,
+) -> Result<String, String> {
+    // 0) Fail fast: cloud mode needs a Deepgram key — check BEFORE the (possibly long)
+    //    decode so the user isn't made to wait only to learn a key is missing.
+    if matches!(batch::pick_batch_route(&opts.mode), batch::BatchRoute::CloudDeepgram) {
+        let has_key = {
+            let s = state.settings.lock().map_err(|e| e.to_string())?;
+            s.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty())
+        };
+        if !has_key {
+            return Err("תמלול ענן ארוך דורש מפתח Deepgram. הוסף אותו בהגדרות, או עבור למצב \"פרטי (במכשיר)\".".to_string());
+        }
+    }
+
+    // 1) Decode → 16kHz mono f32, off the UI thread, with progress + cancel.
+    let cancel = state.batch_cancel.clone();
+    let app_dec = app.clone();
+    let path = std::path::PathBuf::from(&file_path);
+    let samples = tokio::task::spawn_blocking(move || {
+        decode::decode_file_to_16k_mono(&path, &cancel, |pct| {
+            let _ = app_dec.emit(
+                "batch-progress",
+                serde_json::json!({ "stage": "decoding", "pct": pct }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("שגיאת משימת פענוח: {}", e))??;
+
+    if state.batch_cancel.load(Ordering::SeqCst) {
+        return Err(batch::CANCELLED.to_string());
+    }
+    if samples.is_empty() {
+        return Err("הקובץ ריק או פגום — לא נמצא אודיו לתמלול".to_string());
+    }
+    // Batch-specific guard (spec §14.2-N): a valid-format but near-silent file would
+    // otherwise hit a generic API 400. Reuse the existing detector but with a batch
+    // message — NOT the mic-permission message (this is a file, not the live mic).
+    if audio::is_effectively_silent(&samples, 0.01) {
+        return Err("לא נמצא דיבור בקובץ (שקט) — ודא שהקובץ מכיל אודיו מדובר.".to_string());
+    }
+
+    // 2) Route.
+    match batch::pick_batch_route(&opts.mode) {
+        batch::BatchRoute::CloudDeepgram => {
+            let key = {
+                let s = state.settings.lock().map_err(|e| e.to_string())?;
+                s.deepgram_api_key.clone()
+            };
+            let key = key.filter(|k| !k.is_empty()).ok_or_else(|| {
+                "תמלול ענן ארוך דורש מפתח Deepgram. הוסף אותו בהגדרות, או עבור למצב \"פרטי (במכשיר)\".".to_string()
+            })?;
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(900))
+                .build()
+                .map_err(|e| format!("שגיאת לקוח רשת: {}", e))?;
+
+            let _ = app.emit(
+                "batch-progress",
+                serde_json::json!({ "stage": "transcribing", "pct": 0 }),
+            );
+
+            let notify = state.batch_cancel_notify.clone();
+            let fut = api_transcribe::transcribe_deepgram_batch(&client, &samples, &key, &opts.language);
+            let text = tokio::select! {
+                r = fut => r.map_err(|e| e.to_string())?,
+                _ = notify.notified() => return Err(batch::CANCELLED.to_string()),
+            };
+            let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
+            Ok(text)
+        }
+        batch::BatchRoute::Local => {
+            // Lock the engine ONLY to create a fresh state, then drop it so the
+            // multi-hour run never blocks short dictation / model management.
+            let (wstate, model_name) = {
+                let guard = state.whisper_engine.lock().map_err(|e| e.to_string())?;
+                match guard.as_ref() {
+                    Some(e) => e.create_long_state()?,
+                    None => {
+                        return Err("המודל המקומי לא טעון — הורד מודל Whisper בהגדרות לפני תמלול מקומי".to_string())
+                    }
+                }
+            };
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<i32>();
+            let app_prog = app.clone();
+            let progress_task = tokio::spawn(async move {
+                while let Some(p) = rx.recv().await {
+                    let _ = app_prog.emit(
+                        "batch-progress",
+                        serde_json::json!({ "stage": "transcribing", "pct": p }),
+                    );
+                }
+            });
+
+            let cancel = state.batch_cancel.clone();
+            let lang = opts.language.clone();
+            let samples_owned = samples;
+            let text = tokio::task::spawn_blocking(move || {
+                whisper::run_long_transcription(
+                    wstate,
+                    &model_name,
+                    &samples_owned,
+                    &lang,
+                    cancel,
+                    move |p| {
+                        let _ = tx.send(p);
+                    },
+                )
+            })
+            .await
+            .map_err(|e| format!("שגיאת משימת תמלול: {}", e))??;
+
+            progress_task.abort();
+            let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
+            Ok(text)
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_batch(state: State<AppState>) -> Result<(), String> {
+    state.batch_cancel.store(true, Ordering::SeqCst);
+    state.batch_cancel_notify.notify_waiters();
+    Ok(())
+}
+
+/// Open a native file picker for an audio file. Returns the chosen path, or None
+/// if the user cancelled. The path is opened Rust-side by symphonia in transcribe_file
+/// (no fs-read capability needed — only dialog:allow-open).
+#[tauri::command]
+async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+    app.dialog()
+        .file()
+        .set_title("בחר קובץ אודיו לתמלול")
+        .add_filter("אודיו", &["mp3", "m4a", "wav", "ogg", "flac", "aac", "mp4"])
+        .pick_file(move |result| {
+            let _ = tx.send(result.and_then(|fp| fp.into_path().ok()));
+        });
+
+    let path = rx
+        .await
+        .map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string())?;
+    Ok(path.map(|p| p.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -1097,6 +1278,9 @@ pub fn run() {
                 streaming: tokio::sync::Mutex::new(None),
                 main_was_visible_before_toolbar: AtomicBool::new(false),
                 migration_outcome: Mutex::new(Some(load_result.migration)),
+                batch_cancel: Arc::new(AtomicBool::new(false)),
+                batch_cancel_notify: Arc::new(tokio::sync::Notify::new()),
+                batch_in_progress: Arc::new(AtomicBool::new(false)),
             }
         })
         .setup(|app| {
@@ -1266,6 +1450,9 @@ pub fn run() {
             test_api_key,
             inject_text,
             enhance_text,
+            transcribe_file,
+            cancel_batch,
+            pick_audio_file,
             export_history,
             get_audio_devices,
             set_window_always_on_top,
