@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 /// Convert f32 samples (16kHz mono) to a WAV byte buffer (PCM16).
-fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+pub(crate) fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     let num_samples = samples.len();
     let bytes_per_sample: u16 = 2;
     let num_channels: u16 = 1;
