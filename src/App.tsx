@@ -10,6 +10,17 @@ import "./App.css";
 const APP_VERSION = "v2.9.3";
 const APP_LICENSE = "MIT";
 
+/** Hebrew label for a batch-transcription progress stage. */
+function stageLabel(stage: string): string {
+  switch (stage) {
+    case "decoding": return "מפענח אודיו…";
+    case "uploading": return "מעלה…";
+    case "transcribing": return "מתמלל…";
+    case "done": return "הושלם";
+    default: return "מעבד…";
+  }
+}
+
 const TERMS_FULL_URL = "https://henry-ai-website.pages.dev/hebrew-dictation#terms";
 
 const LINKS = {
@@ -364,6 +375,13 @@ function App() {
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string } | null>(null);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
+  // Batch file transcription (file upload → cloud Deepgram / local whisper).
+  const [batchTranscript, setBatchTranscript] = useState("");
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchStage, setBatchStage] = useState("");
+  const [batchPct, setBatchPct] = useState(0);
+  const [batchMode, setBatchMode] = useState<"cloud" | "local">("cloud");
+  const [batchError, setBatchError] = useState("");
   const updateRef = useRef<Update | null>(null);
   const pendingCloseTipRef = useRef(false);
   const statusRef = useRef(status);
@@ -594,6 +612,15 @@ function App() {
     return () => { unlistenInterim.then((fn) => fn()); };
   }, []);
 
+  // Batch transcription progress (decoding / uploading / transcribing / done).
+  useEffect(() => {
+    const unlisten = listen<{ stage: string; pct: number }>("batch-progress", (event) => {
+      setBatchStage(event.payload.stage);
+      setBatchPct(event.payload.pct ?? 0);
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
   const handleToggleRecording = useCallback(async () => {
     const currentStatus = statusRef.current;
     if (currentStatus === "recording") {
@@ -698,6 +725,8 @@ function App() {
     try {
       const settings = await invoke("get_settings") as RedactedSettings;
       setTranscriptionMode(settings.transcription_mode);
+      // Default the batch panel toggle from the user's transcription mode.
+      setBatchMode(settings.transcription_mode === "local" ? "local" : "cloud");
       setApiProvider(settings.api_provider);
       // Defensive: legacy "auto" language is migrated to "he" by the backend,
       // but if any code path slips through, normalize here too.
@@ -853,6 +882,57 @@ function App() {
       setExporting(null);
     }
   }, [history]);
+
+  // ── Batch file transcription handlers ──
+  const handlePickAndTranscribe = useCallback(async () => {
+    setBatchError("");
+    let filePath: string | null = null;
+    try {
+      filePath = await invoke<string | null>("pick_audio_file");
+    } catch (e) {
+      setBatchError(`בחירת הקובץ נכשלה: ${e}`);
+      return;
+    }
+    if (!filePath) return; // user cancelled the picker
+    setBatchRunning(true);
+    setBatchPct(0);
+    setBatchStage("decoding");
+    setBatchTranscript("");
+    try {
+      const text = await invoke<string>("transcribe_file", {
+        filePath,
+        opts: { mode: batchMode, language: "he", inject: false },
+      });
+      setBatchTranscript(text);
+      setBatchStage("done");
+    } catch (e) {
+      const msg = String(e);
+      if (msg !== "בוטל") setBatchError(`התמלול נכשל: ${msg}`);
+    } finally {
+      setBatchRunning(false);
+    }
+  }, [batchMode]);
+
+  const handleCancelBatch = useCallback(async () => {
+    try {
+      await invoke("cancel_batch");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const exportBatch = useCallback(async (format: "txt" | "docx") => {
+    if (!batchTranscript.trim()) return;
+    try {
+      const items = [{ text: batchTranscript, timestamp: new Date().toISOString() }];
+      const path = await invoke<string>("export_history", { items, format });
+      setExportNotice(`✅ נשמר: ${path}`);
+      window.setTimeout(() => setExportNotice(null), 6000);
+    } catch (e) {
+      const msg = String(e);
+      if (msg !== "הייצוא בוטל") setBatchError(`ייצוא נכשל: ${msg}`);
+    }
+  }, [batchTranscript]);
 
   /** Push the silence-to-stop duration to the running recorder. */
   const applySilenceDuration = useCallback(async (secs: number) => {
@@ -2237,6 +2317,64 @@ function App() {
           ))}
         </div>
       )}
+
+      {/* ── Batch: file transcription ── */}
+      <div className="settings-section batch-panel" dir="rtl">
+        <h3>📁 תמלול קובץ</h3>
+        <p className="settings-hint">
+          העלה קובץ אודיו (mp3, m4a, wav, ogg, flac) ← תמלול ← עריכה / ייצוא / הזרקה.
+          עובד בענן (מהיר, Deepgram) וגם במכשיר (פרטי, ללא אינטרנט).
+        </p>
+
+        <div className="batch-mode-toggle">
+          <label className="toggle-label">
+            <input type="radio" name="batchMode" checked={batchMode === "cloud"} disabled={batchRunning}
+              onChange={() => setBatchMode("cloud")} />
+            <span className="toggle-text">מהיר (ענן — Deepgram, המפתח שלך)</span>
+          </label>
+          <label className="toggle-label">
+            <input type="radio" name="batchMode" checked={batchMode === "local"} disabled={batchRunning}
+              onChange={() => setBatchMode("local")} />
+            <span className="toggle-text">פרטי (במכשיר — איטי, ללא אינטרנט)</span>
+          </label>
+        </div>
+
+        {!batchRunning && (
+          <button className="btn-primary" onClick={handlePickAndTranscribe}>בחר קובץ ותמלל</button>
+        )}
+
+        {batchRunning && (
+          <div className="batch-progress">
+            <div className="batch-progress-bar">
+              <div className="batch-progress-fill" style={{ width: `${batchPct}%` }} />
+            </div>
+            <span className="batch-progress-label">
+              {stageLabel(batchStage)} {batchPct > 0 ? `${batchPct}%` : ""}
+            </span>
+            <button className="btn-secondary btn-sm" onClick={handleCancelBatch}>בטל</button>
+          </div>
+        )}
+
+        {batchError && <p className="error" onClick={() => setBatchError("")}>❌ {batchError}</p>}
+
+        {batchTranscript && (
+          <div className="batch-result">
+            <textarea
+              dir="rtl"
+              className="batch-textarea"
+              value={batchTranscript}
+              onChange={(e) => setBatchTranscript(e.target.value)}
+              rows={10}
+            />
+            <div className="batch-actions">
+              <button className="btn-secondary btn-sm" onClick={() => injectText(batchTranscript)} title="הדבק בשדה הפעיל">⌨️ הדבק</button>
+              <button className="btn-secondary btn-sm" onClick={() => navigator.clipboard.writeText(batchTranscript)} title="העתק">📋 העתק</button>
+              <button className="btn-secondary btn-sm" onClick={() => exportBatch("txt")}>📄 TXT</button>
+              <button className="btn-secondary btn-sm" onClick={() => exportBatch("docx")}>📝 Word</button>
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="footer">
         <span>{formatHotkey(hotkey)} · {langLabels[language]} · {vadEnabled ? "עצירה אוטומטית" : "עצירה ידנית"}</span>
