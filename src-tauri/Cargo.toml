@@ -43,3 +43,8 @@ tauri-plugin-dialog = "2"
 keyring = { version = "3", features = ["windows-native", "apple-native"] }
 docx-rs = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Pure-Rust audio decode (file upload → 16kHz mono f32). No ffmpeg.
+# aac + isomp4 are OFF by default and are REQUIRED for iPhone .m4a (AAC-LC in MP4).
+symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4", "alac", "vorbis", "ogg", "wav", "flac"] }
+# Resample native rate → 16000 Hz. v3 = full rewrite (Fft, audioadapter, Indexing flush).
+rubato = "3"
