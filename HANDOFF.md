@@ -1,33 +1,43 @@
-# Hebrew Dictation — Session Handoff (2026-06-25)
+# Hebrew Dictation — Session Handoff (2026-06-26)
 
 > **Next session: read this + `memory/hebrew-dictation.md` to continue.**
 
 ## Where we are
 
-### Batch Transcription Phase 1 — CODE-COMPLETE, compiles, NOT yet runtime-verified
+### Batch Transcription Phase 1 — BUILT + RUNTIME-VERIFIED (by Henry, in `tauri dev`)
 File upload → transcribe (cloud Deepgram **or** local whisper, offline) → editable RTL textarea → export TXT/DOCX / inject / copy, with cancel. Additive — short dictation untouched.
 
-- **All code written + committed locally** (8 commits, `174ae59`…`d417912`). `cargo test` = **14 tests green**; frontend `npm run build` (tsc + vite) = clean.
-- **Spec rev2** (`docs/superpowers/specs/2026-06-22-batch-transcription-design.md`, §14 authoritative) + **plan** (`docs/superpowers/plans/2026-06-25-batch-transcription-phase1.md`). Both reviewed by multi-agent passes.
-- **Key build facts discovered:** symphonia **0.6** + rubato **3** are *post-rewrite* APIs (totally different from 0.5). decode.rs uses `GenericAudioBufferRef::copy_to_vec_interleaved::<f32>` + rubato `process_all_into_buffer` (handles chunk/partial/delay-trim/flush internally — a hand-rolled flush loop mismanaged offsets and was replaced).
-- **What's left in Phase 1 = manual smoke only (Task 3.5, needs Henry):** run `npm run tauri dev`, test (1) cloud mp3 w/ Deepgram key, (2) local mp3 w/ downloaded model, (3) cancel mid-run, (4) real iPhone .m4a, (5) regression: short dictation responsive during a local batch, (6) empty/garbage file → clear Hebrew error.
+**Henry's smoke results:**
+- ✅ Cloud (Deepgram) — works.
+- ✅ Local (whisper, offline) — works **after the -6 fix** (see below).
+- ✅ iPhone **.m4a** — works.
+- ✅ Cancel — works.
+- ✅ Regression: short dictation responsive during a local batch.
+- ⏳ Corrupt/empty file — Henry still to test; error is already Hebrew (`"פורמט אודיו לא נתמך או קובץ פגום"`).
 
-### Concurrency invariant (the critical correctness point)
-Local batch locks `whisper_engine` ONLY for `create_long_state()`, then runs `state.full()` off-lock in `spawn_blocking` → short dictation stays responsive during a multi-hour run. Cloud cancel drops the in-flight reqwest future via `tokio::select!` on a `Notify`; local cancel via `set_abort_callback_safe`.
+**All committed locally** (`174ae59`…`7dafc37`, ~11 commits). `cargo build` clean (0 warnings); `cargo test` 14 green; frontend `npm run build` clean. NOT pushed.
 
-## Still pending from the PREVIOUS session (unchanged)
-- **v2.9.1→2.9.3 bug fixes still LOCAL-ONLY, NOT published.** `origin/main` = v2.9.0. Critical **keyring** fix (all users lose API keys on restart) is in these unpushed commits. Henry's decision (2026-06-25): **bundle bug fixes + batch feature → release together as v2.10.0** (do NOT publish 2.9.3 separately). If he changes his mind, the 2.9.1-2.9.3 patch is a quick publish.
-- 2.9.3 installer built: `src-tauri/target/release/bundle/nsis/הכתבה בעברית_2.9.3_x64-setup.exe`. Pending Henry verify: hard-lock toggles + installer text.
+### Two bugs/asks fixed this session
+1. **Local -6 ("failed to encode")** — root cause: **whisper-rs 0.16.0 `set_abort_callback_safe` is BUGGY** (its trampoline is parameterized by the closure type `F` while `user_data` points to a `Box<dyn FnMut()->bool>` — the progress wrapper gets this right, abort doesn't → reads garbage → returns spurious `true` → whisper aborts encode → -6). **Fix:** bypass the safe wrapper; use raw `set_abort_callback` + a module-static `LOCAL_ABORT: AtomicBool` (single in-flight batch, so no user_data box needed). `cancel_batch` calls `whisper::request_local_abort()`. (whisper.rs)
+2. **Hebrew error messages** (Henry: users must understand + know what to do) — added `whisper::whisper_error_to_he()` (GenericError/-6 → "(1) סגור תוכנות לפנות זיכרון, (2) מודל קטן יותר, (3) מחק+הורד מחדש"); translated model download/save/hash + `load_whisper_model` "model not found". **All user-facing local/download/decode errors are now actionable Hebrew.**
 
 ## Next steps (in order)
-1. **Henry runs the Phase 1 manual smoke** (above). Fix anything it surfaces.
-2. **Phase 2:** Groq cloud + chunking (`chunk.rs`, 5-10min windows + de-dupe), `save_transcript_next_to` (header-less export + overwrite policy), accuracy toggle. Plan: write `docs/superpowers/plans/2026-06-2x-batch-transcription-phase2.md`.
-3. **Phase 3:** long in-app meeting recording (RAM MVP, raised ceiling, VAD-off) → same orchestrator (cloud/local).
-4. **Phase 4:** disk-streaming sink (ringbuf + hound writer thread), Opus encode, ffmpeg HE-AAC fallback.
-5. **Release:** bundle everything → **v2.10.0** (minor). Bump version in 4 places (package.json, Cargo.toml, tauri.conf.json, **APP_VERSION in src/App.tsx:10**). Build signed installer, GitHub release, website update.
+1. **DEDICATED UX/UI session (Henry CONFIRMED — "פצצה ברמת על חלל").** The current batch panel is functional but rough: short/technical labels ("📄 TXT"/"⌨️ הדבק"), no empty-state, no cloud-vs-local guidance, crowds the main view. This session = full redesign (likely move batch to its own tab/view, list-style results, premium accessible UX). **FOLD MULTI-FILE INTO THIS SESSION** — Henry wants multi-file upload; it requires a list-view state refactor (`batchTranscript: string` → `results: BatchResult[]`) that the redesign does anyway. Backend for multi-file is ~100 lines (`pick_files` multi-select + serial loop + per-file progress `{stage,pct,fileIndex,fileTotal,fileName}` + per-file Result + cancel-skips-rest). Don't build multi-file on the current panel — it'd be thrown away.
+2. **Phase 2 (batch):** Groq cloud + chunking (`chunk.rs`, 5-10min windows + de-dupe), `save_transcript_next_to` (header-less export + overwrite policy), accuracy toggle.
+3. **Phase 3:** long in-app meeting recording (RAM MVP) → same orchestrator.
+4. **Phase 4:** disk-streaming sink, Opus, ffmpeg HE-AAC fallback.
+5. **Release v2.10.0** — bundle bug fixes (incl. critical keyring) + batch. Bump version in 4 places (package.json, Cargo.toml, tauri.conf.json, **APP_VERSION src/App.tsx:10**). Signed installer, GitHub release, website.
+
+## Deferred / low-priority
+- Remaining **English** error strings in deep-internal paths users rarely hit (audio.rs stream init L145-285, settings.rs serialize L427-432, streaming.rs WS L46-96, injector.rs). Translate opportunistically; not urgent.
+- `BatchError` enum still deliberately deferred (Hebrew String errors + `"בוטל"` sentinel work fine).
+
+## Still pending from earlier sessions (unchanged)
+- **v2.9.1→2.9.3 fixes LOCAL-ONLY, NOT pushed.** `origin/main` = v2.9.0. Critical **keyring** fix (all users lose API keys on restart) sits in these unpushed commits. Decision: bundle → release as **v2.10.0**.
 
 ## Key facts
 - Signing: `~/.tauri/hebrew-dictation.key` (no password); `export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/hebrew-dictation.key)"` before `npm run tauri build`.
-- Repo: `aihenryai/hebrew-dictation`. Website repo: `aihenryai/Henry-AI-website` (Cloudflare auto-deploy on push to main).
-- Release process: `gh release create` with 2 small assets first, then `gh release upload <exe> --clobber` (resilient to DNS blips). Git Bash: `gh api -X DELETE` needs `MSYS_NO_PATHCONV=1` + no leading slash.
-- Phase 1 = Deepgram cloud only (no Groq batch yet); near-silence + empty-file guards in place; BatchError enum deliberately deferred (Hebrew String errors + `"בוטל"` sentinel).
+- Repo: `aihenryai/hebrew-dictation`. Website: `aihenryai/Henry-AI-website` (Cloudflare auto-deploy on push to main).
+- whisper-rs 0.16 abort-callback bug is real — if upgrading whisper-rs later, re-check the LOCAL_ABORT workaround.
+- Decode = symphonia 0.6 + rubato 3 (post-rewrite APIs): `GenericAudioBufferRef::copy_to_vec_interleaved` + rubato `process_all_into_buffer`.
+- Dev run for testing: `npm run tauri dev` (repo root). Kill orphans: PowerShell `Get-CimInstance Win32_Process | ? CommandLine -match 'hebrew-dictation' | % { Stop-Process -Id $_.ProcessId -Force }`.
