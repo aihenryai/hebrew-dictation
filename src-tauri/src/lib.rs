@@ -466,6 +466,8 @@ async fn run_transcribe_file(
 fn cancel_batch(state: State<AppState>) -> Result<(), String> {
     state.batch_cancel.store(true, Ordering::SeqCst);
     state.batch_cancel_notify.notify_waiters();
+    // Local whisper compute can only be interrupted via whisper.cpp's abort hook.
+    whisper::request_local_abort();
     Ok(())
 }
 
@@ -639,7 +641,10 @@ fn load_whisper_model(state: State<AppState>, model_name: String) -> Result<(), 
 
     let model_path = model::get_model_path(&model_name);
     if !model_path.exists() {
-        return Err(format!("Model not found: {}", model_path.display()));
+        return Err(format!(
+            "המודל \"{}\" לא נמצא במחשב. הורד אותו בהגדרות לפני השימוש.",
+            model_name
+        ));
     }
 
     let engine = whisper::WhisperEngine::new(&model_path, model_name.clone())?;

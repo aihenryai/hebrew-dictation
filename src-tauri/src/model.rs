@@ -156,7 +156,7 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
     // Create directory
     let models_dir = get_models_dir();
     std::fs::create_dir_all(&models_dir)
-        .map_err(|e| format!("Failed to create models dir: {}", e))?;
+        .map_err(|e| format!("יצירת תיקיית המודלים נכשלה. בדוק שיש מקום פנוי בדיסק והרשאות כתיבה. (פרטים טכניים: {e})"))?;
 
     // Download with progress
     let client = reqwest::Client::new();
@@ -164,14 +164,14 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
         .get(*url)
         .send()
         .await
-        .map_err(|e| format!("Download request failed: {}", e))?;
+        .map_err(|e| format!("הורדת המודל נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})"))?;
 
     let total_size = response.content_length().unwrap_or(*expected_size);
 
     let tmp_path = model_path.with_extension("bin.tmp");
     let mut file = tokio::fs::File::create(&tmp_path)
         .await
-        .map_err(|e| format!("Failed to create file: {}", e))?;
+        .map_err(|e| format!("יצירת קובץ המודל בדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
 
     let mut downloaded: u64 = 0;
     let mut hasher = Sha256::new();
@@ -179,21 +179,21 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
     let max_size = expected_size + (expected_size / 10); // 10% tolerance
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+        let chunk = chunk.map_err(|e| format!("ההורדה נקטעה — בדוק את החיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})"))?;
 
         downloaded += chunk.len() as u64;
 
         // Abort if download exceeds expected size
         if downloaded > max_size {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err("Download exceeded expected size — aborting".to_string());
+            return Err("ההורדה חרגה מהגודל הצפוי — בוטלה לצורך אבטחה. נסה שוב.".to_string());
         }
 
         hasher.update(&chunk);
 
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
             .await
-            .map_err(|e| format!("Write error: {}", e))?;
+            .map_err(|e| format!("כתיבה לדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
 
         let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
         let _ = app.emit(
@@ -211,7 +211,7 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
     if hash_result != *expected_hash {
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(format!(
-            "Hash mismatch! Expected: {}..., Got: {}... — file deleted",
+            "המודל שהורד לא תואם לחתימה הצפויה (ייתכן שההורדה נפגמה). הקובץ נמחק. נסה להוריד שוב. (צפוי: {}…, התקבל: {}…)",
             &expected_hash[..16],
             &hash_result[..16]
         ));
@@ -219,7 +219,7 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
 
     // Rename tmp to final
     std::fs::rename(&tmp_path, &model_path)
-        .map_err(|e| format!("Failed to finalize download: {}", e))?;
+        .map_err(|e| format!("שמירת המודל הסופית נכשלה. נסה למחוק את המודל בהגדרות ולהוריד מחדש. (פרטים טכניים: {e})"))?;
 
     // OS-level notification — most users start a download and switch to other work
     // while it runs in the background. Surfacing completion via the system tray

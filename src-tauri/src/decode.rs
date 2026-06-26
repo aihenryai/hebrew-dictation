@@ -6,7 +6,8 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use symphonia::core::audio::GenericAudioBufferRef; // .spec()/.frames()/.copy_to_vec_interleaved are inherent — do NOT import the `Audio` trait (unused → warning → fails under -D warnings)
+// NOTE: GenericAudioBufferRef's .spec()/.frames()/.copy_to_vec_interleaved are inherent
+// methods, so no `use` for the type is needed (importing it = unused_imports warning).
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error;

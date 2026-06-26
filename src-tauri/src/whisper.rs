@@ -1,9 +1,47 @@
+use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
+    WhisperState,
+};
+
+/// Translate a `WhisperError` to a Hebrew message with an actionable next step.
+/// The raw `WhisperError` Display is English ("Generic whisper error. Error code: -6")
+/// which leaves users with nothing to act on. Keep messages concrete: WHAT went wrong
+/// + WHAT to do next, in Henry's tone (direct, practical).
+fn whisper_error_to_he(e: &WhisperError) -> String {
+    match e {
+        // The whisper.cpp encode step failed (out of memory / GPU/CPU backend issue / corrupt model file).
+        // Common causes on Henry's audience: not enough free RAM, or a partly-downloaded model file.
+        WhisperError::GenericError(code) => format!(
+            "התמלול המקומי נכשל (קוד שגיאה {code}). נסה: (1) לסגור תוכנות פתוחות לפנות זיכרון, (2) לבחור מודל קטן יותר בהגדרות, או (3) למחוק את המודל בהגדרות ולהוריד אותו מחדש (ייתכן שההורדה הקודמת נקטעה)."
+        ),
+        WhisperError::NoSamples => {
+            "הקובץ ריק או קצר מדי לתמלול.".to_string()
+        }
+        WhisperError::FailedToCreateState => {
+            "טעינת המודל המקומי נכשלה. נסה לסגור תוכנות פתוחות (לפנות זיכרון) או לבחור מודל קטן יותר בהגדרות.".to_string()
+        }
+        WhisperError::InvalidText => {
+            "המרת טקסט לטוקנים נכשלה במודל המקומי. בחר מודל אחר בהגדרות.".to_string()
+        }
+        WhisperError::InvalidThreadCount => {
+            "תצורת מספר ה-threads לא תקינה. דווח על כך בכתובת henrystauber22@gmail.com.".to_string()
+        }
+        WhisperError::InvalidUtf8 { .. } => {
+            "התמלול הופק טקסט לא תקין (UTF-8). נסה שוב, ואם זה חוזר — נסה מודל אחר.".to_string()
+        }
+        // Anything else from the underlying library — surface a clear Hebrew umbrella
+        // and include the technical detail in parens for Henry to triage if needed.
+        other => format!(
+            "התמלול המקומי נכשל. נסה לבחור מודל אחר בהגדרות. (פרטים טכניים: {other})"
+        ),
+    }
+}
 
 /// Maximum time allowed for a single transcription before timeout
 const TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
@@ -18,10 +56,16 @@ pub struct WhisperEngine {
 impl WhisperEngine {
     pub fn new(model_path: &Path, model_name: String) -> Result<Self, String> {
         let ctx = WhisperContext::new_with_params(
-            model_path.to_str().ok_or("Invalid model path")?,
+            model_path
+                .to_str()
+                .ok_or_else(|| "נתיב המודל אינו תקין (תווים לא נתמכים).".to_string())?,
             WhisperContextParameters::default(),
         )
-        .map_err(|e| format!("Failed to load Whisper model: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "טעינת המודל המקומי נכשלה. ייתכן שקובץ המודל פגום או לא הורד עד הסוף — נסה למחוק אותו בהגדרות ולהוריד מחדש. (פרטים טכניים: {e})"
+            )
+        })?;
 
         Ok(Self { ctx, model_name })
     }
@@ -30,7 +74,7 @@ impl WhisperEngine {
         let mut state = self
             .ctx
             .create_state()
-            .map_err(|e| format!("Failed to create whisper state: {}", e))?;
+            .map_err(|e| format!("יצירת מצב התמלול המקומי נכשלה. נסה לטעון מחדש את המודל בהגדרות. (פרטים טכניים: {e})"))?;
 
         // ivrit.ai models had their language-detection capability degraded during
         // training and the model card explicitly requires the language token to
@@ -76,7 +120,7 @@ impl WhisperEngine {
                     }
                     Ok(text.trim().to_string())
                 }
-                Err(e) => Err(format!("Transcription failed: {}", e)),
+                Err(e) => Err(whisper_error_to_he(&e)),
             };
             let _ = tx.send(text);
         });
@@ -86,9 +130,9 @@ impl WhisperEngine {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 Err("התמלול חרג מזמן המקסימום (3 דקות). נסה הקלטה קצרה יותר או מודל קטן יותר.".to_string())
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("Transcription thread terminated unexpectedly".to_string())
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(
+                "תהליך התמלול הסתיים באופן בלתי צפוי. נסה שוב; אם זה חוזר, החלף מודל בהגדרות.".to_string(),
+            ),
         }
     }
 
@@ -100,9 +144,31 @@ impl WhisperEngine {
         let state = self
             .ctx
             .create_state()
-            .map_err(|e| format!("Failed to create whisper state: {}", e))?;
+            .map_err(|e| format!("יצירת מצב התמלול המקומי נכשלה. נסה לטעון מחדש את המודל בהגדרות. (פרטים טכניים: {e})"))?;
         Ok((state, self.model_name.clone()))
     }
+}
+
+/// Global abort flag for the single in-flight local batch transcription.
+///
+/// whisper-rs 0.16's `set_abort_callback_safe` is BUGGY: its trampoline is
+/// parameterized by the closure type `F` while the stored `user_data` actually
+/// points to a `Box<dyn FnMut()->bool>` (the progress wrapper gets this right;
+/// the abort one doesn't). So it reads garbage, returns a spurious `true`, and
+/// whisper aborts the encode → `full()` returns `GenericError(-6)` ("failed to
+/// encode"). We avoid that API entirely and use the raw `set_abort_callback` with
+/// a plain C function reading this static — no `user_data` box needed because
+/// only one batch runs at a time (guarded by `batch_in_progress`).
+static LOCAL_ABORT: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn local_abort_callback(_user_data: *mut c_void) -> bool {
+    LOCAL_ABORT.load(Ordering::Relaxed)
+}
+
+/// Trip the abort flag so the in-flight local transcription stops at the next
+/// whisper.cpp checkpoint. Called from `cancel_batch`.
+pub fn request_local_abort() {
+    LOCAL_ABORT.store(true, Ordering::Relaxed);
 }
 
 /// Run a long, cancellable transcription on a pre-created state. Holds NO external
@@ -139,15 +205,22 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
     params.set_print_timestamps(false);
 
     params.set_progress_callback_safe(on_progress);
-    let cancel_for_abort = cancel.clone();
-    params.set_abort_callback_safe(move || cancel_for_abort.load(Ordering::Relaxed));
+    // Raw abort callback reading the module static (the safe wrapper is broken in
+    // 0.16 — see LOCAL_ABORT). Reset the flag before the run; `cancel_batch` trips it
+    // via `request_local_abort()`. No user_data needed (single in-flight batch).
+    LOCAL_ABORT.store(false, Ordering::Relaxed);
+    unsafe {
+        params.set_abort_callback(Some(local_abort_callback));
+    }
 
     let full_res = state.full(params, samples);
     // If the user cancelled, report it cleanly regardless of how full() returned.
-    if cancel.load(Ordering::Relaxed) {
+    let cancelled = cancel.load(Ordering::Relaxed) || LOCAL_ABORT.load(Ordering::Relaxed);
+    LOCAL_ABORT.store(false, Ordering::Relaxed);
+    if cancelled {
         return Err("בוטל".to_string());
     }
-    full_res.map_err(|e| format!("Transcription failed: {}", e))?;
+    full_res.map_err(|e| whisper_error_to_he(&e))?;
 
     let n = state.full_n_segments();
     let mut text = String::new();

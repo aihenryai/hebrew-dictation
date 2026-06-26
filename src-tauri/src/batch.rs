@@ -12,6 +12,7 @@ pub struct BatchOpts {
     pub language: String,
     /// Reserved for a future "inject on completion" toggle; the UI handles inject in Phase 1.
     #[serde(default)]
+    #[allow(dead_code)]
     pub inject: bool,
 }
 
