@@ -13,7 +13,7 @@ File upload → transcribe (cloud Deepgram **or** local whisper, offline) → ed
 - ✅ iPhone **.m4a** — works.
 - ✅ Cancel — works.
 - ✅ Regression: short dictation responsive during a local batch.
-- ⏳ Corrupt/empty file — Henry still to test; error is already Hebrew (`"פורמט אודיו לא נתמך או קובץ פגום"`).
+- ✅ Corrupt/empty file — Henry deprioritized the manual check (couldn't find a sample); covered by the `decode::tests::corrupt_file_errors` unit test + the error is already Hebrew (`"פורמט אודיו לא נתמך או קובץ פגום"`).
 
 **All committed locally** (`174ae59`…`7dafc37`, ~11 commits). `cargo build` clean (0 warnings); `cargo test` 14 green; frontend `npm run build` clean. NOT pushed.
 
