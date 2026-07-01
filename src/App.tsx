@@ -7,7 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.9.3";
+const APP_VERSION = "v2.10.0";
 const APP_LICENSE = "MIT";
 
 /** Hebrew label for a batch-transcription progress stage. */
@@ -41,7 +41,17 @@ const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
 )}`;
 
 type AppStatus = "idle" | "recording" | "transcribing" | "enhancing" | "downloading" | "loading-model";
-type AppView = "main" | "settings" | "onboarding";
+type AppView = "main" | "settings" | "onboarding" | "batch";
+type BatchFileStatus = "pending" | "processing" | "done" | "cancelled" | "error";
+interface BatchResult {
+  id: number;
+  fileName: string;
+  filePath: string;
+  transcript: string;
+  status: BatchFileStatus;
+  error?: string;
+}
+let batchIdCounter = 0;
 type Language = "he" | "en" | "multi";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "deepgram" | "groq";
@@ -114,6 +124,13 @@ interface VadStatePayload {
 interface ExportHistoryItem {
   text: string;
   timestamp?: string;
+}
+
+/** First 4 words of a transcript, capped at 40 chars — used as a content-derived
+ *  export filename for BOTH the regular dictation history and batch file results. */
+function firstWordsName(text: string): string {
+  const words = text.trim().split(/\s+/).slice(0, 4).join(" ");
+  return words.length > 40 ? words.substring(0, 40) : words;
 }
 
 interface InterimPayload {
@@ -375,13 +392,21 @@ function App() {
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string } | null>(null);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
-  // Batch file transcription (file upload → cloud Deepgram / local whisper).
-  const [batchTranscript, setBatchTranscript] = useState("");
+  // Batch file transcription (multi-file upload → cloud Deepgram / local whisper).
+  const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchStage, setBatchStage] = useState("");
   const [batchPct, setBatchPct] = useState(0);
   const [batchMode, setBatchMode] = useState<"cloud" | "local">("cloud");
   const [batchError, setBatchError] = useState("");
+  const [batchCurrentIdx, setBatchCurrentIdx] = useState(0);
+  const [batchFileTotal, setBatchFileTotal] = useState(0);
+  const batchCancelledRef = useRef(false);
+  const [batchRecording, setBatchRecording] = useState(false);
+  const [batchRecordElapsed, setBatchRecordElapsed] = useState(0);
+  const [batchActiveResultId, setBatchActiveResultId] = useState<number | null>(null);
+  const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
   const pendingCloseTipRef = useRef(false);
   const statusRef = useRef(status);
@@ -394,6 +419,7 @@ function App() {
   const liveFinalRef = useRef("");
 
   useEffect(() => { statusRef.current = status; }, [status]);
+  useEffect(() => { batchRecordingRef.current = batchRecording; }, [batchRecording]);
   useEffect(() => { vadEnabledRef.current = vadEnabled; }, [vadEnabled]);
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { transcriptionModeRef.current = transcriptionMode; }, [transcriptionMode]);
@@ -558,6 +584,10 @@ function App() {
   useEffect(() => {
     const unlistenHotkey = listen<string>("hotkey-pressed", async (event) => {
       const fromToolbar = event.payload === "toolbar";
+      // A long batch-view recording owns the mic. The backend already rejects a
+      // concurrent start (C1/H1 guards), but its error would land in the hidden
+      // main-view error state — bail here so Alt+D is a clean no-op on that screen.
+      if (batchRecordingRef.current) return;
       const currentStatus = statusRef.current;
       if (currentStatus === "recording") {
         stopAndTranscribe(fromToolbar);
@@ -616,7 +646,7 @@ function App() {
   useEffect(() => {
     const unlisten = listen<{ stage: string; pct: number }>("batch-progress", (event) => {
       setBatchStage(event.payload.stage);
-      setBatchPct(event.payload.pct ?? 0);
+      setBatchPct(Math.round(event.payload.pct ?? 0));
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
@@ -870,7 +900,10 @@ function App() {
     setExportNotice(null);
     try {
       const items: ExportHistoryItem[] = history.map((h) => ({ text: h.text, timestamp: h.timestamp }));
-      const path = await invoke<string>("export_history", { items, format });
+      // Name the file after its content (most recent dictation's opening words),
+      // same as the batch/file-transcription export — not a generic timestamp.
+      const suggested_name = history[0]?.text ? firstWordsName(history[0].text) : "";
+      const path = await invoke<string>("export_history", { items, format, suggested_name });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
@@ -886,34 +919,76 @@ function App() {
   // ── Batch file transcription handlers ──
   const handlePickAndTranscribe = useCallback(async () => {
     setBatchError("");
-    let filePath: string | null = null;
+    let filePaths: string[] | null = null;
     try {
-      filePath = await invoke<string | null>("pick_audio_file");
+      filePaths = await invoke<string[] | null>("pick_audio_files");
     } catch (e) {
-      setBatchError(`בחירת הקובץ נכשלה: ${e}`);
+      setBatchError(`בחירת הקבצים נכשלה: ${e}`);
       return;
     }
-    if (!filePath) return; // user cancelled the picker
+    if (!filePaths || filePaths.length === 0) return;
+
+    const extractFileName = (p: string) =>
+      p.replace(/\\/g, "/").split("/").pop() || p;
+
+    const initial: BatchResult[] = filePaths.map((p) => ({
+      id: ++batchIdCounter,
+      fileName: extractFileName(p),
+      filePath: p,
+      transcript: "",
+      status: "pending",
+    }));
+
+    setBatchActiveResultId(null);
+    setBatchResults(initial);
     setBatchRunning(true);
-    setBatchPct(0);
-    setBatchStage("decoding");
-    setBatchTranscript("");
-    try {
-      const text = await invoke<string>("transcribe_file", {
-        filePath,
-        opts: { mode: batchMode, language: "he", inject: false },
-      });
-      setBatchTranscript(text);
-      setBatchStage("done");
-    } catch (e) {
-      const msg = String(e);
-      if (msg !== "בוטל") setBatchError(`התמלול נכשל: ${msg}`);
-    } finally {
-      setBatchRunning(false);
+    setBatchFileTotal(initial.length);
+    setBatchCurrentIdx(0);
+    batchCancelledRef.current = false;
+
+    for (let i = 0; i < initial.length; i++) {
+      if (batchCancelledRef.current) {
+        setBatchResults((prev) =>
+          prev.map((r, idx) => idx >= i ? { ...r, status: "cancelled" } : r)
+        );
+        break;
+      }
+
+      setBatchCurrentIdx(i);
+      setBatchPct(0);
+      setBatchStage("decoding");
+      setBatchResults((prev) =>
+        prev.map((r, idx) => idx === i ? { ...r, status: "processing" } : r)
+      );
+
+      try {
+        const text = await invoke<string>("transcribe_file", {
+          filePath: initial[i].filePath,
+          opts: { mode: batchMode, language: "he", inject: false },
+        });
+        setBatchResults((prev) =>
+          prev.map((r, idx) => idx === i ? { ...r, status: "done", transcript: text } : r)
+        );
+      } catch (e) {
+        const msg = String(e);
+        if (msg === "בוטל" || batchCancelledRef.current) {
+          setBatchResults((prev) =>
+            prev.map((r, idx) => idx >= i ? { ...r, status: "cancelled" } : r)
+          );
+          break;
+        }
+        setBatchResults((prev) =>
+          prev.map((r, idx) => idx === i ? { ...r, status: "error", error: msg } : r)
+        );
+      }
     }
+
+    setBatchRunning(false);
+    setBatchStage("done");
   }, [batchMode]);
 
   const handleCancelBatch = useCallback(async () => {
+    batchCancelledRef.current = true;
     try {
       await invoke("cancel_batch");
     } catch {
@@ -921,18 +996,112 @@ function App() {
     }
   }, []);
 
-  const exportBatch = useCallback(async (format: "txt" | "docx") => {
-    if (!batchTranscript.trim()) return;
+  const formatRecordTime = (secs: number) => {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+      : `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
+
+  const handleStartBatchRecord = useCallback(async () => {
+    setBatchError("");
     try {
-      const items = [{ text: batchTranscript, timestamp: new Date().toISOString() }];
-      const path = await invoke<string>("export_history", { items, format });
+      await invoke("start_batch_recording");
+      setBatchRecording(true);
+      setBatchRecordElapsed(0);
+      batchRecordTimerRef.current = setInterval(() => {
+        setBatchRecordElapsed((e) => e + 1);
+      }, 1000);
+    } catch (e) {
+      setBatchError(String(e));
+    }
+  }, []);
+
+  const handleStopBatchRecord = useCallback(async () => {
+    if (batchRecordTimerRef.current) {
+      clearInterval(batchRecordTimerRef.current);
+      batchRecordTimerRef.current = null;
+    }
+    setBatchRecording(false);
+
+    let filePath: string;
+    try {
+      filePath = await invoke<string>("stop_batch_recording_to_file");
+    } catch (e) {
+      setBatchError(`שמירת ההקלטה נכשלה: ${String(e)}`);
+      return;
+    }
+
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
+    const fileName = `הקלטה ${timeStr}.wav`;
+    const newId = ++batchIdCounter;
+    const newItem: BatchResult = { id: newId, fileName, filePath, transcript: "", status: "pending" };
+
+    setBatchActiveResultId(newId);
+    setBatchResults((prev) => [...prev, newItem]);
+    setBatchRunning(true);
+    setBatchPct(0);
+    setBatchStage("decoding");
+    batchCancelledRef.current = false;
+
+    setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "processing" } : r));
+
+    try {
+      const text = await invoke<string>("transcribe_file", {
+        filePath,
+        opts: { mode: batchMode, language: "he", inject: false },
+      });
+      setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "done", transcript: text } : r));
+    } catch (e) {
+      const msg = String(e);
+      if (msg === "בוטל" || batchCancelledRef.current) {
+        setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "cancelled" } : r));
+      } else {
+        setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "error", error: msg } : r));
+      }
+    } finally {
+      // The temp WAV (≈110 MB/hour) has been transcribed — delete it so recordings
+      // don't pile up in %TEMP%. Best-effort: the transcript is already in state.
+      try { await invoke("delete_temp_recording", { path: filePath }); } catch { /* ignore */ }
+    }
+
+    setBatchRunning(false);
+    setBatchStage("done");
+    setBatchActiveResultId(null);
+  }, [batchMode]);
+
+  const handleCancelBatchRecord = useCallback(async () => {
+    if (batchRecordTimerRef.current) {
+      clearInterval(batchRecordTimerRef.current);
+      batchRecordTimerRef.current = null;
+    }
+    setBatchRecording(false);
+    setBatchRecordElapsed(0);
+    try { await invoke("cancel_batch_recording"); } catch { /* ignore */ }
+  }, []);
+
+  const generateExportName = (results: BatchResult[]): string => {
+    const first = results.find((r) => r.status === "done" && r.transcript.trim());
+    return first ? firstWordsName(first.transcript) : "";
+  };
+
+  const exportBatch = useCallback(async (format: "txt" | "docx") => {
+    const done = batchResults.filter((r) => r.status === "done" && r.transcript.trim());
+    if (done.length === 0) return;
+    try {
+      const items = done.map((r) => ({ text: r.transcript, timestamp: new Date().toISOString() }));
+      const suggested_name = generateExportName(done);
+      const path = await invoke<string>("export_history", { items, format, suggested_name });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
       const msg = String(e);
       if (msg !== "הייצוא בוטל") setBatchError(`ייצוא נכשל: ${msg}`);
     }
-  }, [batchTranscript]);
+  }, [batchResults]);
 
   /** Push the silence-to-stop duration to the running recorder. */
   const applySilenceDuration = useCallback(async (secs: number) => {
@@ -2099,6 +2268,198 @@ function App() {
     );
   }
 
+  // ---- BATCH VIEW ----
+  if (view === "batch") {
+    const doneCount = batchResults.filter((r) => r.status === "done").length;
+    const processingResult = batchActiveResultId != null
+      ? batchResults.find((r) => r.id === batchActiveResultId)
+      : batchResults[batchCurrentIdx];
+
+    return (
+      <main className="container batch-view" dir="rtl">
+        {/* Header */}
+        <div className="batch-view-header">
+          <button className="btn-back" onClick={() => setView("main")} aria-label="חזור">חזור</button>
+          <h2 className="batch-view-title">תמלול קובץ</h2>
+        </div>
+
+        {/* Mode selector */}
+        <div className="batch-mode-cards" role="group" aria-label="מצב תמלול">
+          <button
+            className={`batch-mode-card ${batchMode === "cloud" ? "active" : ""}`}
+            onClick={() => !batchRunning && !batchRecording && setBatchMode("cloud")}
+            disabled={batchRunning || batchRecording}
+            aria-pressed={batchMode === "cloud"}
+          >
+            <span className="batch-mode-icon" aria-hidden="true">☁</span>
+            <span className="batch-mode-name">מהיר — ענן</span>
+            <span className="batch-mode-desc">Deepgram · דורש מפתח API</span>
+          </button>
+          <button
+            className={`batch-mode-card ${batchMode === "local" ? "active" : ""}`}
+            onClick={() => !batchRunning && !batchRecording && setBatchMode("local")}
+            disabled={batchRunning || batchRecording}
+            aria-pressed={batchMode === "local"}
+          >
+            <span className="batch-mode-icon" aria-hidden="true">🔒</span>
+            <span className="batch-mode-name">פרטי — מכשיר</span>
+            <span className="batch-mode-desc">ללא אינטרנט · דורש מודל מורד</span>
+          </button>
+        </div>
+
+        {/* Global error */}
+        {batchError && (
+          <p className="error batch-error" role="alert" onClick={() => setBatchError("")}>
+            ❌ {batchError}
+          </p>
+        )}
+
+        {/* Empty state */}
+        {batchResults.length === 0 && !batchRunning && !batchRecording && (
+          <div className="batch-empty-state">
+            <div className="batch-empty-icon" aria-hidden="true">🎵</div>
+            <p className="batch-empty-title">תמלול קובץ או הקלטה</p>
+            <p className="batch-empty-hint">תומך ב-MP3, M4A, WAV, FLAC, OGG, AAC · ניתן לבחור מספר קבצים בבת אחת</p>
+            <div className="batch-empty-actions">
+              <button className="btn-primary batch-pick-btn" onClick={handlePickAndTranscribe}>
+                📁 בחר קבצים
+              </button>
+              <button className="btn-secondary batch-record-btn" onClick={handleStartBatchRecord}>
+                🎙 הקלט ותמלל
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Recording active state */}
+        {batchRecording && (
+          <div className="batch-record-active" role="status" aria-live="polite">
+            <span className="batch-record-dot" aria-hidden="true" />
+            <span className="batch-record-timer" aria-label={`זמן הקלטה: ${formatRecordTime(batchRecordElapsed)}`}>
+              {formatRecordTime(batchRecordElapsed)}
+            </span>
+            <span className="batch-record-label">מקליט...</span>
+            <div className="batch-record-controls">
+              <button className="btn-primary btn-record-stop" onClick={handleStopBatchRecord}>
+                ⏹ עצור ותמלל
+              </button>
+              <button className="btn-secondary btn-record-cancel" onClick={handleCancelBatchRecord}>
+                בטל
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Overall progress */}
+        {batchRunning && (
+          <div className="batch-overall-progress" role="status" aria-live="polite">
+            <div className="batch-overall-row">
+              <span className="batch-overall-label">
+                מתמלל {batchCurrentIdx + 1} מתוך {batchFileTotal}
+                {processingResult?.fileName ? ` — ${processingResult.fileName}` : ""}
+              </span>
+              <button className="btn-secondary btn-sm" onClick={handleCancelBatch}>בטל</button>
+            </div>
+            <div className="batch-progress-bar">
+              <div
+                className="batch-progress-fill"
+                style={{ width: `${batchPct}%` }}
+                role="progressbar"
+                aria-valuenow={batchPct}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              />
+            </div>
+            <span className="batch-progress-stage">{stageLabel(batchStage)}{batchPct > 0 ? ` ${batchPct}%` : ""}</span>
+          </div>
+        )}
+
+        {/* File result list */}
+        {batchResults.length > 0 && (
+          <div className="batch-file-list">
+            {batchResults.map((result, idx) => (
+              <div key={result.id} className={`batch-file-card batch-file-${result.status}`}>
+                <div className="batch-file-header">
+                  <span className="batch-file-icon" aria-hidden="true">{result.fileName.startsWith("הקלטה") ? "🎙" : "🎵"}</span>
+                  <span className="batch-file-name" title={result.filePath}>{result.fileName}</span>
+                  <span className={`batch-file-badge badge-${result.status}`}>
+                    {result.status === "pending" && "ממתין"}
+                    {result.status === "processing" && (
+                      <>
+                        <span className="badge-spinner" aria-hidden="true" />
+                        {stageLabel(batchStage)}{batchPct > 0 ? ` ${batchPct}%` : ""}
+                      </>
+                    )}
+                    {result.status === "done" && "✅ הושלם"}
+                    {result.status === "cancelled" && "⛔ בוטל"}
+                    {result.status === "error" && "❌ שגיאה"}
+                  </span>
+                </div>
+
+                {result.status === "error" && result.error && (
+                  <p className="batch-file-error">{result.error}</p>
+                )}
+
+                {result.status === "done" && (
+                  <div className="batch-file-result">
+                    <textarea
+                      dir="rtl"
+                      className="batch-textarea"
+                      value={result.transcript}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setBatchResults((prev) =>
+                          prev.map((r, i) => i === idx ? { ...r, transcript: val } : r)
+                        );
+                      }}
+                      rows={5}
+                      aria-label={`תמלול ${result.fileName}`}
+                    />
+                    <div className="batch-file-actions">
+                      <button
+                        className="btn-secondary btn-sm"
+                        onClick={() => injectText(result.transcript)}
+                        title="הדבק בשדה הפעיל"
+                      >
+                        ⌨️ הדבק בחלון הפעיל
+                      </button>
+                      <button
+                        className="btn-secondary btn-sm"
+                        onClick={() => navigator.clipboard.writeText(result.transcript)}
+                        title="העתק"
+                      >
+                        📋 העתק
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Bottom action bar */}
+        {!batchRunning && !batchRecording && batchResults.length > 0 && (
+          <div className="batch-action-bar">
+            <button className="btn-secondary btn-sm" onClick={handlePickAndTranscribe}>
+              📁 קבצים נוספים
+            </button>
+            <button className="btn-secondary btn-sm" onClick={handleStartBatchRecord}>
+              🎙 הקלט ותמלל
+            </button>
+            {doneCount > 0 && (
+              <>
+                <button className="btn-secondary btn-sm" onClick={() => exportBatch("txt")}>📄 TXT</button>
+                <button className="btn-secondary btn-sm" onClick={() => exportBatch("docx")}>📝 Word</button>
+              </>
+            )}
+            <button className="btn-secondary btn-sm batch-clear-btn" onClick={() => setBatchResults([])}>נקה</button>
+          </div>
+        )}
+      </main>
+    );
+  }
+
   // ---- MAIN VIEW (compact) ----
   const dismissCloseTip = async () => {
     setShowCloseTip(false);
@@ -2182,8 +2543,14 @@ function App() {
       )}
 
       <div className="main-header">
-        <h1>🎤 הכתבה</h1>
-        <button className="btn-settings" onClick={() => setView("settings")} title="הגדרות">⚙</button>
+        <div className="main-header-modes">
+          <button
+            className="btn-batch-nav btn-mode-rec"
+            onClick={() => { setView("batch"); void handleStartBatchRecord(); }}
+            aria-label="הקלט ותמלל"
+          >הקלט ותמלל</button>
+          <button className="btn-batch-nav btn-mode-files" onClick={() => setView("batch")} aria-label="תמלול קבצי שמע">תמלול קבצי שמע</button>
+        </div>
       </div>
 
       {/* No setup — first-time prompt */}
@@ -2222,8 +2589,9 @@ function App() {
           className={`btn-record ${status === "recording" ? "recording" : ""}`}
           disabled={status === "transcribing" || status === "enhancing" || status === "downloading" || status === "loading-model" || !canRecord}
         >
-          {status === "recording" ? "⏹ עצור" : "🎤 הקלט"}
+          {status === "recording" ? "⏹ עצור" : "🎤 הכתב"}
         </button>
+        <button className="btn-settings-inline" onClick={() => setView("settings")} title="הגדרות" aria-label="הגדרות">⚙</button>
       </div>
 
       {/* Recording progress bar — hidden in unlimited mode */}
@@ -2255,7 +2623,7 @@ function App() {
           />
           <div className="transcript-actions">
             <button onClick={() => injectText(editableTranscript)} className="btn-secondary" title="הדבק בשדה הפעיל">
-              ⌨️ הדבק
+              ⌨️ הדבק בחלון הפעיל
             </button>
             <button onClick={() => navigator.clipboard.writeText(editableTranscript)} className="btn-secondary" title="העתק ללוח">
               📋 העתק
@@ -2317,64 +2685,6 @@ function App() {
           ))}
         </div>
       )}
-
-      {/* ── Batch: file transcription ── */}
-      <div className="settings-section batch-panel" dir="rtl">
-        <h3>📁 תמלול קובץ</h3>
-        <p className="settings-hint">
-          העלה קובץ אודיו (mp3, m4a, wav, ogg, flac) ← תמלול ← עריכה / ייצוא / הזרקה.
-          עובד בענן (מהיר, Deepgram) וגם במכשיר (פרטי, ללא אינטרנט).
-        </p>
-
-        <div className="batch-mode-toggle">
-          <label className="toggle-label">
-            <input type="radio" name="batchMode" checked={batchMode === "cloud"} disabled={batchRunning}
-              onChange={() => setBatchMode("cloud")} />
-            <span className="toggle-text">מהיר (ענן — Deepgram, המפתח שלך)</span>
-          </label>
-          <label className="toggle-label">
-            <input type="radio" name="batchMode" checked={batchMode === "local"} disabled={batchRunning}
-              onChange={() => setBatchMode("local")} />
-            <span className="toggle-text">פרטי (במכשיר — איטי, ללא אינטרנט)</span>
-          </label>
-        </div>
-
-        {!batchRunning && (
-          <button className="btn-primary" onClick={handlePickAndTranscribe}>בחר קובץ ותמלל</button>
-        )}
-
-        {batchRunning && (
-          <div className="batch-progress">
-            <div className="batch-progress-bar">
-              <div className="batch-progress-fill" style={{ width: `${batchPct}%` }} />
-            </div>
-            <span className="batch-progress-label">
-              {stageLabel(batchStage)} {batchPct > 0 ? `${batchPct}%` : ""}
-            </span>
-            <button className="btn-secondary btn-sm" onClick={handleCancelBatch}>בטל</button>
-          </div>
-        )}
-
-        {batchError && <p className="error" onClick={() => setBatchError("")}>❌ {batchError}</p>}
-
-        {batchTranscript && (
-          <div className="batch-result">
-            <textarea
-              dir="rtl"
-              className="batch-textarea"
-              value={batchTranscript}
-              onChange={(e) => setBatchTranscript(e.target.value)}
-              rows={10}
-            />
-            <div className="batch-actions">
-              <button className="btn-secondary btn-sm" onClick={() => injectText(batchTranscript)} title="הדבק בשדה הפעיל">⌨️ הדבק</button>
-              <button className="btn-secondary btn-sm" onClick={() => navigator.clipboard.writeText(batchTranscript)} title="העתק">📋 העתק</button>
-              <button className="btn-secondary btn-sm" onClick={() => exportBatch("txt")}>📄 TXT</button>
-              <button className="btn-secondary btn-sm" onClick={() => exportBatch("docx")}>📝 Word</button>
-            </div>
-          </div>
-        )}
-      </div>
 
       <div className="footer">
         <span>{formatHotkey(hotkey)} · {langLabels[language]} · {vadEnabled ? "עצירה אוטומטית" : "עצירה ידנית"}</span>

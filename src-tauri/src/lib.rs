@@ -42,10 +42,16 @@ struct AppState {
     batch_cancel_notify: Arc<tokio::sync::Notify>,
     /// Guards against two concurrent batch jobs.
     batch_in_progress: Arc<AtomicBool>,
+    /// Set true while a long batch-view recording is in progress (separate from
+    /// short dictation) so Alt+D cannot overwrite the buffer mid-session.
+    batch_recording_in_progress: Arc<AtomicBool>,
 }
 
 #[tauri::command]
 fn start_recording(state: State<AppState>) -> Result<(), String> {
+    if state.batch_recording_in_progress.load(Ordering::SeqCst) {
+        return Err("הקלטת ישיבה בתהליך — עצור אותה לפני הקלטה חדשה".to_string());
+    }
     let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
     recorder.start_recording()
 }
@@ -462,6 +468,139 @@ async fn run_transcribe_file(
     }
 }
 
+/// Write a 16-bit PCM mono WAV file from 16kHz f32 samples. No external crate needed.
+fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> Result<(), String> {
+    use std::io::Write;
+    let pcm: Vec<i16> = samples
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+    let data_len = (pcm.len() * 2) as u32;
+    let mut f = std::fs::File::create(path)
+        .map_err(|e| format!("לא ניתן ליצור קובץ זמני להקלטה: {}", e))?;
+    f.write_all(b"RIFF").map_err(|e| e.to_string())?;
+    f.write_all(&(36 + data_len).to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(b"WAVE").map_err(|e| e.to_string())?;
+    f.write_all(b"fmt ").map_err(|e| e.to_string())?;
+    f.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // PCM
+    f.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?; // mono
+    f.write_all(&16000u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    f.write_all(&32000u32.to_le_bytes()).map_err(|e| e.to_string())?; // byte-rate
+    f.write_all(&2u16.to_le_bytes()).map_err(|e| e.to_string())?; // block align
+    f.write_all(&16u16.to_le_bytes()).map_err(|e| e.to_string())?; // bits per sample
+    f.write_all(b"data").map_err(|e| e.to_string())?;
+    f.write_all(&data_len.to_le_bytes()).map_err(|e| e.to_string())?;
+    for s in &pcm {
+        f.write_all(&s.to_le_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Restore the recorder's VAD/timeout settings from the persisted user config.
+/// Called after a batch recording ends so the short-dictation flow resumes correctly.
+fn restore_recorder_settings(state: &State<AppState>) {
+    if let (Ok(s), Ok(rec)) = (state.settings.lock(), state.recorder.lock()) {
+        rec.set_vad_enabled(s.vad_enabled);
+        rec.set_silence_duration_secs(s.vad_silence_secs);
+        let max = if s.unlimited_recording { 3600.0 } else { s.max_recording_secs };
+        rec.set_max_recording_secs(max);
+    }
+}
+
+/// Start a long batch recording (for meeting / lecture). Uses the same AudioRecorder
+/// as short dictation but disables VAD auto-stop so the user controls stop manually.
+/// Blocks while a transcription or another batch recording is already in progress.
+#[tauri::command]
+fn start_batch_recording(state: State<AppState>) -> Result<(), String> {
+    if state.batch_in_progress.load(Ordering::SeqCst) {
+        return Err("תמלול בתהליך — המתן לסיומו לפני הקלטה".to_string());
+    }
+    // Symmetric to C1: a live streaming session also owns the recorder. `try_lock`
+    // keeps this command sync — a held lock means streaming is mid setup/teardown,
+    // so treat it as busy rather than racing into `recorder.start_recording()`.
+    match state.streaming.try_lock() {
+        Ok(guard) if guard.is_some() => {
+            return Err("חיבור streaming פעיל — עצור אותו לפני הקלטת ישיבה".to_string());
+        }
+        Err(_) => {
+            return Err("מצב הקלטה בלתי-יציב כרגע — נסה שוב בעוד רגע".to_string());
+        }
+        Ok(_) => {}
+    }
+    if state.batch_recording_in_progress.swap(true, Ordering::SeqCst) {
+        return Err("הקלטה כבר בתהליך".to_string());
+    }
+    let mut recorder = state.recorder.lock().map_err(|e| {
+        state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+        e.to_string()
+    })?;
+    // Disable VAD — user stops manually.
+    recorder.set_vad_enabled(false);
+    // Allow up to 1 hour (hard ceiling in AudioRecorder).
+    recorder.set_max_recording_secs(3600.0);
+    recorder.start_recording().map_err(|e| {
+        state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+        e
+    })
+}
+
+/// Stop the batch recording, write the captured audio to a temporary WAV file,
+/// and return its path. The frontend then calls `transcribe_file` with the path
+/// (same pipeline as file-upload), so no large sample buffer crosses the IPC bridge.
+#[tauri::command]
+async fn stop_batch_recording_to_file(state: State<'_, AppState>) -> Result<String, String> {
+    let samples = {
+        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.stop_recording()?
+    };
+    state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+    restore_recorder_settings(&state);
+
+    if samples.is_empty() || audio::is_effectively_silent(&samples, 0.005) {
+        return Err("לא נקלט אודיו — ודא שהמיקרופון מחובר ופעיל.".to_string());
+    }
+
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tmp_path = std::env::temp_dir().join(format!("hd-recording-{}.wav", epoch));
+    write_wav_16k_mono(&tmp_path, &samples)?;
+    Ok(tmp_path.to_string_lossy().to_string())
+}
+
+/// Cancel a batch recording in progress — discards the accumulated audio buffer.
+#[tauri::command]
+fn cancel_batch_recording(state: State<AppState>) -> Result<(), String> {
+    // Clear the guard FIRST. If the recorder lock is poisoned the `?` below returns
+    // early — leaving the flag set would block short dictation until app restart.
+    state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+    let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+    let _ = recorder.stop_recording();
+    drop(recorder);
+    restore_recorder_settings(&state);
+    Ok(())
+}
+
+/// Delete a temporary recording WAV produced by `stop_batch_recording_to_file`
+/// (≈110 MB/hour). Hardened: only removes files inside the system temp dir whose
+/// name matches our `hd-recording-*.wav` pattern, so a bad/forged path can never
+/// delete a user's own audio file.
+#[tauri::command]
+fn delete_temp_recording(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    let in_temp = p.starts_with(std::env::temp_dir());
+    let name_ok = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("hd-recording-") && n.ends_with(".wav"));
+    if !in_temp || !name_ok {
+        return Err("נתיב לא חוקי למחיקת קובץ זמני".to_string());
+    }
+    std::fs::remove_file(&p).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn cancel_batch(state: State<AppState>) -> Result<(), String> {
     state.batch_cancel.store(true, Ordering::SeqCst);
@@ -493,12 +632,42 @@ async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
     Ok(path.map(|p| p.to_string_lossy().to_string()))
 }
 
+/// Open a native file picker that allows selecting multiple audio files.
+/// Returns the chosen paths, or None if the user cancelled.
+#[tauri::command]
+async fn pick_audio_files(app: AppHandle) -> Result<Option<Vec<String>>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<std::path::PathBuf>>>();
+    app.dialog()
+        .file()
+        .set_title("בחר קבצי אודיו לתמלול")
+        .add_filter("אודיו", &["mp3", "m4a", "wav", "ogg", "flac", "aac", "mp4"])
+        .pick_files(move |result| {
+            let _ = tx.send(result.map(|fps| {
+                fps.into_iter()
+                    .filter_map(|fp| fp.into_path().ok())
+                    .collect()
+            }));
+        });
+
+    let paths = rx
+        .await
+        .map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string())?;
+    Ok(paths.map(|ps| ps.iter().map(|p| p.to_string_lossy().to_string()).collect()))
+}
+
 #[tauri::command]
 async fn start_streaming_transcription(
     state: State<'_, AppState>,
     app: AppHandle,
     language: Option<String>,
 ) -> Result<(), String> {
+    // A long batch-view recording owns the recorder — starting a streaming session
+    // would call `recorder.start_recording()` and wipe the meeting buffer (the old C1).
+    if state.batch_recording_in_progress.load(Ordering::SeqCst) {
+        return Err("הקלטת ישיבה בתהליך — עצור אותה לפני הקלטה חדשה".to_string());
+    }
     // Only one active session at a time.
     {
         let guard = state.streaming.lock().await;
@@ -807,12 +976,32 @@ fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
 
 /// Export the user's dictation history to a TXT or DOCX file. The frontend
 /// passes the items so the backend doesn't need to manage history persistence.
+/// Sanitize a user-facing string for use as a Windows filename.
+/// Replaces forbidden chars (`\ / : * ? " < > |` and controls) with `_`,
+/// trims whitespace, and caps at 80 characters.
+fn sanitize_filename(name: &str) -> String {
+    const FORBIDDEN: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+    let s: String = name
+        .chars()
+        .map(|c| if FORBIDDEN.contains(&c) || c.is_control() { '_' } else { c })
+        .collect();
+    let s = s.trim();
+    let mut out = String::new();
+    for (i, ch) in s.char_indices() {
+        if i >= 80 { break; }
+        out.push(ch);
+    }
+    out
+}
+
 /// `format` must be "txt" or "docx".
+/// `suggested_name` is an optional content-derived filename (no extension); falls back to timestamp.
 #[tauri::command]
 async fn export_history(
     app: AppHandle,
     items: Vec<export::HistoryItem>,
     format: String,
+    suggested_name: Option<String>,
 ) -> Result<String, String> {
     use tauri_plugin_dialog::DialogExt;
 
@@ -828,7 +1017,10 @@ async fn export_history(
     };
 
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M");
-    let default_name = format!("hebrew-dictation-history_{}.{}", timestamp, extension);
+    let default_name = match suggested_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(name) => format!("{}.{}", sanitize_filename(name), extension),
+        None => format!("hebrew-dictation-history_{}.{}", timestamp, extension),
+    };
 
     // tauri-plugin-dialog `save` is callback-based — wrap it in a oneshot channel.
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
@@ -1286,6 +1478,7 @@ pub fn run() {
                 batch_cancel: Arc::new(AtomicBool::new(false)),
                 batch_cancel_notify: Arc::new(tokio::sync::Notify::new()),
                 batch_in_progress: Arc::new(AtomicBool::new(false)),
+                batch_recording_in_progress: Arc::new(AtomicBool::new(false)),
             }
         })
         .setup(|app| {
@@ -1457,7 +1650,12 @@ pub fn run() {
             enhance_text,
             transcribe_file,
             cancel_batch,
+            start_batch_recording,
+            stop_batch_recording_to_file,
+            cancel_batch_recording,
+            delete_temp_recording,
             pick_audio_file,
+            pick_audio_files,
             export_history,
             get_audio_devices,
             set_window_always_on_top,

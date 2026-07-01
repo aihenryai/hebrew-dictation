@@ -127,6 +127,15 @@ impl AudioRecorder {
     }
 
     pub fn start_recording(&mut self) -> Result<(), String> {
+        // Re-entrancy backstop (root cause of C1/H1/H3): never start over a live
+        // stream. A second start would `samples.clear()` the in-flight buffer and
+        // spawn a duplicate VAD thread (the old one never sees is_recording=false,
+        // so it never exits). The command-layer guards should prevent reaching here;
+        // this enforces it at the source.
+        if self.is_recording() {
+            return Err("הקלטה כבר פעילה — עצור אותה לפני התחלת הקלטה חדשה".to_string());
+        }
+
         // Query device info on the main thread (this is safe)
         let host = cpal::default_host();
         let preferred = self
