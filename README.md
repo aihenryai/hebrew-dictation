@@ -2,6 +2,8 @@
 
 **הכתבה קולית בעברית מכל מקום במחשב — חינמי וקוד פתוח.**
 
+### **[⬇️ הורדה והתקנה → bintechai.com/hebrew-dictation](https://bintechai.com/hebrew-dictation)**
+
 > by [BinTech AI — הנרי שטאובר](https://taplink.cc/henry.ai)
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -31,7 +33,13 @@
 
 ### אפשרות 1: הורדת מתקין (מומלץ)
 
-> 🚧 קישור להורדה יתעדכן בקרוב
+**⬇️ הורדה והתקנה דרך האתר → [bintechai.com/hebrew-dictation](https://bintechai.com/hebrew-dictation)**
+
+או הורדה ישירה מ-GitHub:
+- **Windows** (גרסה אחרונה): [עמוד ה-Releases](https://github.com/aihenryai/hebrew-dictation/releases/latest) → `hebrew-dictation-…-setup.exe`
+- **macOS** (Apple Silicon, v2.8.1): [DMG](https://github.com/aihenryai/hebrew-dictation/releases/download/v2.8.1/hebrew-dictation-v2.8.1-aarch64.dmg)
+
+דאבל-קליק להתקנה — לא דורש הרשאות מנהל. עדכונים מגיעים אוטומטית דרך האפליקציה.
 
 ### אפשרות 2: בנייה מהקוד
 
