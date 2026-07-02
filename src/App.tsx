@@ -7,7 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.10.0";
+const APP_VERSION = "v2.10.1";
 const APP_LICENSE = "MIT";
 
 /** Hebrew label for a batch-transcription progress stage. */
@@ -908,7 +908,7 @@ function App() {
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
       const msg = String(e);
-      if (msg !== "הייצוא בוטל") {
+      if (!msg.includes("הייצוא בוטל")) {
         setError(`ייצוא ההיסטוריה נכשל: ${msg}`);
       }
     } finally {
@@ -939,8 +939,10 @@ function App() {
       status: "pending",
     }));
 
-    setBatchActiveResultId(null);
-    setBatchResults(initial);
+    // Append the new files, preserving any existing results (button = "הוסף קבצים").
+    // All per-item updates below target by ID, not index, so appended items are
+    // matched correctly regardless of how many results already existed.
+    setBatchResults((prev) => [...prev, ...initial]);
     setBatchRunning(true);
     setBatchFileTotal(initial.length);
     setBatchCurrentIdx(0);
@@ -948,17 +950,20 @@ function App() {
 
     for (let i = 0; i < initial.length; i++) {
       if (batchCancelledRef.current) {
+        const remaining = new Set(initial.slice(i).map((r) => r.id));
         setBatchResults((prev) =>
-          prev.map((r, idx) => idx >= i ? { ...r, status: "cancelled" } : r)
+          prev.map((r) => remaining.has(r.id) ? { ...r, status: "cancelled" } : r)
         );
         break;
       }
 
+      const curId = initial[i].id;
       setBatchCurrentIdx(i);
+      setBatchActiveResultId(curId);
       setBatchPct(0);
       setBatchStage("decoding");
       setBatchResults((prev) =>
-        prev.map((r, idx) => idx === i ? { ...r, status: "processing" } : r)
+        prev.map((r) => r.id === curId ? { ...r, status: "processing" } : r)
       );
 
       try {
@@ -967,24 +972,26 @@ function App() {
           opts: { mode: batchMode, language: "he", inject: false },
         });
         setBatchResults((prev) =>
-          prev.map((r, idx) => idx === i ? { ...r, status: "done", transcript: text } : r)
+          prev.map((r) => r.id === curId ? { ...r, status: "done", transcript: text } : r)
         );
       } catch (e) {
         const msg = String(e);
         if (msg === "בוטל" || batchCancelledRef.current) {
+          const remaining = new Set(initial.slice(i).map((r) => r.id));
           setBatchResults((prev) =>
-            prev.map((r, idx) => idx >= i ? { ...r, status: "cancelled" } : r)
+            prev.map((r) => remaining.has(r.id) ? { ...r, status: "cancelled" } : r)
           );
           break;
         }
         setBatchResults((prev) =>
-          prev.map((r, idx) => idx === i ? { ...r, status: "error", error: msg } : r)
+          prev.map((r) => r.id === curId ? { ...r, status: "error", error: msg } : r)
         );
       }
     }
 
     setBatchRunning(false);
     setBatchStage("done");
+    setBatchActiveResultId(null);
   }, [batchMode]);
 
   const handleCancelBatch = useCallback(async () => {
@@ -1088,6 +1095,26 @@ function App() {
     return first ? firstWordsName(first.transcript) : "";
   };
 
+  // Per-item export: save a single transcript segment to TXT/DOCX, named by content.
+  const exportSingle = useCallback(async (
+    text: string,
+    format: "txt" | "docx",
+    onErr: (msg: string) => void,
+  ) => {
+    const t = text.trim();
+    if (!t) return;
+    try {
+      await invoke<string>("export_history", {
+        items: [{ text: t, timestamp: new Date().toISOString() }],
+        format,
+        suggested_name: firstWordsName(t),
+      });
+    } catch (e) {
+      const msg = String(e);
+      if (!msg.includes("הייצוא בוטל")) onErr(`ייצוא נכשל: ${msg}`);
+    }
+  }, []);
+
   const exportBatch = useCallback(async (format: "txt" | "docx") => {
     const done = batchResults.filter((r) => r.status === "done" && r.transcript.trim());
     if (done.length === 0) return;
@@ -1099,7 +1126,7 @@ function App() {
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
       const msg = String(e);
-      if (msg !== "הייצוא בוטל") setBatchError(`ייצוא נכשל: ${msg}`);
+      if (!msg.includes("הייצוא בוטל")) setBatchError(`ייצוא נכשל: ${msg}`);
     }
   }, [batchResults]);
 
@@ -2307,6 +2334,18 @@ function App() {
           </button>
         </div>
 
+        {/* Actions — pinned near the top so a growing result list never pushes them off-screen */}
+        {!batchRecording && (
+          <div className="batch-actions-top">
+            <button className="btn-primary batch-pick-btn" onClick={handlePickAndTranscribe} disabled={batchRunning}>
+              📁 {batchResults.length === 0 ? "בחר קבצים" : "הוסף קבצים"}
+            </button>
+            <button className="btn-secondary batch-record-btn" onClick={handleStartBatchRecord} disabled={batchRunning}>
+              🎙 הקלט ותמלל
+            </button>
+          </div>
+        )}
+
         {/* Global error */}
         {batchError && (
           <p className="error batch-error" role="alert" onClick={() => setBatchError("")}>
@@ -2320,14 +2359,6 @@ function App() {
             <div className="batch-empty-icon" aria-hidden="true">🎵</div>
             <p className="batch-empty-title">תמלול קובץ או הקלטה</p>
             <p className="batch-empty-hint">תומך ב-MP3, M4A, WAV, FLAC, OGG, AAC · ניתן לבחור מספר קבצים בבת אחת</p>
-            <div className="batch-empty-actions">
-              <button className="btn-primary batch-pick-btn" onClick={handlePickAndTranscribe}>
-                📁 בחר קבצים
-              </button>
-              <button className="btn-secondary batch-record-btn" onClick={handleStartBatchRecord}>
-                🎙 הקלט ותמלל
-              </button>
-            </div>
           </div>
         )}
 
@@ -2430,6 +2461,20 @@ function App() {
                       >
                         📋 העתק
                       </button>
+                      <button
+                        className="btn-secondary btn-sm"
+                        onClick={() => exportSingle(result.transcript, "txt", setBatchError)}
+                        title="ייצוא מקטע זה כקובץ טקסט"
+                      >
+                        📄 TXT
+                      </button>
+                      <button
+                        className="btn-secondary btn-sm"
+                        onClick={() => exportSingle(result.transcript, "docx", setBatchError)}
+                        title="ייצוא מקטע זה כמסמך Word"
+                      >
+                        📝 Word
+                      </button>
                     </div>
                   </div>
                 )}
@@ -2441,14 +2486,9 @@ function App() {
         {/* Bottom action bar */}
         {!batchRunning && !batchRecording && batchResults.length > 0 && (
           <div className="batch-action-bar">
-            <button className="btn-secondary btn-sm" onClick={handlePickAndTranscribe}>
-              📁 קבצים נוספים
-            </button>
-            <button className="btn-secondary btn-sm" onClick={handleStartBatchRecord}>
-              🎙 הקלט ותמלל
-            </button>
-            {doneCount > 0 && (
+            {doneCount > 1 && (
               <>
+                <span className="batch-export-all-label">ייצוא הכל:</span>
                 <button className="btn-secondary btn-sm" onClick={() => exportBatch("txt")}>📄 TXT</button>
                 <button className="btn-secondary btn-sm" onClick={() => exportBatch("docx")}>📝 Word</button>
               </>
@@ -2545,11 +2585,10 @@ function App() {
       <div className="main-header">
         <div className="main-header-modes">
           <button
-            className="btn-batch-nav btn-mode-rec"
-            onClick={() => { setView("batch"); void handleStartBatchRecord(); }}
-            aria-label="הקלט ותמלל"
-          >הקלט ותמלל</button>
-          <button className="btn-batch-nav btn-mode-files" onClick={() => setView("batch")} aria-label="תמלול קבצי שמע">תמלול קבצי שמע</button>
+            className="btn-batch-nav btn-mode-combined"
+            onClick={() => setView("batch")}
+            aria-label="הקלט ותמלל או תמלול קבצי שמע"
+          >הקלט ותמלל / תמלול קבצי שמע</button>
         </div>
       </div>
 

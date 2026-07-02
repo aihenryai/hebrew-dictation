@@ -613,9 +613,21 @@ fn cancel_batch(state: State<AppState>) -> Result<(), String> {
 /// Open a native file picker for an audio file. Returns the chosen path, or None
 /// if the user cancelled. The path is opened Rust-side by symphonia in transcribe_file
 /// (no fs-read capability needed — only dialog:allow-open).
+/// Toggle the main window's always-on-top. Native file dialogs open BEHIND an
+/// always-on-top window, so callers drop it for the dialog's duration and restore
+/// it to the user's configured setting afterwards.
+fn set_main_on_top(app: &AppHandle, on: bool) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_always_on_top(on);
+    }
+}
+
 #[tauri::command]
-async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
+async fn pick_audio_file(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
+
+    let restore_on_top = state.settings.lock().map(|s| s.always_on_top).unwrap_or(true);
+    set_main_on_top(&app, false);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
     app.dialog()
@@ -626,17 +638,20 @@ async fn pick_audio_file(app: AppHandle) -> Result<Option<String>, String> {
             let _ = tx.send(result.and_then(|fp| fp.into_path().ok()));
         });
 
-    let path = rx
-        .await
-        .map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string())?;
+    let path = rx.await.map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string());
+    set_main_on_top(&app, restore_on_top);
+    let path = path?;
     Ok(path.map(|p| p.to_string_lossy().to_string()))
 }
 
 /// Open a native file picker that allows selecting multiple audio files.
 /// Returns the chosen paths, or None if the user cancelled.
 #[tauri::command]
-async fn pick_audio_files(app: AppHandle) -> Result<Option<Vec<String>>, String> {
+async fn pick_audio_files(app: AppHandle, state: State<'_, AppState>) -> Result<Option<Vec<String>>, String> {
     use tauri_plugin_dialog::DialogExt;
+
+    let restore_on_top = state.settings.lock().map(|s| s.always_on_top).unwrap_or(true);
+    set_main_on_top(&app, false);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<Vec<std::path::PathBuf>>>();
     app.dialog()
@@ -651,9 +666,9 @@ async fn pick_audio_files(app: AppHandle) -> Result<Option<Vec<String>>, String>
             }));
         });
 
-    let paths = rx
-        .await
-        .map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string())?;
+    let paths = rx.await.map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string());
+    set_main_on_top(&app, restore_on_top);
+    let paths = paths?;
     Ok(paths.map(|ps| ps.iter().map(|p| p.to_string_lossy().to_string()).collect()))
 }
 
@@ -999,6 +1014,7 @@ fn sanitize_filename(name: &str) -> String {
 #[tauri::command]
 async fn export_history(
     app: AppHandle,
+    state: State<'_, AppState>,
     items: Vec<export::HistoryItem>,
     format: String,
     suggested_name: Option<String>,
@@ -1022,6 +1038,10 @@ async fn export_history(
         None => format!("hebrew-dictation-history_{}.{}", timestamp, extension),
     };
 
+    // Drop always-on-top so the save dialog isn't hidden behind the main window.
+    let restore_on_top = state.settings.lock().map(|s| s.always_on_top).unwrap_or(true);
+    set_main_on_top(&app, false);
+
     // tauri-plugin-dialog `save` is callback-based — wrap it in a oneshot channel.
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
     app.dialog()
@@ -1037,9 +1057,9 @@ async fn export_history(
             let _ = tx.send(path);
         });
 
-    let path = rx
-        .await
-        .map_err(|_| "דיאלוג השמירה נסגר ללא תגובה".to_string())?;
+    let path = rx.await.map_err(|_| "דיאלוג השמירה נסגר ללא תגובה".to_string());
+    set_main_on_top(&app, restore_on_top);
+    let path = path?;
     let path = match path {
         Some(p) => p,
         None => return Err("הייצוא בוטל".to_string()),

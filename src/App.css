@@ -1774,6 +1774,21 @@ body:has(.toolbar-idle) #root {
   flex-wrap: wrap;
   justify-content: center;
 }
+/* Persistent action row pinned near the top of the batch view. */
+.batch-actions-top {
+  display: flex;
+  gap: 0.6rem;
+  margin: 0.25rem 0 0.75rem;
+}
+.batch-actions-top button {
+  flex: 1;
+  padding: 0.5rem 0.8rem;
+}
+.batch-export-all-label {
+  font-size: 0.78rem;
+  color: #888;
+  align-self: center;
+}
 .batch-pick-btn,
 .batch-record-btn {
   padding: 0.65rem 1.4rem;
@@ -1985,19 +2000,16 @@ body:has(.toolbar-idle) #root {
   margin-top: 0.5rem;
 }
 
-/* Bottom action bar */
+/* Bottom action bar — normal flow below the results (was sticky with a
+   negative bottom margin, which overlapped and cut into the last card). */
 .batch-action-bar {
-  position: sticky;
-  bottom: 0;
-  background: #1a1a2e;
   border-top: 1px solid #2a3a5e;
-  padding: 0.6rem 0;
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
   align-items: center;
-  margin: 0 -1.2rem -5rem;
-  padding: 0.6rem 1.2rem;
+  margin: 0.75rem -1.2rem 0;
+  padding: 0.6rem 1.2rem 0;
 }
 .batch-clear-btn {
   margin-right: auto;
@@ -2045,8 +2057,12 @@ body:has(.toolbar-idle) #root {
 /* Per-mode accent colors (brand: teal + gold) so the two entries read as
    distinct actions rather than one repeated button. Placed after the base
    :hover so they win on source order. */
-.btn-mode-rec { color: #2dd4bf; border-color: #2dd4bf55; }
-.btn-mode-rec:hover { background: #10302c; border-color: #2dd4bf; }
-.btn-mode-files { color: #f5b942; border-color: #f5b94255; }
-.btn-mode-files:hover { background: #2e2610; border-color: #f5b942; }
+/* Single combined entry to the unified files+recording screen. */
+.btn-mode-combined {
+  color: #2dd4bf;
+  border-color: #2dd4bf55;
+  white-space: normal;
+  line-height: 1.25;
+}
+.btn-mode-combined:hover { background: #10302c; border-color: #2dd4bf; }
 
