@@ -112,8 +112,9 @@ File upload → transcribe (cloud Deepgram **or** local whisper, offline) → ed
 - `restore_recorder_settings` silently no-ops on lock poison → use `unwrap_or_else(|e| e.into_inner())` (pattern already used elsewhere in lib.rs).
 - Remaining English error strings in deep-internal paths (see "Deferred / low-priority" below).
 
-## Future feature ideas (Henry — not scheduled)
-- **English → Hebrew transcription:** upload/dictate in English and have it auto-transcribe into Hebrew (i.e. transcribe + translate). Requested 2026-06-30 during the UI pass; explicitly deferred — do NOT build now.
+## Roadmap — next version (Henry-confirmed 2026-07-02, not scheduled)
+- **SRT export:** per-item subtitle export. Needs per-segment timestamps threaded through the transcription pipeline — Deepgram batch + whisper both produce them, but `transcribe_file` currently returns a plain `String` and discards them. Real feature (change return types + build SRT), not a quick patch.
+- **English → Hebrew translation:** upload/dictate in English and have it auto-transcribe + translate into Hebrew.
 
 ## Deferred / low-priority
 - Remaining **English** error strings in deep-internal paths users rarely hit (audio.rs stream init L145-285, settings.rs serialize L427-432, streaming.rs WS L46-96, injector.rs). Translate opportunistically; not urgent.
