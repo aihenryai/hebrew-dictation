@@ -131,7 +131,7 @@ Mirrors `export_history`'s early-return guard (`lib.rs:1024-1026`): if `items`
 is empty, or every inner `Vec` is empty (zero cues total), return a clear
 Hebrew error instead of writing a 0-byte/malformed SRT. Must also be added to
 the `tauri::generate_handler!` command list alongside the other commands
-(`lib.rs:1671-1684`).
+(`lib.rs:1637-1686`, `export_history` itself registered at `lib.rs:1679`).
 
 For a single-item call, `items.len() == 1`. For the combined export, the
 frontend passes all done items' segments in order; the backend computes each
