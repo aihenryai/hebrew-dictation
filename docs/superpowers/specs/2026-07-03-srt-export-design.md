@@ -55,8 +55,11 @@ pub struct TimedSegment {
 
 **Deepgram (`api_transcribe.rs::transcribe_deepgram_batch`):** the API already
 returns `results.channels[0].alternatives[0].words[]`, each `{word, start, end,
-punctuated_word?}` in seconds — no request-side change needed. Add a pure,
-testable chunking function:
+punctuated_word?}` in **floating-point seconds** — no request-side change
+needed (`words` is present by default, no `words=true` param required).
+Convert to `TimedSegment`'s `u64` millisecond fields via `(secs * 1000.0) as
+u64` — a different conversion from whisper's centisecond×10 below; don't
+conflate the two when implementing. Add a pure, testable chunking function:
 
 ```rust
 pub fn chunk_words_to_cues(words: &[DeepgramWord], max_words: usize, max_ms: u64) -> Vec<TimedSegment>
@@ -81,10 +84,32 @@ Then iterate `state.get_segment(i)` as today, but also read
 `segment.start_timestamp()` / `end_timestamp()` (centiseconds → ×10 for ms) per
 segment to build `Vec<TimedSegment>` alongside the concatenated text.
 
-**Open risk to verify at runtime:** flipping `no_timestamps` from `true`→`false`
-changes whisper.cpp's decoding behavior (it now predicts timestamp tokens). Must
-confirm this doesn't measurably hurt transcription accuracy or speed on a real
-Hebrew recording before release.
+**Open risk to verify at runtime, with fallback:** flipping `no_timestamps` from
+`true`→`false` changes whisper.cpp's decoding behavior (it now predicts
+timestamp tokens) for **every** local batch transcription, not just ones headed
+to SRT — a regression here would silently degrade the core transcription
+feature. Must confirm in manual testing (see Testing) that this doesn't
+measurably hurt accuracy or speed on a real Hebrew recording before release.
+**Fallback if it does regress:** keep `no_timestamps(true)` for the main decode
+(untouched, zero risk to existing behavior) and instead enable
+`set_token_timestamps(true)` — whisper.cpp's cross-attention-based per-token
+timing, which is independent of decoder-predicted timestamp tokens. Build
+`TimedSegment`s by grouping the resulting per-token times with the same
+`chunk_words_to_cues`-style word/duration bucketing already used for Deepgram,
+instead of relying on whisper.cpp's own `max_len`/`split_on_word` segmentation.
+This confines the fallback to the SRT-timing path only.
+
+**Cue-length parity between routes:** Deepgram cues are bucketed by an explicit
+word/time budget (~10 words / ~4s). Whisper cues are bucketed by whisper.cpp's
+own character-length cap (`max_len`, script-agnostic character count, not a
+word count). These are two different proxies for the same goal — readable cue
+duration — and won't produce identical cue boundaries for equivalent speech;
+this is accepted for v1. The `max_len(42)` constant is the classic subtitle
+line-length convention (chosen for reading-speed readability, the same reason
+behind the ~10-word/~4s target), not a value re-derived word-by-word from the
+Deepgram target — sanity-check during manual testing that whisper cues land in
+a comparable ballpark (roughly 7-10 Hebrew words per cue) and adjust `max_len`
+if they're consistently much shorter or longer.
 
 ### 2. New Tauri command: `export_srt`
 
@@ -101,6 +126,12 @@ async fn export_srt(
     suggested_name: Option<String>,
 ) -> Result<String, String>
 ```
+
+Mirrors `export_history`'s early-return guard (`lib.rs:1024-1026`): if `items`
+is empty, or every inner `Vec` is empty (zero cues total), return a clear
+Hebrew error instead of writing a 0-byte/malformed SRT. Must also be added to
+the `tauri::generate_handler!` command list alongside the other commands
+(`lib.rs:1671-1684`).
 
 For a single-item call, `items.len() == 1`. For the combined export, the
 frontend passes all done items' segments in order; the backend computes each
@@ -127,6 +158,16 @@ rendering concern, this is plain text).
     `generateExportName` used for combined TXT/DOCX today.
 - The SRT button is hidden/disabled when `segments` is empty or absent
   (defensive — protects a future route that might not populate timing).
+- **Edited-transcript desync:** the result card's `<textarea>` already lets the
+  user hand-edit `result.transcript` (`onChange` writes straight to
+  `transcript`); `segments` are derived from the original ASR output and are
+  never re-synced to those edits. Exporting SRT after an edit would silently
+  ship stale (pre-edit) text/timing while TXT/DOCX would reflect the edit.
+  Fix: set a per-item `edited: true` flag the first time the textarea's
+  `onChange` fires, and treat that the same as "no segments" — hide/disable
+  the SRT button for that item once edited (TXT/DOCX stay unaffected, since
+  they already export the live `transcript` string). Out of scope: re-timing
+  edited text — not possible without re-running ASR.
 
 ## Testing
 
