@@ -1085,6 +1085,59 @@ async fn export_history(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// `items` is one Vec<TimedSegment> per source file, in original order — a
+/// single-file export is `items.len() == 1`; a combined export lists every
+/// done file's cues so `srt::render_srt` can offset and renumber them.
+/// `suggested_name` is an optional content-derived filename (no extension);
+/// falls back to a timestamp, matching `export_history`'s convention.
+#[tauri::command]
+async fn export_srt(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    items: Vec<Vec<srt::TimedSegment>>,
+    suggested_name: Option<String>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    if items.is_empty() || items.iter().all(|f| f.is_empty()) {
+        return Err("אין כתוביות לייצוא — תמלל קודם קובץ אודיו/וידאו.".to_string());
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M");
+    let default_name = match suggested_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(name) => format!("{}.srt", sanitize_filename(name)),
+        None => format!("hebrew-dictation-subtitles_{}.srt", timestamp),
+    };
+
+    let restore_on_top = state.settings.lock().map(|s| s.always_on_top).unwrap_or(true);
+    set_main_on_top(&app, false);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+    app.dialog()
+        .file()
+        .set_title("שמור כתוביות כקובץ SRT")
+        .set_file_name(&default_name)
+        .add_filter("כתוביות SRT", &["srt"])
+        .save_file(move |result| {
+            let path = result.and_then(|fp| fp.into_path().ok());
+            let _ = tx.send(path);
+        });
+
+    let path = rx.await.map_err(|_| "דיאלוג השמירה נסגר ללא תגובה".to_string());
+    set_main_on_top(&app, restore_on_top);
+    let path = path?;
+    let path = match path {
+        Some(p) => p,
+        None => return Err("הייצוא בוטל".to_string()),
+    };
+
+    let content = srt::render_srt(&items);
+    std::fs::write(&path, content.as_bytes())
+        .map_err(|e| format!("שגיאה בכתיבת קובץ SRT: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn get_audio_devices() -> Result<Vec<String>, String> {
     use cpal::traits::{DeviceTrait, HostTrait};
@@ -1688,6 +1741,7 @@ pub fn run() {
             pick_audio_file,
             pick_audio_files,
             export_history,
+            export_srt,
             get_audio_devices,
             set_window_always_on_top,
             set_autostart_enabled,
