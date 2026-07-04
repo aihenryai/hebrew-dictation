@@ -43,6 +43,11 @@ const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
 type AppStatus = "idle" | "recording" | "transcribing" | "enhancing" | "downloading" | "loading-model";
 type AppView = "main" | "settings" | "onboarding" | "batch";
 type BatchFileStatus = "pending" | "processing" | "done" | "cancelled" | "error";
+interface TimedSegment {
+  text: string;
+  start_ms: number;
+  end_ms: number;
+}
 interface BatchResult {
   id: number;
   fileName: string;
@@ -50,6 +55,10 @@ interface BatchResult {
   transcript: string;
   status: BatchFileStatus;
   error?: string;
+  segments?: TimedSegment[];
+  /** True once the user hand-edits `transcript` in the textarea — segments
+   * no longer match the (unedited) text, so SRT export is hidden for this item. */
+  edited?: boolean;
 }
 let batchIdCounter = 0;
 type Language = "he" | "en" | "multi";
@@ -967,12 +976,12 @@ function App() {
       );
 
       try {
-        const text = await invoke<string>("transcribe_file", {
-          filePath: initial[i].filePath,
-          opts: { mode: batchMode, language: "he", inject: false },
-        });
+        const { text, segments } = await invoke<{ text: string; segments: TimedSegment[] }>(
+          "transcribe_file",
+          { filePath: initial[i].filePath, opts: { mode: batchMode, language: "he", inject: false } }
+        );
         setBatchResults((prev) =>
-          prev.map((r) => r.id === curId ? { ...r, status: "done", transcript: text } : r)
+          prev.map((r) => r.id === curId ? { ...r, status: "done", transcript: text, segments } : r)
         );
       } catch (e) {
         const msg = String(e);
@@ -1057,11 +1066,11 @@ function App() {
     setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "processing" } : r));
 
     try {
-      const text = await invoke<string>("transcribe_file", {
-        filePath,
-        opts: { mode: batchMode, language: "he", inject: false },
-      });
-      setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "done", transcript: text } : r));
+      const { text, segments } = await invoke<{ text: string; segments: TimedSegment[] }>(
+        "transcribe_file",
+        { filePath, opts: { mode: batchMode, language: "he", inject: false } }
+      );
+      setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "done", transcript: text, segments } : r));
     } catch (e) {
       const msg = String(e);
       if (msg === "בוטל" || batchCancelledRef.current) {
@@ -1095,6 +1104,12 @@ function App() {
     return first ? firstWordsName(first.transcript) : "";
   };
 
+  /** True when a batch item has usable timed segments for SRT export (done, not
+   * hand-edited since transcription, and has at least one segment). Single source
+   * of truth — used by the per-item button, the combined button, and exportBatchSrt. */
+  const isSrtEligible = (r: BatchResult): boolean =>
+    r.status === "done" && !r.edited && !!r.segments && r.segments.length > 0;
+
   // Per-item export: save a single transcript segment to TXT/DOCX, named by content.
   const exportSingle = useCallback(async (
     text: string,
@@ -1122,6 +1137,38 @@ function App() {
       const items = done.map((r) => ({ text: r.transcript, timestamp: new Date().toISOString() }));
       const suggested_name = generateExportName(done);
       const path = await invoke<string>("export_history", { items, format, suggested_name });
+      setExportNotice(`✅ נשמר: ${path}`);
+      window.setTimeout(() => setExportNotice(null), 6000);
+    } catch (e) {
+      const msg = String(e);
+      if (!msg.includes("הייצוא בוטל")) setBatchError(`ייצוא נכשל: ${msg}`);
+    }
+  }, [batchResults]);
+
+  const exportSingleSrt = useCallback(async (
+    segments: TimedSegment[],
+    transcriptForName: string,
+    onErr: (msg: string) => void,
+  ) => {
+    if (segments.length === 0) return;
+    try {
+      await invoke<string>("export_srt", {
+        items: [segments],
+        suggested_name: firstWordsName(transcriptForName),
+      });
+    } catch (e) {
+      const msg = String(e);
+      if (!msg.includes("הייצוא בוטל")) onErr(`ייצוא נכשל: ${msg}`);
+    }
+  }, []);
+
+  const exportBatchSrt = useCallback(async () => {
+    const eligible = batchResults.filter(isSrtEligible);
+    if (eligible.length === 0) return;
+    try {
+      const items = eligible.map((r) => r.segments!);
+      const suggested_name = generateExportName(eligible);
+      const path = await invoke<string>("export_srt", { items, suggested_name });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
@@ -2440,7 +2487,7 @@ function App() {
                       onChange={(e) => {
                         const val = e.target.value;
                         setBatchResults((prev) =>
-                          prev.map((r, i) => i === idx ? { ...r, transcript: val } : r)
+                          prev.map((r, i) => i === idx ? { ...r, transcript: val, edited: true } : r)
                         );
                       }}
                       rows={5}
@@ -2475,6 +2522,15 @@ function App() {
                       >
                         📝 Word
                       </button>
+                      {isSrtEligible(result) && (
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => exportSingleSrt(result.segments!, result.transcript, setBatchError)}
+                          title="ייצוא כתוביות SRT למקטע זה"
+                        >
+                          🎬 SRT
+                        </button>
+                      )}
                     </div>
                   </div>
                 )}
@@ -2491,6 +2547,9 @@ function App() {
                 <span className="batch-export-all-label">ייצוא הכל:</span>
                 <button className="btn-secondary btn-sm" onClick={() => exportBatch("txt")}>📄 TXT</button>
                 <button className="btn-secondary btn-sm" onClick={() => exportBatch("docx")}>📝 Word</button>
+                {batchResults.filter(isSrtEligible).length > 1 && (
+                  <button className="btn-secondary btn-sm" onClick={() => exportBatchSrt()}>🎬 SRT</button>
+                )}
               </>
             )}
             <button className="btn-secondary btn-sm batch-clear-btn" onClick={() => setBatchResults([])}>נקה</button>
