@@ -413,12 +413,12 @@ async fn run_transcribe_file(
 
             let notify = state.batch_cancel_notify.clone();
             let fut = api_transcribe::transcribe_deepgram_batch(&client, &samples, &key, &opts.language);
-            let text = tokio::select! {
+            let (text, segments) = tokio::select! {
                 r = fut => r.map_err(|e| e.to_string())?,
                 _ = notify.notified() => return Err(batch::CANCELLED.to_string()),
             };
             let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
-            Ok(text)
+            Ok(TranscribeFileResult { text, segments })
         }
         batch::BatchRoute::Local => {
             // Lock the engine ONLY to create a fresh state, then drop it so the

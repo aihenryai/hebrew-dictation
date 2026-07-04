@@ -254,7 +254,7 @@ pub(crate) async fn transcribe_deepgram_batch(
     samples: &[f32],
     api_key: &str,
     language: &str,
-) -> Result<String, ApiError> {
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
     let lang = if language == "auto" { "he" } else { language };
     let url = format!(
@@ -292,7 +292,35 @@ pub(crate) async fn transcribe_deepgram_batch(
         .trim()
         .to_string();
 
-    Ok(transcript)
+    // words[] is present by default (no extra request param needed), each
+    // {word, start, end, punctuated_word?} with start/end in fractional seconds.
+    let words: Vec<crate::srt::TimedWord> = alt["words"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| {
+                    let text = w["punctuated_word"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| w["word"].as_str())?;
+                    let start = w["start"].as_f64()?;
+                    let end = w["end"].as_f64()?;
+                    Some(crate::srt::TimedWord {
+                        text: text.to_string(),
+                        start_ms: (start * 1000.0).round() as u64,
+                        end_ms: (end * 1000.0).round() as u64,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let segments = crate::srt::chunk_words_to_cues(
+        &words,
+        crate::srt::SRT_MAX_WORDS_PER_CUE,
+        crate::srt::SRT_MAX_MS_PER_CUE,
+    );
+
+    Ok((transcript, segments))
 }
 
 // ── Unified entry point ──
