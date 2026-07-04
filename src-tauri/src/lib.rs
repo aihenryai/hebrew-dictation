@@ -447,7 +447,7 @@ async fn run_transcribe_file(
             let cancel = state.batch_cancel.clone();
             let lang = opts.language.clone();
             let samples_owned = samples;
-            let text = tokio::task::spawn_blocking(move || {
+            let (text, segments) = tokio::task::spawn_blocking(move || {
                 whisper::run_long_transcription(
                     wstate,
                     &model_name,
@@ -464,7 +464,7 @@ async fn run_transcribe_file(
 
             progress_task.abort();
             let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
-            Ok(text)
+            Ok(TranscribeFileResult { text, segments })
         }
     }
 }

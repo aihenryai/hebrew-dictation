@@ -183,7 +183,7 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
     language: &str,
     cancel: Arc<AtomicBool>,
     on_progress: F,
-) -> Result<String, String> {
+) -> Result<(String, Vec<crate::srt::TimedSegment>), String> {
     // ivrit.ai models require the language token forced to Hebrew.
     let effective_lang = if model_name.starts_with("ivrit-") {
         "he".to_string()
@@ -198,7 +198,15 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
         params.set_language(Some(&effective_lang));
     }
     params.set_translate(false);
-    params.set_no_timestamps(true);
+    // SRT needs real segment timing (was `true`) — see spec's "Open risk to
+    // verify at runtime, with fallback" if this regresses accuracy/speed.
+    params.set_no_timestamps(false);
+    // whisper.cpp's own SRT-chunking mechanism (same as its `--max-len` CLI
+    // flag): caps each segment's length and never cuts mid-word, so
+    // get_segment/start_timestamp/end_timestamp below already come back
+    // pre-chunked into short, readable cues — no token-level API needed.
+    params.set_max_len(42);
+    params.set_split_on_word(true);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
@@ -224,12 +232,29 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
 
     let n = state.full_n_segments();
     let mut text = String::new();
+    let mut segments = Vec::new();
     for i in 0..n {
         if let Some(segment) = state.get_segment(i) {
             if let Ok(s) = segment.to_str_lossy() {
-                text.push_str(&s);
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    text.push_str(&s);
+                    // start_timestamp/end_timestamp are in centiseconds (10ms units).
+                    let start_raw = segment.start_timestamp();
+                    let end_raw = segment.end_timestamp();
+                    if start_raw < 0 || end_raw < 0 {
+                        eprintln!(
+                            "whisper: negative segment timestamp (start={start_raw}, end={end_raw}) at segment {i}, clamping to 0"
+                        );
+                    }
+                    segments.push(crate::srt::TimedSegment {
+                        text: trimmed.to_string(),
+                        start_ms: (start_raw.max(0) as u64) * 10,
+                        end_ms: (end_raw.max(0) as u64) * 10,
+                    });
+                }
             }
         }
     }
-    Ok(text.trim().to_string())
+    Ok((text.trim().to_string(), segments))
 }
