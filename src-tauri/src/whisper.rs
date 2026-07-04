@@ -237,6 +237,10 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
         if let Some(segment) = state.get_segment(i) {
             if let Ok(s) = segment.to_str_lossy() {
                 let trimmed = s.trim();
+                // Skipping whitespace-only segments here also intentionally affects
+                // the plain-text output (not just `segments`) — a whitespace-only
+                // segment previously contributed nothing meaningful anyway, so this
+                // just avoids inserting an extra space into `text` at its position.
                 if !trimmed.is_empty() {
                     text.push_str(&s);
                     // start_timestamp/end_timestamp are in centiseconds (10ms units).
