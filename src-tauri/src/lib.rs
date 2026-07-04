@@ -8,6 +8,7 @@ mod injector;
 mod model;
 mod secure_keys;
 mod settings;
+mod srt;
 mod streaming;
 mod whisper;
 
