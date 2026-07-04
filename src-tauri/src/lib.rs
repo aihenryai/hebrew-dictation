@@ -327,13 +327,23 @@ async fn enhance_text(
 
 // ── Batch transcription (file upload → cloud Deepgram / local whisper) ──
 
+/// Response shape for `transcribe_file`: the plain transcript (unchanged
+/// consumer for inject/copy/TXT/DOCX) plus timed cues for SRT export.
+/// `segments` is empty only if a route produced no timed cues (defensive —
+/// the frontend treats empty `segments` as "SRT unavailable for this item").
+#[derive(Debug, Clone, serde::Serialize)]
+struct TranscribeFileResult {
+    text: String,
+    segments: Vec<srt::TimedSegment>,
+}
+
 #[tauri::command]
 async fn transcribe_file(
     app: AppHandle,
     state: State<'_, AppState>,
     file_path: String,
     opts: batch::BatchOpts,
-) -> Result<String, String> {
+) -> Result<TranscribeFileResult, String> {
     // One batch at a time.
     if state.batch_in_progress.swap(true, Ordering::SeqCst) {
         return Err("תמלול ארוך כבר רץ — המתן לסיומו או בטל אותו".to_string());
@@ -349,7 +359,7 @@ async fn run_transcribe_file(
     state: &State<'_, AppState>,
     file_path: String,
     opts: batch::BatchOpts,
-) -> Result<String, String> {
+) -> Result<TranscribeFileResult, String> {
     // 0) Fail fast: cloud mode needs a Deepgram key — check BEFORE the (possibly long)
     //    decode so the user isn't made to wait only to learn a key is missing.
     if matches!(batch::pick_batch_route(&opts.mode), batch::BatchRoute::CloudDeepgram) {
