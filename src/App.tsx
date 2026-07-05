@@ -7,7 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.10.1";
+const APP_VERSION = "v2.11.0";
 const APP_LICENSE = "MIT";
 
 /** Hebrew label for a batch-transcription progress stage. */
