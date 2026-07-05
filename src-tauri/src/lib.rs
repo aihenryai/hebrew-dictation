@@ -971,17 +971,22 @@ fn accept_terms(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
-    // Hide any of our own windows that might currently hold OS focus, so the
-    // simulated typing doesn't land in our own webview instead of the user's
-    // target app. Two windows can end up holding focus here:
-    // - "main": the primary app window flow (original case this handled).
-    // - "toolbar": the floating idle-button/recording-bar window — a mouse
-    //   click on it (e.g. starting dictation from the idle circle) activates
-    //   it like any normal window, and `hide_toolbar_window` already brings
-    //   the idle circle back on screen well before transcription finishes,
-    //   so it can easily still hold focus by the time we get here.
+/// Hide any of our own windows that might currently hold OS focus, inject
+/// `text` via simulated typing, then restore whichever window(s) were hidden.
+/// Shared by the `inject_text` command (short/batch dictation) AND
+/// `streaming::handle_message`'s live per-segment injection — both need this,
+/// not just the command, or a window that stole focus (e.g. a mouse click on
+/// the floating idle button) swallows the paste into our own webview instead
+/// of the user's target app. Two windows can end up holding focus:
+/// - "main": the primary app window flow (original case this handled).
+/// - "toolbar": the floating idle-button/recording-bar window — a mouse
+///   click on it (e.g. starting dictation from the idle circle) activates
+///   it like any normal window, and it can still hold focus well after that,
+///   including throughout an entire streaming session (the bar stays shown).
+///
+/// Blocking (uses `std::thread::sleep`) — callers on the async runtime must
+/// run this via `spawn_blocking` (see `streaming::handle_message`).
+pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), String> {
     let main_window = app.get_webview_window("main");
     let toolbar_window = app.get_webview_window("toolbar");
 
@@ -1009,7 +1014,7 @@ fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
 
-    let result = injector::inject_text(&text, &injector::InjectionMethod::Clipboard);
+    let result = injector::inject_text(text, &injector::InjectionMethod::Clipboard);
 
     if main_was_visible {
         if let Some(w) = &main_window {
@@ -1023,6 +1028,11 @@ fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     }
 
     result
+}
+
+#[tauri::command]
+fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
+    inject_text_defocused(&app, &text)
 }
 
 /// Export the user's dictation history to a TXT or DOCX file. The frontend

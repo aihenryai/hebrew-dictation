@@ -151,13 +151,16 @@ async fn handle_message(raw: &str, final_text: &Arc<Mutex<String>>, app: &AppHan
     if is_final {
         // Inject this segment into the active text field immediately so the user
         // sees dictation appear in their target app as they speak (live streaming).
-        // A trailing space separates consecutive segments.
+        // A trailing space separates consecutive segments. Goes through
+        // `inject_text_defocused` (not the raw injector) — the floating
+        // toolbar/idle-button window can hold OS focus for the entire
+        // streaming session (e.g. after a mouse click started it), so every
+        // segment needs the same defocus-before-typing treatment the
+        // non-streaming `inject_text` command already gets.
         let to_inject = format!("{} ", transcript);
+        let app_for_inject = app.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = crate::injector::inject_text(
-                &to_inject,
-                &crate::injector::InjectionMethod::Clipboard,
-            );
+            let _ = crate::inject_text_defocused(&app_for_inject, &to_inject);
         })
         .await;
 
