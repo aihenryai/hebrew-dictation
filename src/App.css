@@ -1996,8 +1996,13 @@ body:has(.toolbar-idle) #root {
 }
 .batch-file-actions {
   display: flex;
+  flex-direction: column;
   gap: 0.4rem;
   margin-top: 0.5rem;
+}
+.batch-file-actions-row {
+  display: flex;
+  gap: 0.4rem;
 }
 
 /* Bottom action bar — normal flow below the results (was sticky with a

@@ -2494,43 +2494,47 @@ function App() {
                       aria-label={`תמלול ${result.fileName}`}
                     />
                     <div className="batch-file-actions">
-                      <button
-                        className="btn-secondary btn-sm"
-                        onClick={() => injectText(result.transcript)}
-                        title="הדבק בשדה הפעיל"
-                      >
-                        ⌨️ הדבק בחלון הפעיל
-                      </button>
-                      <button
-                        className="btn-secondary btn-sm"
-                        onClick={() => navigator.clipboard.writeText(result.transcript)}
-                        title="העתק"
-                      >
-                        📋 העתק
-                      </button>
-                      <button
-                        className="btn-secondary btn-sm"
-                        onClick={() => exportSingle(result.transcript, "txt", setBatchError)}
-                        title="ייצוא מקטע זה כקובץ טקסט"
-                      >
-                        📄 TXT
-                      </button>
-                      <button
-                        className="btn-secondary btn-sm"
-                        onClick={() => exportSingle(result.transcript, "docx", setBatchError)}
-                        title="ייצוא מקטע זה כמסמך Word"
-                      >
-                        📝 Word
-                      </button>
-                      {isSrtEligible(result) && (
+                      <div className="batch-file-actions-row">
                         <button
                           className="btn-secondary btn-sm"
-                          onClick={() => exportSingleSrt(result.segments!, result.transcript, setBatchError)}
-                          title="ייצוא כתוביות SRT למקטע זה"
+                          onClick={() => injectText(result.transcript)}
+                          title="הדבק בשדה הפעיל"
                         >
-                          🎬 SRT
+                          ⌨️ הדבק בחלון הפעיל
                         </button>
-                      )}
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => navigator.clipboard.writeText(result.transcript)}
+                          title="העתק"
+                        >
+                          📋 העתק
+                        </button>
+                      </div>
+                      <div className="batch-file-actions-row">
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => exportSingle(result.transcript, "txt", setBatchError)}
+                          title="ייצוא מקטע זה כקובץ טקסט"
+                        >
+                          📄 TXT
+                        </button>
+                        <button
+                          className="btn-secondary btn-sm"
+                          onClick={() => exportSingle(result.transcript, "docx", setBatchError)}
+                          title="ייצוא מקטע זה כמסמך Word"
+                        >
+                          📝 Word
+                        </button>
+                        {isSrtEligible(result) && (
+                          <button
+                            className="btn-secondary btn-sm"
+                            onClick={() => exportSingleSrt(result.segments!, result.transcript, setBatchError)}
+                            title="ייצוא כתוביות SRT למקטע זה"
+                          >
+                            🎬 SRT
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 )}
