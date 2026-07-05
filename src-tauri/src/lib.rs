@@ -973,26 +973,51 @@ fn accept_terms(state: State<AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
-    // Hide the main window briefly so its focus doesn't capture the simulated Ctrl+V.
-    // Without this, a focused Tauri window swallows the paste and nothing lands in the target app.
+    // Hide any of our own windows that might currently hold OS focus, so the
+    // simulated typing doesn't land in our own webview instead of the user's
+    // target app. Two windows can end up holding focus here:
+    // - "main": the primary app window flow (original case this handled).
+    // - "toolbar": the floating idle-button/recording-bar window — a mouse
+    //   click on it (e.g. starting dictation from the idle circle) activates
+    //   it like any normal window, and `hide_toolbar_window` already brings
+    //   the idle circle back on screen well before transcription finishes,
+    //   so it can easily still hold focus by the time we get here.
     let main_window = app.get_webview_window("main");
-    let was_visible = main_window
+    let toolbar_window = app.get_webview_window("toolbar");
+
+    let main_was_visible = main_window
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+    let toolbar_was_visible = toolbar_window
         .as_ref()
         .and_then(|w| w.is_visible().ok())
         .unwrap_or(false);
 
-    if was_visible {
+    if main_was_visible {
         if let Some(w) = &main_window {
             let _ = w.hide();
         }
+    }
+    if toolbar_was_visible {
+        if let Some(w) = &toolbar_window {
+            let _ = w.hide();
+        }
+    }
+    if main_was_visible || toolbar_was_visible {
         // Let Windows promote the previously-active window to the foreground.
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
 
     let result = injector::inject_text(&text, &injector::InjectionMethod::Clipboard);
 
-    if was_visible {
+    if main_was_visible {
         if let Some(w) = &main_window {
+            let _ = w.show();
+        }
+    }
+    if toolbar_was_visible {
+        if let Some(w) = &toolbar_window {
             let _ = w.show();
         }
     }
