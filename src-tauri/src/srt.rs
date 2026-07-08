@@ -11,6 +11,13 @@ pub struct TimedSegment {
     pub text: String,
     pub start_ms: u64,
     pub end_ms: u64,
+    /// Diarization speaker index (0-based, from Deepgram `diarize=true`).
+    /// `None` when diarization is off or unavailable (local whisper never
+    /// sets it). `#[serde(default)]` so cues produced by routes that don't
+    /// set it — or serialized before this field existed — round-trip through
+    /// the frontend and back into `export_srt` without a missing-field error.
+    #[serde(default)]
+    pub speaker: Option<u32>,
 }
 
 /// A single transcribed word with its timing, as reported by Deepgram's
@@ -20,6 +27,9 @@ pub struct TimedWord {
     pub text: String,
     pub start_ms: u64,
     pub end_ms: u64,
+    /// Diarization speaker index for this word (0-based), when Deepgram's
+    /// `diarize=true` is active; `None` otherwise.
+    pub speaker: Option<u32>,
 }
 
 /// Target cue size (see spec's "Cue-length parity between routes" note —
@@ -40,7 +50,12 @@ pub fn chunk_words_to_cues(words: &[TimedWord], max_words: usize, max_ms: u64) -
     for w in words {
         if !current.is_empty() {
             let span = w.end_ms.saturating_sub(current[0].start_ms);
-            if current.len() >= max_words || span > max_ms {
+            // A cue belongs to one speaker: force a flush when the speaker
+            // changes. With diarization off every word is `None`, so
+            // `None != None` is false and this never triggers — behavior
+            // identical to before.
+            let speaker_changed = w.speaker != current[0].speaker;
+            if current.len() >= max_words || span > max_ms || speaker_changed {
                 cues.push(flush_cue(&current));
                 current.clear();
             }
@@ -58,6 +73,9 @@ fn flush_cue(words: &[&TimedWord]) -> TimedSegment {
         text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
         start_ms: words.first().map(|w| w.start_ms).unwrap_or(0),
         end_ms: words.last().map(|w| w.end_ms).unwrap_or(0),
+        // All words in a cue share a speaker (chunk_words_to_cues splits on
+        // change), so the first word's speaker labels the whole cue.
+        speaker: words.first().and_then(|w| w.speaker),
     }
 }
 
@@ -82,6 +100,15 @@ pub fn render_srt(files: &[Vec<TimedSegment>]) -> String {
     let mut offset_ms: u64 = 0;
 
     for cues in files {
+        // Label speakers only when this file actually has ≥2 of them: single-
+        // speaker dictation stays byte-for-byte clean, while a multi-speaker
+        // call/interview gets "דובר N:" prefixes automatically — no toggle.
+        // Counted per file (not per document) so a clean file in a mixed batch
+        // export isn't labeled just because a sibling file had two speakers.
+        let distinct_speakers: std::collections::BTreeSet<u32> =
+            cues.iter().filter_map(|c| c.speaker).collect();
+        let label_speakers = distinct_speakers.len() >= 2;
+
         for cue in cues {
             out.push_str(&index.to_string());
             out.push('\n');
@@ -89,6 +116,12 @@ pub fn render_srt(files: &[Vec<TimedSegment>]) -> String {
             out.push_str(" --> ");
             out.push_str(&format_srt_timestamp(cue.end_ms + offset_ms));
             out.push('\n');
+            // Deepgram speaker indices are 0-based; display them 1-based.
+            if label_speakers {
+                if let Some(spk) = cue.speaker {
+                    out.push_str(&format!("דובר {}: ", spk + 1));
+                }
+            }
             out.push_str(&cue.text);
             out.push_str("\n\n");
             index += 1;
@@ -104,7 +137,11 @@ mod tests {
     use super::*;
 
     fn word(text: &str, start_ms: u64, end_ms: u64) -> TimedWord {
-        TimedWord { text: text.to_string(), start_ms, end_ms }
+        TimedWord { text: text.to_string(), start_ms, end_ms, speaker: None }
+    }
+
+    fn word_spk(text: &str, start_ms: u64, end_ms: u64, speaker: Option<u32>) -> TimedWord {
+        TimedWord { text: text.to_string(), start_ms, end_ms, speaker }
     }
 
     #[test]
@@ -147,6 +184,23 @@ mod tests {
     }
 
     #[test]
+    fn chunk_splits_when_speaker_changes() {
+        // Two speakers within the same time/word budget must NOT share a cue —
+        // a cue belongs to exactly one speaker, and its `speaker` is recorded.
+        let words = vec![
+            word_spk("שלום", 0, 500, Some(0)),
+            word_spk("עולם", 500, 1000, Some(0)),
+            word_spk("היי", 1000, 1500, Some(1)),
+        ];
+        let cues = chunk_words_to_cues(&words, 10, 4000);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].speaker, Some(0));
+        assert_eq!(cues[0].text, "שלום עולם");
+        assert_eq!(cues[1].speaker, Some(1));
+        assert_eq!(cues[1].text, "היי");
+    }
+
+    #[test]
     fn format_timestamp_zero() {
         assert_eq!(format_srt_timestamp(0), "00:00:00,000");
     }
@@ -164,7 +218,7 @@ mod tests {
 
     #[test]
     fn render_single_file_zero_offset() {
-        let file = vec![TimedSegment { text: "היי".to_string(), start_ms: 0, end_ms: 900 }];
+        let file = vec![TimedSegment { text: "היי".to_string(), start_ms: 0, end_ms: 900, speaker: None }];
         let srt = render_srt(&[file]);
         assert_eq!(srt, "1\n00:00:00,000 --> 00:00:00,900\nהיי\n\n");
     }
@@ -172,16 +226,45 @@ mod tests {
     #[test]
     fn render_combines_files_with_cumulative_offset() {
         let file1 = vec![
-            TimedSegment { text: "קובץ אחד".to_string(), start_ms: 0, end_ms: 1000 },
-            TimedSegment { text: "עוד קטע".to_string(), start_ms: 1000, end_ms: 2500 },
+            TimedSegment { text: "קובץ אחד".to_string(), start_ms: 0, end_ms: 1000, speaker: None },
+            TimedSegment { text: "עוד קטע".to_string(), start_ms: 1000, end_ms: 2500, speaker: None },
         ];
-        let file2 = vec![TimedSegment { text: "קובץ שתיים".to_string(), start_ms: 0, end_ms: 800 }];
+        let file2 = vec![TimedSegment { text: "קובץ שתיים".to_string(), start_ms: 0, end_ms: 800, speaker: None }];
 
         let srt = render_srt(&[file1, file2]);
 
         let expected = "1\n00:00:00,000 --> 00:00:01,000\nקובץ אחד\n\n\
                          2\n00:00:01,000 --> 00:00:02,500\nעוד קטע\n\n\
                          3\n00:00:02,500 --> 00:00:03,300\nקובץ שתיים\n\n";
+        assert_eq!(srt, expected);
+    }
+
+    #[test]
+    fn render_labels_speakers_when_multiple() {
+        // Two distinct speakers in the file → every cue gets a 1-based
+        // "דובר N:" prefix (Deepgram speaker 0 → "דובר 1").
+        let file = vec![
+            TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
+            TimedSegment { text: "היי".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(1) },
+        ];
+        let srt = render_srt(&[file]);
+        let expected = "1\n00:00:00,000 --> 00:00:00,500\nדובר 1: שלום\n\n\
+                         2\n00:00:00,500 --> 00:00:01,000\nדובר 2: היי\n\n";
+        assert_eq!(srt, expected);
+    }
+
+    #[test]
+    fn render_single_speaker_has_no_labels() {
+        // Only one speaker in the file → no labels at all. Single-speaker
+        // dictation must stay byte-for-byte clean; labeling is opt-in on the
+        // presence of a second speaker, not on diarization being active.
+        let file = vec![
+            TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
+            TimedSegment { text: "עולם".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(0) },
+        ];
+        let srt = render_srt(&[file]);
+        let expected = "1\n00:00:00,000 --> 00:00:00,500\nשלום\n\n\
+                         2\n00:00:00,500 --> 00:00:01,000\nעולם\n\n";
         assert_eq!(srt, expected);
     }
 }

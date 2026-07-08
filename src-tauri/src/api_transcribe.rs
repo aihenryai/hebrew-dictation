@@ -257,8 +257,11 @@ pub(crate) async fn transcribe_deepgram_batch(
 ) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
     let lang = if language == "auto" { "he" } else { language };
+    // diarize=true adds a per-word `speaker` index to words[]; it does not
+    // change the transcript text, so it's safe to send on every batch request
+    // (single-speaker audio simply reports one speaker → no SRT label).
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true",
         lang
     );
 
@@ -292,9 +295,26 @@ pub(crate) async fn transcribe_deepgram_batch(
         .trim()
         .to_string();
 
-    // words[] is present by default (no extra request param needed), each
-    // {word, start, end, punctuated_word?} with start/end in fractional seconds.
-    let words: Vec<crate::srt::TimedWord> = alt["words"]
+    // words[] is present by default (no extra request param needed).
+    // parse_deepgram_words converts fractional-second timings to ms and carries
+    // each word's diarization `speaker` (populated by &diarize=true, above).
+    let words = parse_deepgram_words(alt);
+    let segments = crate::srt::chunk_words_to_cues(
+        &words,
+        crate::srt::SRT_MAX_WORDS_PER_CUE,
+        crate::srt::SRT_MAX_MS_PER_CUE,
+    );
+
+    Ok((transcript, segments))
+}
+
+/// Parse Deepgram's `words[]` array (from an `alternatives[]` entry) into
+/// `TimedWord`s: fractional-second timings become milliseconds, and — when
+/// `diarize=true` populated it — the per-word `speaker` index is carried
+/// through. A word with no `speaker` field yields `speaker: None`, so the
+/// non-diarized path is unaffected.
+pub(crate) fn parse_deepgram_words(alt: &serde_json::Value) -> Vec<crate::srt::TimedWord> {
+    alt["words"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -309,18 +329,14 @@ pub(crate) async fn transcribe_deepgram_batch(
                         text: text.to_string(),
                         start_ms: (start * 1000.0).round() as u64,
                         end_ms: (end * 1000.0).round() as u64,
+                        // Deepgram's diarize=true adds a per-word `speaker`
+                        // integer; absent (no diarization) → None.
+                        speaker: w["speaker"].as_u64().map(|n| n as u32),
                     })
                 })
                 .collect()
         })
-        .unwrap_or_default();
-    let segments = crate::srt::chunk_words_to_cues(
-        &words,
-        crate::srt::SRT_MAX_WORDS_PER_CUE,
-        crate::srt::SRT_MAX_MS_PER_CUE,
-    );
-
-    Ok((transcript, segments))
+        .unwrap_or_default()
 }
 
 // ── Unified entry point ──
@@ -382,5 +398,46 @@ pub async fn test_api_key(provider: &ApiProvider, api_key: &str) -> Result<(), S
         Ok(_) => Ok(()),
         Err(e) if e.is_key_problem() || e.is_network_problem() => Err(e.to_string()),
         Err(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_words_reads_speaker_field() {
+        // A diarized Deepgram `alternatives[0]`: each word's `speaker` index
+        // must land on the corresponding TimedWord, alongside text and timing.
+        let alt = serde_json::json!({
+            "words": [
+                { "word": "שלום", "punctuated_word": "שלום", "start": 0.0, "end": 0.5, "speaker": 0 },
+                { "word": "עולם", "punctuated_word": "עולם", "start": 0.5, "end": 1.0, "speaker": 0 },
+                { "word": "היי", "punctuated_word": "היי", "start": 1.0, "end": 1.4, "speaker": 1 }
+            ]
+        });
+        let words = parse_deepgram_words(&alt);
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0].text, "שלום");
+        assert_eq!(words[0].start_ms, 0);
+        assert_eq!(words[0].end_ms, 500);
+        assert_eq!(words[0].speaker, Some(0));
+        assert_eq!(words[1].speaker, Some(0));
+        assert_eq!(words[2].text, "היי");
+        assert_eq!(words[2].speaker, Some(1));
+    }
+
+    #[test]
+    fn parse_words_absent_speaker_is_none() {
+        // No diarization → no `speaker` key → speaker stays None. The whisper
+        // and non-diarized cloud paths both rely on this.
+        let alt = serde_json::json!({
+            "words": [
+                { "word": "בדיקה", "start": 0.0, "end": 0.3 }
+            ]
+        });
+        let words = parse_deepgram_words(&alt);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].speaker, None);
     }
 }

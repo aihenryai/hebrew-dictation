@@ -255,6 +255,8 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
                         text: trimmed.to_string(),
                         start_ms: (start_raw.max(0) as u64) * 10,
                         end_ms: (end_raw.max(0) as u64) * 10,
+                        // Local whisper has no diarization — speaker is always unknown.
+                        speaker: None,
                     });
                 }
             }
