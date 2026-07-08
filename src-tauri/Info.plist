@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Tauri auto-merges this file into the generated macOS Info.plist.
+	     Without NSMicrophoneUsageDescription, macOS silently denies mic access
+	     to the native cpal/CoreAudio capture and the app receives only silence. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>הכתבה בעברית משתמשת במיקרופון כדי להקליט את הדיבור שלך ולתמלל אותו לטקסט.</string>
+</dict>
+</plist>

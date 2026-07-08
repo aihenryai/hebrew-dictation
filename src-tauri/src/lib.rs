@@ -5,6 +5,7 @@ mod decode;
 mod enhance;
 mod export;
 mod injector;
+mod local_api;
 mod model;
 mod secure_keys;
 mod settings;
@@ -46,6 +47,9 @@ struct AppState {
     /// Set true while a long batch-view recording is in progress (separate from
     /// short dictation) so Alt+D cannot overwrite the buffer mid-session.
     batch_recording_in_progress: Arc<AtomicBool>,
+    /// Last text actually injected into the user's target app (dictation or
+    /// streaming) — backs the opt-in local API's `/transcript` endpoint.
+    last_transcript: Arc<Mutex<String>>,
 }
 
 #[tauri::command]
@@ -242,6 +246,23 @@ fn stop_via_toolbar(app: AppHandle, state: State<AppState>) -> Result<(), String
     Ok(())
 }
 
+/// Localized location where the user grants microphone permission, used in the
+/// "no audio captured" hint. Split per-OS so each platform build points at its
+/// own settings path (macOS TCC lives somewhere completely different from the
+/// Windows privacy pane). Pure — takes the OS name so every branch is unit-
+/// testable on any host; `mic_permission_path()` passes `std::env::consts::OS`.
+fn mic_permission_path_for(os: &str) -> &'static str {
+    match os {
+        "macos" => "הגדרות המערכת ← פרטיות ואבטחה ← מיקרופון",
+        "windows" => "הגדרות Windows ← פרטיות ← מיקרופון",
+        _ => "הגדרות המערכת ← פרטיות ← מיקרופון",
+    }
+}
+
+fn mic_permission_path() -> &'static str {
+    mic_permission_path_for(std::env::consts::OS)
+}
+
 fn transcribe_local(state: &State<AppState>, samples: &[f32], lang: &str) -> Result<String, String> {
     let engine = state.whisper_engine.lock().map_err(|e| e.to_string())?;
     match engine.as_ref() {
@@ -255,7 +276,10 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
     // Mic captured effectively nothing — muted, disabled, or no OS permission.
     // Surface a clear, actionable message instead of silently returning no text.
     if audio::is_effectively_silent(&samples, 0.01) {
-        return Err("לא נקלט קול מהמיקרופון. ודאו שהמיקרופון פתוח ומחובר, ושלאפליקציה יש הרשאה: הגדרות Windows ← פרטיות ← מיקרופון.".to_string());
+        return Err(format!(
+            "לא נקלט קול מהמיקרופון. ודאו שהמיקרופון פתוח ומחובר, ושלאפליקציה יש הרשאה: {}.",
+            mic_permission_path()
+        ));
     }
     let lang = language.unwrap_or_else(|| "he".to_string());
     let (mode, provider, api_key) = {
@@ -1016,6 +1040,14 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
 
     let result = injector::inject_text(text, &injector::InjectionMethod::Clipboard);
 
+    if result.is_ok() {
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(mut last) = state.last_transcript.lock() {
+                *last = text.to_string();
+            }
+        }
+    }
+
     if main_was_visible {
         if let Some(w) = &main_window {
             let _ = w.show();
@@ -1598,6 +1630,7 @@ pub fn run() {
                 batch_cancel_notify: Arc::new(tokio::sync::Notify::new()),
                 batch_in_progress: Arc::new(AtomicBool::new(false)),
                 batch_recording_in_progress: Arc::new(AtomicBool::new(false)),
+                last_transcript: Arc::new(Mutex::new(String::new())),
             }
         })
         .setup(|app| {
@@ -1638,6 +1671,18 @@ pub fn run() {
             };
             setup_global_shortcuts(app.handle(), &combo, pause_combo.as_deref());
             let _ = setup_tray(app.handle());
+
+            // Opt-in local API — off unless explicitly enabled in settings.json,
+            // since it's a new 127.0.0.1 listener. See `local_api` module.
+            let (local_api_enabled, local_api_port) = {
+                let state = app.state::<AppState>();
+                let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+                (s.local_api_enabled, s.local_api_port)
+            };
+            if local_api_enabled {
+                let state = app.state::<AppState>();
+                local_api::start(local_api_port, state.last_transcript.clone());
+            }
 
             // Surface the one-shot key migration result (if any) to the frontend.
             // Only ever fires once per app launch — we `take()` the value here.
@@ -1789,4 +1834,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mic_permission_path_is_platform_specific() {
+        // macOS users must get macOS wording, never the Windows settings path —
+        // that's the reported bug (a Mac user was sent to "הגדרות Windows").
+        assert_eq!(
+            mic_permission_path_for("macos"),
+            "הגדרות המערכת ← פרטיות ואבטחה ← מיקרופון"
+        );
+        assert_eq!(
+            mic_permission_path_for("windows"),
+            "הגדרות Windows ← פרטיות ← מיקרופון"
+        );
+        // Any other OS gets a generic system-settings path — never Windows-
+        // specific instructions handed to a non-Windows user.
+        assert!(!mic_permission_path_for("linux").contains("Windows"));
+    }
 }

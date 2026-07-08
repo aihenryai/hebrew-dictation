@@ -74,6 +74,10 @@
           "Hebrew": "nsis/Hebrew.nsh"
         }
       }
+    },
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "minimumSystemVersion": "10.15"
     }
   },
   "plugins": {

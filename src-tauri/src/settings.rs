@@ -128,6 +128,14 @@ pub struct AppSettings {
     /// Cleanup profile. Default "he_general". Unknown values fall back via EnhanceMode::from_str.
     #[serde(default = "default_enhance_mode")]
     pub enhance_mode: String,
+    /// Opt-in local-only HTTP API (127.0.0.1) exposing the last dictated transcript
+    /// for other local tools/scripts to read. Default false — a new listener
+    /// should never appear silently. No frontend UI yet; enable via settings.json.
+    #[serde(default)]
+    pub local_api_enabled: bool,
+    /// Port for the local API server. Default 5757.
+    #[serde(default = "default_local_api_port")]
+    pub local_api_port: u16,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -159,6 +167,8 @@ pub struct RedactedSettings {
     pub audio_volume: f32,
     pub enhance_enabled: bool,
     pub enhance_mode: String,
+    pub local_api_enabled: bool,
+    pub local_api_port: u16,
 }
 
 impl AppSettings {
@@ -190,6 +200,8 @@ impl AppSettings {
             audio_volume: self.audio_volume,
             enhance_enabled: self.enhance_enabled,
             enhance_mode: self.enhance_mode.clone(),
+            local_api_enabled: self.local_api_enabled,
+            local_api_port: self.local_api_port,
         }
     }
 }
@@ -230,6 +242,10 @@ fn default_enhance_mode() -> String {
     "he_general".to_string()
 }
 
+fn default_local_api_port() -> u16 {
+    5757
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -259,6 +275,8 @@ impl Default for AppSettings {
             audio_volume: default_audio_volume(),
             enhance_enabled: false,
             enhance_mode: default_enhance_mode(),
+            local_api_enabled: false,
+            local_api_port: default_local_api_port(),
         }
     }
 }
@@ -450,6 +468,12 @@ impl AppSettings {
         incoming.terms_accepted = self.terms_accepted;
         incoming.close_notification_shown = self.close_notification_shown;
         incoming.toolbar_position = self.toolbar_position;
+        // No frontend UI for these yet (settings.json-only, opt-in) — the frontend
+        // payload never carries them, so preserve `current` the same way as the
+        // other not-yet-exposed fields above, or every settings save would reset
+        // them to the serde default.
+        incoming.local_api_enabled = self.local_api_enabled;
+        incoming.local_api_port = self.local_api_port;
         incoming
     }
 }

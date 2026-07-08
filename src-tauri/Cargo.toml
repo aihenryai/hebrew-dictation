@@ -48,3 +48,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 symphonia = { version = "0.6", features = ["mp3", "aac", "isomp4", "alac", "vorbis", "ogg", "wav", "flac"] }
 # Resample native rate → 16000 Hz. v3 = full rewrite (Fft, audioadapter, Indexing flush).
 rubato = "3"
+# Minimal blocking HTTP server for the opt-in local API (127.0.0.1 only) — no
+# async runtime integration needed, so this runs on its own plain OS thread.
+tiny_http = "0.12"
