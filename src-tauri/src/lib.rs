@@ -673,8 +673,12 @@ async fn stop_batch_recording_to_file(
         return Err("מצב שיחה נעצר דרך stop_call_recording ולא דרך מסלול-הקובץ".to_string());
     }
 
-    let samples = stop_recorder_for_source(&state, source)?;
+    // Clear the recording guard BEFORE draining — a poisoned recorder lock inside
+    // stop_recorder_for_source (newly reachable via the System source) would otherwise
+    // leave the flag set and block future dictation until restart. Mirrors the
+    // guard-first order in cancel_batch_recording / run_stop_call_recording.
     state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+    let samples = stop_recorder_for_source(&state, source)?;
     restore_recorder_settings(&state);
 
     if samples.is_empty() || audio::is_effectively_silent(&samples, 0.005) {
@@ -814,6 +818,16 @@ fn cancel_batch_recording(state: State<AppState>) -> Result<(), String> {
     // Clear the guard FIRST. If the recorder lock is poisoned the `?` below returns
     // early — leaving the flag set would block short dictation until app restart.
     state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+    // Cancel isn't source-aware, so unconditionally stop the system recorder too:
+    // without this a cancelled System/Call recording leaves the WASAPI capture
+    // thread running (unbounded memory/CPU) AND the re-entrancy guard rejects every
+    // future System/Call start until app restart. stop_recording() on an idle
+    // recorder is a harmless no-op. Stopped before the mic `?`-lock so a poisoned
+    // mic lock can't skip it; a poisoned system lock is ignored (best-effort).
+    #[cfg(target_os = "windows")]
+    if let Ok(mut sys) = state.system_recorder.lock() {
+        let _ = sys.stop_recording();
+    }
     let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
     let _ = recorder.stop_recording();
     drop(recorder);
