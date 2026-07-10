@@ -31,6 +31,11 @@ struct ActiveStreaming {
 
 struct AppState {
     recorder: Mutex<AudioRecorder>,
+    /// System-audio (WASAPI loopback) recorder for `System`/`Call` sources.
+    /// Windows-only (spec §4.1, §6) and independent of `recorder` (the mic) —
+    /// the "already recording" guard is per-recorder, so both can run at once.
+    #[cfg(target_os = "windows")]
+    system_recorder: Mutex<system_audio::SystemAudioRecorder>,
     whisper_engine: Mutex<Option<whisper::WhisperEngine>>,
     settings: Mutex<settings::AppSettings>,
     streaming: tokio::sync::Mutex<Option<ActiveStreaming>>,
@@ -1642,6 +1647,8 @@ pub fn run() {
             let load_result = settings::load_settings();
             AppState {
                 recorder: Mutex::new(AudioRecorder::new()),
+                #[cfg(target_os = "windows")]
+                system_recorder: Mutex::new(system_audio::SystemAudioRecorder::new()),
                 whisper_engine: Mutex::new(None),
                 settings: Mutex::new(load_result.settings),
                 streaming: tokio::sync::Mutex::new(None),
