@@ -11,6 +11,8 @@ mod secure_keys;
 mod settings;
 mod srt;
 mod streaming;
+#[cfg(target_os = "windows")]
+mod system_audio;
 mod whisper;
 
 use audio::AudioRecorder;
