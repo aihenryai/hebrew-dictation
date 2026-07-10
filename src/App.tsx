@@ -1039,7 +1039,9 @@ function App() {
   const handleStartBatchRecord = useCallback(async () => {
     setBatchError("");
     try {
-      await invoke("start_batch_recording");
+      // Thread the chosen source (Mic/System/Call) into the record command.
+      // Default "mic" reproduces the previous no-arg behavior exactly.
+      await invoke("start_batch_recording", { source: recordSource });
       setBatchRecording(true);
       setBatchRecordElapsed(0);
       batchRecordTimerRef.current = setInterval(() => {
@@ -1048,7 +1050,7 @@ function App() {
     } catch (e) {
       setBatchError(String(e));
     }
-  }, []);
+  }, [recordSource]);
 
   const handleStopBatchRecord = useCallback(async () => {
     if (batchRecordTimerRef.current) {
