@@ -65,6 +65,9 @@ interface BatchResult {
   /** True once the user hand-edits `transcript` in the textarea — segments
    * no longer match the (unedited) text, so SRT export is hidden for this item. */
   edited?: boolean;
+  /** True for a Call recording — SRT export uses אני/הצד השני side labels instead
+   * of the diarization דובר N: prefix (Task 20). Falsy/undefined for Mic/System. */
+  isCall?: boolean;
 }
 let batchIdCounter = 0;
 type Language = "he" | "en" | "multi";
@@ -1081,7 +1084,7 @@ function App() {
     const timeStr = now.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
     const fileName = `הקלטה ${timeStr}.wav`;
     const newId = ++batchIdCounter;
-    const newItem: BatchResult = { id: newId, fileName, filePath, transcript: "", status: "pending" };
+    const newItem: BatchResult = { id: newId, fileName, filePath, transcript: "", status: "pending", isCall };
 
     setBatchActiveResultId(newId);
     setBatchResults((prev) => [...prev, newItem]);
@@ -1184,12 +1187,14 @@ function App() {
   const exportSingleSrt = useCallback(async (
     segments: TimedSegment[],
     transcriptForName: string,
+    isCall: boolean | undefined,
     onErr: (msg: string) => void,
   ) => {
     if (segments.length === 0) return;
     try {
       await invoke<string>("export_srt", {
         items: [segments],
+        styles: [isCall ? "Call" : "Diarization"],
         suggested_name: firstWordsName(transcriptForName),
       });
     } catch (e) {
@@ -1203,8 +1208,9 @@ function App() {
     if (eligible.length === 0) return;
     try {
       const items = eligible.map((r) => r.segments!);
+      const styles = eligible.map((r) => (r.isCall ? "Call" : "Diarization"));
       const suggested_name = generateExportName(eligible);
-      const path = await invoke<string>("export_srt", { items, suggested_name });
+      const path = await invoke<string>("export_srt", { items, styles, suggested_name });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
@@ -2608,7 +2614,7 @@ function App() {
                         {isSrtEligible(result) && (
                           <button
                             className="btn-secondary btn-sm"
-                            onClick={() => exportSingleSrt(result.segments!, result.transcript, setBatchError)}
+                            onClick={() => exportSingleSrt(result.segments!, result.transcript, result.isCall, setBatchError)}
                             title="ייצוא כתוביות SRT למקטע זה"
                           >
                             🎬 SRT
