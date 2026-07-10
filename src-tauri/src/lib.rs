@@ -505,6 +505,20 @@ async fn run_transcribe_file(
     }
 }
 
+/// Call bypasses `stop_batch_recording_to_file` / `run_transcribe_file`, so the
+/// near-silence guard that normally lives there (lib.rs:595, 423) must run HERE, on
+/// the INTERLEAVED buffer — never per-channel: a call where only one side spoke
+/// still has content in the combined buffer and must NOT be blocked (spec §6). On
+/// pass, encodes the two-channel WAV body posted to Deepgram `multichannel=true`.
+/// Reuses the 0.005 threshold from the mono stop-recording guard it replaces.
+#[cfg(target_os = "windows")]
+fn call_stereo_wav_or_silent(interleaved: &[f32]) -> Result<Vec<u8>, String> {
+    if interleaved.is_empty() || audio::is_effectively_silent(interleaved, 0.005) {
+        return Err("לא נקלט אודיו בשיחה — ודאו שהמיקרופון ולכידת-המערכת פעילים.".to_string());
+    }
+    Ok(api_transcribe::samples_to_wav_stereo(interleaved, 16000))
+}
+
 /// Write a 16-bit PCM mono WAV file from 16kHz f32 samples. No external crate needed.
 fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> Result<(), String> {
     use std::io::Write;
@@ -1862,5 +1876,22 @@ mod tests {
         // Any other OS gets a generic system-settings path — never Windows-
         // specific instructions handed to a non-Windows user.
         assert!(!mic_permission_path_for("linux").contains("Windows"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn call_stereo_wav_or_silent_blocks_silence_and_wraps_audio() {
+        // Call bypasses the stop_batch/transcribe silence guards, so this helper
+        // must block silence itself — on the COMBINED buffer, before any network call.
+        assert!(call_stereo_wav_or_silent(&[]).is_err());
+        assert!(call_stereo_wav_or_silent(&vec![0.0f32; 16000]).is_err());
+
+        // Non-silent interleaved buffer → a 2-channel WAV body for multichannel.
+        let loud = vec![0.5f32; 16000];
+        let wav = call_stereo_wav_or_silent(&loud).expect("loud audio must pass the guard");
+        assert_eq!(&wav[0..4], b"RIFF");
+        // Byte 22 (u16 LE) is the WAV channel count — Call MUST send stereo so
+        // Deepgram can separate "אני"/"הצד השני".
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2);
     }
 }
