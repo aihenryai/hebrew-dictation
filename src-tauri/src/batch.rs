@@ -16,6 +16,23 @@ pub struct BatchOpts {
     pub inject: bool,
 }
 
+/// Which audio source a batch recording captures. This is a DIFFERENT axis from
+/// `BatchOpts.mode` (cloud/local): `mode` picks the transcription engine, `source`
+/// picks what is recorded. Named `source` precisely so it never collides with
+/// `mode`. Defaults to `Mic` (existing behavior, zero regression when the frontend
+/// omits it). Spec §3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingSource {
+    /// Existing cpal microphone path (mono).
+    #[default]
+    Mic,
+    /// WASAPI loopback of the default render device (Windows-only).
+    System,
+    /// Mic + system captured together, interleaved to stereo for multichannel.
+    Call,
+}
+
 fn default_language() -> String {
     "he".to_string()
 }
@@ -49,5 +66,16 @@ mod tests {
         assert_eq!(pick_batch_route("cloud"), BatchRoute::CloudDeepgram);
         // Unknown/empty mode defaults to cloud.
         assert_eq!(pick_batch_route("whatever"), BatchRoute::CloudDeepgram);
+    }
+
+    #[test]
+    fn recording_source_deserializes_and_defaults_to_mic() {
+        use serde_json::from_str;
+        // Frontend sends lowercase strings for the source toggle.
+        assert_eq!(from_str::<RecordingSource>("\"mic\"").unwrap(), RecordingSource::Mic);
+        assert_eq!(from_str::<RecordingSource>("\"system\"").unwrap(), RecordingSource::System);
+        assert_eq!(from_str::<RecordingSource>("\"call\"").unwrap(), RecordingSource::Call);
+        // Zero-regression default: an absent/legacy `source` must fall back to Mic.
+        assert_eq!(RecordingSource::default(), RecordingSource::Mic);
     }
 }
