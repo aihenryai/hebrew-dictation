@@ -68,6 +68,18 @@ pub fn ensure_call_deepgram_available(has_deepgram_key: bool) -> Result<(), Stri
     }
 }
 
+/// Which physical recorders a batch `source` drives, as `(uses_mic, uses_system)`.
+/// Pure decision table (spec §3, §4.6) so the Mic/System/Call routing is unit-tested
+/// and can't silently regress — `start_recorders_for_source` in lib.rs keys off it,
+/// making this the single source of truth for "what does each source capture".
+pub fn recorders_for_source(source: RecordingSource) -> (bool, bool) {
+    match source {
+        RecordingSource::Mic => (true, false),
+        RecordingSource::System => (false, true),
+        RecordingSource::Call => (true, true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +111,15 @@ mod tests {
         let err = ensure_call_deepgram_available(false).unwrap_err();
         assert!(err.contains("Deepgram"));
         assert!(err.contains("שיחה"));
+    }
+
+    #[test]
+    fn recorders_for_source_maps_each_variant() {
+        // (uses_mic, uses_system) — the routing table the lib.rs start/stop wiring
+        // keys off. Locked down so a Mic/System/Call mis-route fails HERE.
+        assert_eq!(recorders_for_source(RecordingSource::Mic), (true, false));
+        assert_eq!(recorders_for_source(RecordingSource::System), (false, true));
+        // Call is the ONLY source that drives BOTH recorders → stereo/multichannel.
+        assert_eq!(recorders_for_source(RecordingSource::Call), (true, true));
     }
 }
