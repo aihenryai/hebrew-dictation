@@ -16,18 +16,19 @@
 |---|---|---|
 | 1. Pure stereo helpers | 1-2 | ✅ **DONE** — `4d1bf03`, `55e1922` |
 | 2. Deepgram multichannel transcribe | 3-5 | ✅ **DONE** — `06f6a19`, `e021281`, `09b5b8f` |
-| 3. `render_srt` `SpeakerLabelStyle` | 6 | ⬜ **← RESUME HERE** |
-| 4. `SystemAudioRecorder` (WASAPI) | 7-9 | ⬜ needs a real audio device; has MANUAL-VERIFY steps |
-| 5. `lib.rs` orchestration + `source` | 10-16 | ⬜ |
-| 6. Frontend source selector | 17-20 | ⬜ incl. Task 20 (per-file SRT style) |
+| 3. `render_srt` `SpeakerLabelStyle` | 6 | ✅ **DONE** — `68a688a` |
+| 4. `SystemAudioRecorder` (WASAPI) | 7-9 | ✅ **DONE** — `2d3c768`, `87a073c`, `b180faa` (wasapi API fix, see Task 9 note) |
+| 5. `lib.rs` orchestration + `source` | 10-16 | ✅ **DONE** — `0ee8661`,`963aa78`,`6e27981`,`8de6dcb`,`a183b00`,`9807998`,`fbc7678` |
+| 6. Frontend source selector | 17-20 | ✅ **DONE** — `cf2cb78`,`56516fb`,`8f15109`,`0073d8b` |
+| Post-review hardening | — | ✅ **DONE** — `af30355` (Critical: cancel now drains system recorder) |
 
-**State at handoff (2026-07-09):** `main` is green and pushed. `cargo test` = **39 passed, 0 failed**. Tasks 1-5 were executed under strict TDD — every test was watched failing with `E0425` before a line of implementation was written.
+**State (2026-07-10): 🎉 ALL 20 TASKS CODE-COMPLETE on `main`.** `cargo build` = **0 warnings** (whole Call path reachable), `cargo test` = **50 passed, 1 ignored** (the `#[ignore]`d MANUAL-VERIFY loopback capture), frontend `tsc && vite build` = clean. Every task executed under strict TDD (red watched before green) via subagent-driven-development. A final integration review (frontend↔backend contract, guards, source routing, seams) found **one Critical** — cancel didn't stop the system recorder, bricking System/Call after one cancel — now fixed in `af30355`.
 
-**What already works (all unit-tested, nothing wired yet):** mic+system → `interleave_stereo` → `samples_to_wav_stereo` → `transcribe_deepgram_multichannel` → per-channel `parse_deepgram_words` + channel-index stamp → chronological merge by `start_ms` → labeled `"אני:"/"הצד השני:"` text via `srt::call_side_label`.
+**⏳ Still open — MANUAL-VERIFY on a real Windows machine (cannot be automated here):**
+> 1. **Loopback capture** — `cargo test ... loopback_captures_playing_audio -- --ignored` while a video/song plays on the default render device. Expect `... ok` (captured >1s).
+> 2. **Call E2E** — `npm run tauri dev`, batch view: select **שיחה**, speak while system audio plays, stop → confirm the transcript separates **אני:/הצד השני:** and the SRT export carries those labels (needs Henry's Deepgram key). Plus the Mic/System regression + UI (three Windows-gated cards) checks in Tasks 17-19 Step 4.
 
-> ⚠️ **The 6 `dead_code` warnings are EXPECTED and correct.** `interleave_stereo`, `samples_to_wav_stereo`, `multichannel_url`, `build_multichannel_result`, `transcribe_deepgram_multichannel`, `call_side_label` — nothing *calls* the Call path until **Chunk 5** wires it, and the warnings vanish then. Do **not** "fix" them by deleting code or adding `#[allow(dead_code)]`.
-
-**Resume:** execute **Task 6** (Chunk 3). Prefer `superpowers:subagent-driven-development`; fall back to `superpowers:executing-plans` if subagents are unavailable. Each task commits atomically, so it is always safe to stop between tasks.
+**Wasapi 0.23 API note (Task 9):** the plan's original snippet used `wasapi::get_default_device(&Direction::Render)` as a free fn; in wasapi 0.23.0 it is a **`DeviceEnumerator` method**. The shipped code (correct) uses `DeviceEnumerator::new().and_then(|e| e.get_default_device(&Direction::Render))` — see the corrected Task 9 Step 3 snippet below.
 
 ---
 
@@ -899,7 +900,8 @@ wasapi = "0.23"
 ```rust
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use wasapi::{get_default_device, initialize_mta, Direction, StreamMode};
+// NOTE (wasapi 0.23 fix): get_default_device is a DeviceEnumerator METHOD, not a free fn.
+use wasapi::{initialize_mta, DeviceEnumerator, Direction, StreamMode};
 
 pub struct SystemAudioRecorder {
     samples: Arc<Mutex<Vec<f32>>>,
@@ -958,8 +960,9 @@ impl SystemAudioRecorder {
                 let _ = ready_tx.send(Err("COM init (MTA) failed".to_string()));
                 return;
             }
-            // Loopback source = the default RENDER (playback) device...
-            let device = match get_default_device(&Direction::Render) {
+            // Loopback source = the default RENDER (playback) device. wasapi 0.23:
+            // get_default_device is a DeviceEnumerator method, not a free function.
+            let device = match DeviceEnumerator::new().and_then(|e| e.get_default_device(&Direction::Render)) {
                 Ok(d) => d,
                 Err(e) => { let _ = ready_tx.send(Err(format!("No default render device: {e}"))); return; }
             };
@@ -1862,4 +1865,4 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ## Follow-ups (out of scope for this plan)
 
-- **`cancel_batch_recording` (lib.rs:610) only stops the mic.** For a `Call` recording it should also drain `state.system_recorder`, so a cancelled call doesn't leave the loopback capture thread running. Small hardening task worth doing once `system_recorder` lands (Task 14). Not required for the happy-path Call flow, which drains both recorders in `run_stop_call_recording`.
+- ~~**`cancel_batch_recording` only stops the mic.**~~ ✅ **DONE (`af30355`, promoted from follow-up to a Critical fix after final review).** Cancel now unconditionally drains `state.system_recorder` too — the final integration review showed the Cancel button renders for every source, so a cancelled System/Call recording was leaving the loopback thread running AND (via the per-recorder re-entrancy guard) bricking every future System/Call start until app restart. Not a "small hardening" — it was ship-blocking.
