@@ -10,6 +10,12 @@ import "./App.css";
 const APP_VERSION = "v2.11.0";
 const APP_LICENSE = "MIT";
 
+// System-audio capture (WASAPI loopback) is Windows-only, so System/Call are
+// hidden off-Windows — non-Windows users only ever see Mic (zero regression).
+// WebView2 on Windows always reports "Windows" in navigator.userAgent.
+const IS_WINDOWS =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+
 /** Hebrew label for a batch-transcription progress stage. */
 function stageLabel(stage: string): string {
   switch (stage) {
@@ -64,6 +70,13 @@ let batchIdCounter = 0;
 type Language = "he" | "en" | "multi";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "deepgram" | "groq";
+
+/** Recording input source, chosen before a batch recording and threaded into
+ * `start_batch_recording` (Task 18). Default "mic" = existing behavior (zero
+ * regression). "system" (WASAPI loopback) and "call" (mic + system) are
+ * Windows-only — see IS_WINDOWS gating in the batch view. Wire values are
+ * lowercase to match the app's existing `mode`/`language` invoke payloads. */
+type RecordingSource = "mic" | "system" | "call";
 
 /** Settings sent to the backend. API keys are managed separately via set_api_key / clear_api_key. */
 interface AppSettings {
@@ -412,6 +425,8 @@ function App() {
   const [batchFileTotal, setBatchFileTotal] = useState(0);
   const batchCancelledRef = useRef(false);
   const [batchRecording, setBatchRecording] = useState(false);
+  // Recording source for the batch record button. Default "mic" = zero regression.
+  const [recordSource, setRecordSource] = useState<RecordingSource>("mic");
   const [batchRecordElapsed, setBatchRecordElapsed] = useState(0);
   const [batchActiveResultId, setBatchActiveResultId] = useState<number | null>(null);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -2380,6 +2395,50 @@ function App() {
             <span className="batch-mode-desc">ללא אינטרנט · דורש מודל מורד</span>
           </button>
         </div>
+
+        {/* batch-source-selector — recording source (Mic / System / Call), chosen
+            before recording. System/Call are Windows-only (WASAPI loopback) →
+            hidden off-Windows. Reuses batch-mode-card styles; no new CSS.
+            (The machine anchor for git grep lives HERE in the comment, NOT in the
+            aria-label, which stays clean Hebrew per the repo's UI convention.) */}
+        {!batchRecording && (
+          <div className="batch-mode-cards" role="group" aria-label="מקור הקלטה">
+            <button
+              className={`batch-mode-card ${recordSource === "mic" ? "active" : ""}`}
+              onClick={() => !batchRunning && setRecordSource("mic")}
+              disabled={batchRunning}
+              aria-pressed={recordSource === "mic"}
+            >
+              <span className="batch-mode-icon" aria-hidden="true">🎙</span>
+              <span className="batch-mode-name">מיקרופון</span>
+              <span className="batch-mode-desc">הקול שלכם בלבד</span>
+            </button>
+            {IS_WINDOWS && (
+              <>
+                <button
+                  className={`batch-mode-card ${recordSource === "system" ? "active" : ""}`}
+                  onClick={() => !batchRunning && setRecordSource("system")}
+                  disabled={batchRunning}
+                  aria-pressed={recordSource === "system"}
+                >
+                  <span className="batch-mode-icon" aria-hidden="true">🔊</span>
+                  <span className="batch-mode-name">אודיו מערכת</span>
+                  <span className="batch-mode-desc">מה שמתנגן במחשב</span>
+                </button>
+                <button
+                  className={`batch-mode-card ${recordSource === "call" ? "active" : ""}`}
+                  onClick={() => !batchRunning && setRecordSource("call")}
+                  disabled={batchRunning}
+                  aria-pressed={recordSource === "call"}
+                >
+                  <span className="batch-mode-icon" aria-hidden="true">📞</span>
+                  <span className="batch-mode-name">שיחה</span>
+                  <span className="batch-mode-desc">אתם + הצד השני</span>
+                </button>
+              </>
+            )}
+          </div>
+        )}
 
         {/* Actions — pinned near the top so a growing result list never pushes them off-screen */}
         {!batchRecording && (
