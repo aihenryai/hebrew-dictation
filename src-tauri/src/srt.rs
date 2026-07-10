@@ -100,25 +100,53 @@ pub fn call_side_label(speaker: u32) -> &'static str {
     }
 }
 
+/// How `render_srt` labels each cue with its speaker. Crosses the Tauri IPC
+/// boundary — the frontend picks a style per exported file (serde renders the
+/// unit variants as the strings `"Diarization"` / `"Call"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SpeakerLabelStyle {
+    /// Diarization export: prefix cues only when a file has ≥2 distinct
+    /// speakers, using 1-based `"דובר {n+1}:"`. Single-speaker files stay
+    /// byte-for-byte clean. This is the historical `render_srt` behavior.
+    Diarization,
+    /// Call export: always prefix every cue (even a single-speaker call where
+    /// one side was silent), mapping interleaved channel 0 → `"אני:"` and any
+    /// other channel → `"הצד השני:"` (see `call_side_label`).
+    Call,
+}
+
 /// Render one or more files' cue lists into a single SRT document. Each
 /// file's cues are offset by the cumulative end time of all files before
 /// it (files play back-to-back, no artificial gap), and cue numbers are
-/// sequential across the whole document. A single-file call is just
-/// `render_srt(&[cues])` with a zero offset.
-pub fn render_srt(files: &[Vec<TimedSegment>]) -> String {
+/// sequential across the whole document.
+///
+/// `styles[i]` selects how file `i`'s cues are labeled; a missing entry falls
+/// back to `Diarization`, so `render_srt(&files, &[])` reproduces the historical
+/// output exactly. Style is chosen **per file**, not per document, because a
+/// combined export can mix a Call recording with plain dictations.
+pub fn render_srt(files: &[Vec<TimedSegment>], styles: &[SpeakerLabelStyle]) -> String {
     let mut out = String::new();
     let mut index = 1u32;
     let mut offset_ms: u64 = 0;
 
-    for cues in files {
-        // Label speakers only when this file actually has ≥2 of them: single-
-        // speaker dictation stays byte-for-byte clean, while a multi-speaker
-        // call/interview gets "דובר N:" prefixes automatically — no toggle.
-        // Counted per file (not per document) so a clean file in a mixed batch
-        // export isn't labeled just because a sibling file had two speakers.
-        let distinct_speakers: std::collections::BTreeSet<u32> =
-            cues.iter().filter_map(|c| c.speaker).collect();
-        let label_speakers = distinct_speakers.len() >= 2;
+    for (file_idx, cues) in files.iter().enumerate() {
+        let style = styles
+            .get(file_idx)
+            .copied()
+            .unwrap_or(SpeakerLabelStyle::Diarization);
+
+        // Whether this file's cues get a speaker prefix depends on the style.
+        // Diarization labels only a genuinely multi-speaker file (single-speaker
+        // dictation stays byte-for-byte clean); Call always labels, so a call in
+        // which one side stayed silent still reads "אני:"/"הצד השני:".
+        let label_speakers = match style {
+            SpeakerLabelStyle::Diarization => {
+                let distinct_speakers: std::collections::BTreeSet<u32> =
+                    cues.iter().filter_map(|c| c.speaker).collect();
+                distinct_speakers.len() >= 2
+            }
+            SpeakerLabelStyle::Call => true,
+        };
 
         for cue in cues {
             out.push_str(&index.to_string());
@@ -127,10 +155,15 @@ pub fn render_srt(files: &[Vec<TimedSegment>]) -> String {
             out.push_str(" --> ");
             out.push_str(&format_srt_timestamp(cue.end_ms + offset_ms));
             out.push('\n');
-            // Deepgram speaker indices are 0-based; display them 1-based.
             if label_speakers {
                 if let Some(spk) = cue.speaker {
-                    out.push_str(&format!("דובר {}: ", spk + 1));
+                    let prefix = match style {
+                        // Deepgram speaker indices are 0-based; display 1-based.
+                        SpeakerLabelStyle::Diarization => format!("דובר {}: ", spk + 1),
+                        // Call channels: 0 = local mic, any other = far end.
+                        SpeakerLabelStyle::Call => format!("{}: ", call_side_label(spk)),
+                    };
+                    out.push_str(&prefix);
                 }
             }
             out.push_str(&cue.text);
@@ -230,7 +263,7 @@ mod tests {
     #[test]
     fn render_single_file_zero_offset() {
         let file = vec![TimedSegment { text: "היי".to_string(), start_ms: 0, end_ms: 900, speaker: None }];
-        let srt = render_srt(&[file]);
+        let srt = render_srt(&[file], &[SpeakerLabelStyle::Diarization]);
         assert_eq!(srt, "1\n00:00:00,000 --> 00:00:00,900\nהיי\n\n");
     }
 
@@ -242,7 +275,7 @@ mod tests {
         ];
         let file2 = vec![TimedSegment { text: "קובץ שתיים".to_string(), start_ms: 0, end_ms: 800, speaker: None }];
 
-        let srt = render_srt(&[file1, file2]);
+        let srt = render_srt(&[file1, file2], &[SpeakerLabelStyle::Diarization, SpeakerLabelStyle::Diarization]);
 
         let expected = "1\n00:00:00,000 --> 00:00:01,000\nקובץ אחד\n\n\
                          2\n00:00:01,000 --> 00:00:02,500\nעוד קטע\n\n\
@@ -258,7 +291,7 @@ mod tests {
             TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
             TimedSegment { text: "היי".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(1) },
         ];
-        let srt = render_srt(&[file]);
+        let srt = render_srt(&[file], &[SpeakerLabelStyle::Diarization]);
         let expected = "1\n00:00:00,000 --> 00:00:00,500\nדובר 1: שלום\n\n\
                          2\n00:00:00,500 --> 00:00:01,000\nדובר 2: היי\n\n";
         assert_eq!(srt, expected);
@@ -273,9 +306,74 @@ mod tests {
             TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
             TimedSegment { text: "עולם".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(0) },
         ];
-        let srt = render_srt(&[file]);
+        let srt = render_srt(&[file], &[SpeakerLabelStyle::Diarization]);
         let expected = "1\n00:00:00,000 --> 00:00:00,500\nשלום\n\n\
                          2\n00:00:00,500 --> 00:00:01,000\nעולם\n\n";
+        assert_eq!(srt, expected);
+    }
+
+    #[test]
+    fn render_call_labels_both_sides() {
+        // Call always labels: channel 0 → "אני:", channel 1 → "הצד השני:".
+        let file = vec![
+            TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
+            TimedSegment { text: "היי".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(1) },
+        ];
+        let srt = render_srt(&[file], &[SpeakerLabelStyle::Call]);
+        let expected = "1\n00:00:00,000 --> 00:00:00,500\nאני: שלום\n\n\
+                         2\n00:00:00,500 --> 00:00:01,000\nהצד השני: היי\n\n";
+        assert_eq!(srt, expected);
+    }
+
+    #[test]
+    fn render_call_labels_single_speaker_when_one_side_silent() {
+        // A call where only one side spoke has a single distinct speaker, which
+        // would suppress labels under Diarization's ≥2 gate. Call bypasses the
+        // gate and still labels every cue "אני:".
+        let file = vec![
+            TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
+            TimedSegment { text: "עולם".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(0) },
+        ];
+        let srt = render_srt(&[file], &[SpeakerLabelStyle::Call]);
+        let expected = "1\n00:00:00,000 --> 00:00:00,500\nאני: שלום\n\n\
+                         2\n00:00:00,500 --> 00:00:01,000\nאני: עולם\n\n";
+        assert_eq!(srt, expected);
+    }
+
+    #[test]
+    fn render_defaults_to_diarization_when_styles_missing() {
+        // An empty styles slice reproduces the historical one-arg behavior, so a
+        // frontend that omits `styles` exports byte-for-byte as it does today.
+        let file = vec![
+            TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
+            TimedSegment { text: "היי".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(1) },
+        ];
+        let srt = render_srt(&[file], &[]);
+        let expected = "1\n00:00:00,000 --> 00:00:00,500\nדובר 1: שלום\n\n\
+                         2\n00:00:00,500 --> 00:00:01,000\nדובר 2: היי\n\n";
+        assert_eq!(srt, expected);
+    }
+
+    #[test]
+    fn render_applies_style_per_file() {
+        // A combined export can mix a Call recording with a plain dictation:
+        // file 0 must read "אני:/הצד השני:", file 1 falls back to "דובר N:".
+        let call_file = vec![
+            TimedSegment { text: "שלום".to_string(), start_ms: 0, end_ms: 500, speaker: Some(0) },
+            TimedSegment { text: "היי".to_string(), start_ms: 500, end_ms: 1000, speaker: Some(1) },
+        ];
+        let diar_file = vec![
+            TimedSegment { text: "אחד".to_string(), start_ms: 0, end_ms: 400, speaker: Some(0) },
+            TimedSegment { text: "שתיים".to_string(), start_ms: 400, end_ms: 900, speaker: Some(1) },
+        ];
+        let srt = render_srt(
+            &[call_file, diar_file],
+            &[SpeakerLabelStyle::Call, SpeakerLabelStyle::Diarization],
+        );
+        let expected = "1\n00:00:00,000 --> 00:00:00,500\nאני: שלום\n\n\
+                         2\n00:00:00,500 --> 00:00:01,000\nהצד השני: היי\n\n\
+                         3\n00:00:01,000 --> 00:00:01,400\nדובר 1: אחד\n\n\
+                         4\n00:00:01,400 --> 00:00:01,900\nדובר 2: שתיים\n\n";
         assert_eq!(srt, expected);
     }
 }

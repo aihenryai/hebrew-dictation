@@ -1162,6 +1162,10 @@ async fn export_srt(
     app: AppHandle,
     state: State<'_, AppState>,
     items: Vec<Vec<srt::TimedSegment>>,
+    // Per-item label style, parallel to `items`. Omitted or short → Diarization,
+    // preserving the historical export byte-for-byte. Chunk 6 (Task 20) fills it
+    // so a Call recording exports "אני:"/"הצד השני:" instead of "דובר N:".
+    styles: Option<Vec<srt::SpeakerLabelStyle>>,
     suggested_name: Option<String>,
 ) -> Result<String, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -1198,7 +1202,8 @@ async fn export_srt(
         None => return Err("הייצוא בוטל".to_string()),
     };
 
-    let content = srt::render_srt(&items);
+    let styles = styles.unwrap_or_default();
+    let content = srt::render_srt(&items, &styles);
     std::fs::write(&path, content.as_bytes())
         .map_err(|e| format!("שגיאה בכתיבת קובץ SRT: {}", e))?;
 
