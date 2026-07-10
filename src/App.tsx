@@ -1059,12 +1059,22 @@ function App() {
     }
     setBatchRecording(false);
 
-    let filePath: string;
-    try {
-      filePath = await invoke<string>("stop_batch_recording_to_file");
-    } catch (e) {
-      setBatchError(`שמירת ההקלטה נכשלה: ${String(e)}`);
-      return;
+    // Call is backend-only (spec §4.3/§4.6): it never writes a WAV and must NOT go
+    // through transcribe_file → decode_file_to_16k_mono, which merges to mono and
+    // destroys the channel separation ("הצד השני"). It stops both recorders and
+    // returns (text, segments) directly. Mic/System keep the existing file path,
+    // now passing `source` so the backend drains the right recorder (System routes
+    // to system_recorder inside stop_batch_recording_to_file).
+    const isCall = recordSource === "call";
+
+    let filePath = "";
+    if (!isCall) {
+      try {
+        filePath = await invoke<string>("stop_batch_recording_to_file", { source: recordSource });
+      } catch (e) {
+        setBatchError(`שמירת ההקלטה נכשלה: ${String(e)}`);
+        return;
+      }
     }
 
     const now = new Date();
@@ -1077,16 +1087,23 @@ function App() {
     setBatchResults((prev) => [...prev, newItem]);
     setBatchRunning(true);
     setBatchPct(0);
-    setBatchStage("decoding");
+    setBatchStage(isCall ? "transcribing" : "decoding");
     batchCancelledRef.current = false;
 
     setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "processing" } : r));
 
     try {
-      const { text, segments } = await invoke<{ text: string; segments: TimedSegment[] }>(
-        "transcribe_file",
-        { filePath, opts: { mode: batchMode, language: "he", inject: false } }
-      );
+      // Call → dedicated backend command (stops both recorders, interleaves,
+      // multichannel Deepgram, returns tagged "אני:"/"הצד השני:" text + merged
+      // segments). Mic/System → existing mono file path, unchanged.
+      const { text, segments } = isCall
+        ? await invoke<{ text: string; segments: TimedSegment[] }>("stop_call_recording", {
+            opts: { mode: batchMode, language: "he", inject: false },
+          })
+        : await invoke<{ text: string; segments: TimedSegment[] }>(
+            "transcribe_file",
+            { filePath, opts: { mode: batchMode, language: "he", inject: false } }
+          );
       setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "done", transcript: text, segments } : r));
     } catch (e) {
       const msg = String(e);
@@ -1096,15 +1113,17 @@ function App() {
         setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "error", error: msg } : r));
       }
     } finally {
-      // The temp WAV (≈110 MB/hour) has been transcribed — delete it so recordings
-      // don't pile up in %TEMP%. Best-effort: the transcript is already in state.
-      try { await invoke("delete_temp_recording", { path: filePath }); } catch { /* ignore */ }
+      // Only Mic/System write a temp WAV (≈110 MB/hour); Call is in-memory so there
+      // is no file to delete. Guard on filePath so the Call branch skips cleanup.
+      if (filePath) {
+        try { await invoke("delete_temp_recording", { path: filePath }); } catch { /* ignore */ }
+      }
     }
 
     setBatchRunning(false);
     setBatchStage("done");
     setBatchActiveResultId(null);
-  }, [batchMode]);
+  }, [batchMode, recordSource]);
 
   const handleCancelBatchRecord = useCallback(async () => {
     if (batchRecordTimerRef.current) {
