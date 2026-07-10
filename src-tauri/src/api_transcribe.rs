@@ -43,6 +43,50 @@ pub(crate) fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
+/// Convert an **interleaved stereo** f32 buffer (L,R,L,R… at `sample_rate`) to a
+/// 2-channel PCM16 WAV byte buffer. Kept deliberately SEPARATE from `samples_to_wav`
+/// (which hardcodes `num_channels = 1`) so the Call-mode multichannel body can be
+/// 2-channel without changing any existing mono caller (groq/deepgram single+batch).
+pub(crate) fn samples_to_wav_stereo(interleaved: &[f32], sample_rate: u32) -> Vec<u8> {
+    let num_samples = interleaved.len(); // total across both channels
+    let bytes_per_sample: u16 = 2;
+    let num_channels: u16 = 2;
+    let data_size = (num_samples * bytes_per_sample as usize) as u32;
+    // RIFF ChunkSize = 4("WAVE") + 24(fmt chunk) + 8(data header) + data_size
+    let file_size = 36 + data_size;
+
+    let mut buf = Vec::with_capacity(44 + data_size as usize);
+
+    // RIFF header
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&file_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    buf.extend_from_slice(&num_channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * num_channels as u32 * bytes_per_sample as u32;
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align = num_channels * bytes_per_sample;
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&(bytes_per_sample * 8).to_le_bytes());
+
+    // data chunk
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_size.to_le_bytes());
+
+    // interleaved is already L,R,L,R… — write straight through.
+    for &sample in interleaved {
+        let clamped = (sample * 32768.0).clamp(-32768.0, 32767.0) as i16;
+        buf.extend_from_slice(&clamped.to_le_bytes());
+    }
+
+    buf
+}
+
 /// Categorized API error — kept stable across UI string changes so callers like
 /// `test_api_key` can branch on the *kind* of failure, not on a Hebrew substring
 /// (which historically caused false positives — see v2.8.0 bug report).
@@ -439,5 +483,41 @@ mod tests {
         let words = parse_deepgram_words(&alt);
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].speaker, None);
+    }
+
+    #[test]
+    fn samples_to_wav_stereo_header_is_two_channel() {
+        // One stereo frame (L=0, R=0) → 2 samples → 4 data bytes, 48-byte file.
+        let wav = samples_to_wav_stereo(&[0.0f32, 0.0], 16000);
+        assert_eq!(wav.len(), 48);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        // audio format = PCM (1)
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        // num_channels = 2 (the whole point of the stereo variant)
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2);
+        // sample_rate = 16000
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 16000);
+        // byte_rate = 16000 * 2ch * 2bytes = 64000
+        assert_eq!(u32::from_le_bytes([wav[28], wav[29], wav[30], wav[31]]), 64000);
+        // block_align = 2ch * 2bytes = 4
+        assert_eq!(u16::from_le_bytes([wav[32], wav[33]]), 4);
+        // bits per sample = 16
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+        assert_eq!(&wav[36..40], b"data");
+        // data_size = 4 bytes
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
+    }
+
+    #[test]
+    fn samples_to_wav_stereo_encodes_and_clamps_samples() {
+        // Full-scale L=+1.0 clamps to i16 32767; R=-1.0 maps to -32768.
+        let wav = samples_to_wav_stereo(&[1.0f32, -1.0], 16000);
+        assert_eq!(wav.len(), 48);
+        // First sample (L): 32767 = 0x7FFF little-endian.
+        assert_eq!(&wav[44..46], &32767i16.to_le_bytes());
+        // Second sample (R): -32768 = 0x8000 little-endian.
+        assert_eq!(&wav[46..48], &(-32768i16).to_le_bytes());
     }
 }
