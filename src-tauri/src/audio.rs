@@ -632,3 +632,63 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
     output
 }
+
+/// Interleave a mono mic buffer and a mono system buffer into a stereo (2-channel)
+/// buffer: L = mic, R = system, laid out per-frame as [L0, R0, L1, R1, …]. The
+/// shorter side is padded with silence (0.0) to the longer length, so the result is
+/// always `2 * max(mic.len(), system.len())` samples. Used by Call mode to keep
+/// channel 0 ("me") and channel 1 ("them") separated for Deepgram multichannel.
+pub fn interleave_stereo(mic: &[f32], system: &[f32]) -> Vec<f32> {
+    let max_len = mic.len().max(system.len());
+    let mut out = Vec::with_capacity(max_len * 2);
+    for i in 0..max_len {
+        out.push(mic.get(i).copied().unwrap_or(0.0)); // L = mic
+        out.push(system.get(i).copied().unwrap_or(0.0)); // R = system
+    }
+    out
+}
+
+#[cfg(test)]
+mod interleave_stereo_tests {
+    use super::*;
+
+    #[test]
+    fn equal_lengths_interleave_l_mic_r_system() {
+        // L = mic, R = system, frame-interleaved: [L0, R0, L1, R1].
+        let mic = [0.1f32, 0.2];
+        let system = [0.3f32, 0.4];
+        assert_eq!(
+            interleave_stereo(&mic, &system),
+            vec![0.1f32, 0.3, 0.2, 0.4]
+        );
+    }
+
+    #[test]
+    fn mic_longer_pads_system_with_silence() {
+        // system is shorter → its missing R samples are silence (0.0).
+        let mic = [0.1f32, 0.2, 0.5];
+        let system = [0.3f32];
+        assert_eq!(
+            interleave_stereo(&mic, &system),
+            vec![0.1f32, 0.3, 0.2, 0.0, 0.5, 0.0]
+        );
+    }
+
+    #[test]
+    fn system_longer_pads_mic_with_silence() {
+        // mic is shorter → its missing L samples are silence (0.0).
+        let mic = [0.1f32];
+        let system = [0.3f32, 0.4];
+        assert_eq!(
+            interleave_stereo(&mic, &system),
+            vec![0.1f32, 0.3, 0.0, 0.4]
+        );
+    }
+
+    #[test]
+    fn empty_inputs_yield_empty() {
+        assert!(interleave_stereo(&[], &[]).is_empty());
+        // One side empty still pads the other to a full stereo frame.
+        assert_eq!(interleave_stereo(&[], &[0.5f32]), vec![0.0f32, 0.5]);
+    }
+}
