@@ -535,7 +535,7 @@ impl AudioRecorder {
     }
 }
 
-fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+pub(crate) fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     if channels <= 1 {
         return samples.to_vec();
     }
@@ -608,7 +608,7 @@ mod silence_helper_tests {
     }
 }
 
-fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() {
         return samples.to_vec();
     }
