@@ -10,6 +10,27 @@
 
 ---
 
+## ⏱️ Execution Progress — READ FIRST
+
+| Chunk | Tasks | Status |
+|---|---|---|
+| 1. Pure stereo helpers | 1-2 | ✅ **DONE** — `4d1bf03`, `55e1922` |
+| 2. Deepgram multichannel transcribe | 3-5 | ✅ **DONE** — `06f6a19`, `e021281`, `09b5b8f` |
+| 3. `render_srt` `SpeakerLabelStyle` | 6 | ⬜ **← RESUME HERE** |
+| 4. `SystemAudioRecorder` (WASAPI) | 7-9 | ⬜ needs a real audio device; has MANUAL-VERIFY steps |
+| 5. `lib.rs` orchestration + `source` | 10-16 | ⬜ |
+| 6. Frontend source selector | 17-20 | ⬜ incl. Task 20 (per-file SRT style) |
+
+**State at handoff (2026-07-09):** `main` is green and pushed. `cargo test` = **39 passed, 0 failed**. Tasks 1-5 were executed under strict TDD — every test was watched failing with `E0425` before a line of implementation was written.
+
+**What already works (all unit-tested, nothing wired yet):** mic+system → `interleave_stereo` → `samples_to_wav_stereo` → `transcribe_deepgram_multichannel` → per-channel `parse_deepgram_words` + channel-index stamp → chronological merge by `start_ms` → labeled `"אני:"/"הצד השני:"` text via `srt::call_side_label`.
+
+> ⚠️ **The 6 `dead_code` warnings are EXPECTED and correct.** `interleave_stereo`, `samples_to_wav_stereo`, `multichannel_url`, `build_multichannel_result`, `transcribe_deepgram_multichannel`, `call_side_label` — nothing *calls* the Call path until **Chunk 5** wires it, and the warnings vanish then. Do **not** "fix" them by deleting code or adding `#[allow(dead_code)]`.
+
+**Resume:** execute **Task 6** (Chunk 3). Prefer `superpowers:subagent-driven-development`; fall back to `superpowers:executing-plans` if subagents are unavailable. Each task commits atomically, so it is always safe to stop between tasks.
+
+---
+
 ## File Structure
 
 | File | Created/Modified | Single responsibility |

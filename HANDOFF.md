@@ -48,11 +48,13 @@ Done via red-green-refactor (the Deepgram parser had **zero** tests before — n
 - **Tests: 28/28 green** (`srt` 12, incl. 3 new speaker tests; `api_transcribe` 2 new parser tests — first ever for that parser). No new compiler/clippy warnings in the touched files.
 - ⏳ **SHIP-GATE (only open item):** one real diarized request — `nova-3` + `he` + `diarize=true` on a **2-speaker Hebrew** clip — to confirm Deepgram actually populates `speaker` in `words[]` (the flagged 2026-05 "Batch Diarization v2" nuance) and the exported SRT shows `דובר 1:/דובר 2:`. Needs Henry's Deepgram key + a two-person recording (or just run the app on any 2-voice audio → export SRT). **Not yet run. Not yet committed.**
 
-### 2. System-audio capture for meetings — ✅ SPEC + PLAN DONE (2026-07-09), ready to implement
+### 2. System-audio capture for meetings — ✅ SPEC + PLAN DONE · 🔨 IMPLEMENTATION IN PROGRESS (5/20 tasks)
 
 > **State:** brainstormed → spec approved (`docs/superpowers/specs/2026-07-09-system-audio-capture-design.md`, `e44977e`) → **20-task TDD implementation plan** authored + adversarially reviewed (`docs/superpowers/plans/2026-07-09-system-audio-capture.md`, `6d697ba`).
 > **Design locked:** three sources (`Mic`/`System`/`Call`). Call captures mic + system separately → stereo WAV (L=mic, R=system) → Deepgram `multichannel=true` → "אני"/"הצד השני". Batch-only v1, cloud-only (multichannel is Deepgram-only), Windows-only via the `wasapi` crate (chosen over cpal-loopback, which is documented-but-flaky).
-> **Next:** execute via `superpowers:subagent-driven-development`, starting at Chunk 1 (pure helpers).
+> **Progress (2026-07-09):** **Chunks 1-2 DONE** — Tasks 1-5 implemented under strict TDD and pushed (`4d1bf03`, `55e1922`, `06f6a19`, `e021281`, `09b5b8f`). `cargo test` = **39 passed**, `main` green. The whole Deepgram Call core now exists (unit-tested, not yet wired): mic+system → `interleave_stereo` → `samples_to_wav_stereo` → `transcribe_deepgram_multichannel` → per-channel parse + channel stamp + chronological merge → labeled "אני:/הצד השני:" text.
+> **Resume at Chunk 3 / Task 6** (`render_srt` + `SpeakerLabelStyle` + the `export_srt` styles param). See the plan's **"Execution Progress"** table at the top — it is the single source of truth for where to pick up. Each task commits atomically, so stopping between tasks is always safe.
+> ⚠️ **The 6 `dead_code` warnings are expected** (nothing calls the Call path until Chunk 5 wires it). Do **not** delete the code or add `#[allow(dead_code)]` to silence them.
 > ⚠️ Plan review caught and fixed a production-dead `SpeakerLabelStyle::Call` (`export_srt` hardcoded Diarization → a Call would have exported "דובר 1/2"). See the plan's Task 6 + the added Task 20.
 
 The original research that led here:
