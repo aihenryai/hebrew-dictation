@@ -442,6 +442,43 @@ fn build_multichannel_result(
     (text, segments)
 }
 
+/// Multichannel (stereo) Deepgram batch request — the Call-mode core. `stereo_wav_bytes`
+/// is a 2-channel / 16kHz WAV body (channel 0 = mic → "me", channel 1 = system
+/// → "them"), built by `samples_to_wav_stereo` upstream. Sends `&multichannel=true`
+/// and — unlike `transcribe_deepgram_batch` — NO `diarize`/`paragraphs`: each
+/// channel is transcribed on its own, the channel index is stamped as the
+/// speaker, and the labeled `text` is built from the merged segments (see
+/// `build_multichannel_result`). The caller supplies a client with a long
+/// timeout; this fn sets none of its own (parity with `transcribe_deepgram_batch`).
+pub(crate) async fn transcribe_deepgram_multichannel(
+    client: &reqwest::Client,
+    stereo_wav_bytes: Vec<u8>,
+    api_key: &str,
+    language: &str,
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+    let response = client
+        .post(multichannel_url(language))
+        .header("Authorization", format!("Token {}", api_key))
+        .header("Content-Type", "audio/wav")
+        .body(stereo_wav_bytes)
+        .send()
+        .await
+        .map_err(|e| classify_request_error(&e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_status(status, &body));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Other(format!("Failed to parse Deepgram response: {}", e)))?;
+
+    Ok(build_multichannel_result(&body))
+}
+
 // ── Unified entry point ──
 
 /// Languages accepted by the transcription APIs.
@@ -637,5 +674,23 @@ mod tests {
         assert_eq!(text, "הצד השני: מה נשמע\nאני: הכול טוב");
         assert!(text.contains("אני:"));
         assert!(text.contains("הצד השני:"));
+    }
+
+    #[test]
+    fn multichannel_wrapper_has_expected_signature() {
+        // Compile-time signature guard only — never polls the future, never hits
+        // the network. `_reference` compiles ONLY if transcribe_deepgram_multichannel
+        // takes (&reqwest::Client, Vec<u8>, &str, &str) and returns a future whose
+        // Output is Result<(String, Vec<TimedSegment>), ApiError>.
+        #[allow(dead_code)]
+        async fn _reference(
+            client: &reqwest::Client,
+            bytes: Vec<u8>,
+            key: &str,
+            lang: &str,
+        ) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+            transcribe_deepgram_multichannel(client, bytes, key, lang).await
+        }
+        let _ = _reference; // silence unused warning; body is never executed
     }
 }
