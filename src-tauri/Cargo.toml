@@ -51,3 +51,9 @@ rubato = "3"
 # Minimal blocking HTTP server for the opt-in local API (127.0.0.1 only) — no
 # async runtime integration needed, so this runs on its own plain OS thread.
 tiny_http = "0.12"
+
+# WASAPI loopback capture of the default render device (system audio). Windows only.
+# Pinned to 0.23.x; the capture body below targets 0.23.0's StreamMode-based API
+# (three-arg initialize_client; loopback = default Render device + Direction::Capture).
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
