@@ -568,13 +568,17 @@ fn restore_recorder_settings(state: &State<AppState>) {
 /// as short dictation but disables VAD auto-stop so the user controls stop manually.
 /// Blocks while a transcription or another batch recording is already in progress.
 #[tauri::command]
-fn start_batch_recording(state: State<AppState>) -> Result<(), String> {
+fn start_batch_recording(
+    state: State<AppState>,
+    source: Option<batch::RecordingSource>,
+) -> Result<(), String> {
+    let source = source.unwrap_or_default();
+
     if state.batch_in_progress.load(Ordering::SeqCst) {
         return Err("תמלול בתהליך — המתן לסיומו לפני הקלטה".to_string());
     }
-    // Symmetric to C1: a live streaming session also owns the recorder. `try_lock`
-    // keeps this command sync — a held lock means streaming is mid setup/teardown,
-    // so treat it as busy rather than racing into `recorder.start_recording()`.
+    // Symmetric to C1: a live streaming session also owns the mic recorder. `try_lock`
+    // keeps this command sync — a held lock means streaming is mid setup/teardown.
     match state.streaming.try_lock() {
         Ok(guard) if guard.is_some() => {
             return Err("חיבור streaming פעיל — עצור אותו לפני הקלטת ישיבה".to_string());
@@ -584,21 +588,74 @@ fn start_batch_recording(state: State<AppState>) -> Result<(), String> {
         }
         Ok(_) => {}
     }
+
+    // Call needs Deepgram (multichannel) — fail BEFORE recording if no key exists,
+    // so the user isn't left with an un-transcribable capture (spec §6).
+    if matches!(source, batch::RecordingSource::Call) {
+        let has_key = {
+            let s = state.settings.lock().map_err(|e| e.to_string())?;
+            s.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty())
+        };
+        batch::ensure_call_deepgram_available(has_key)?;
+    }
+
     if state.batch_recording_in_progress.swap(true, Ordering::SeqCst) {
         return Err("הקלטה כבר בתהליך".to_string());
     }
-    let mut recorder = state.recorder.lock().map_err(|e| {
+
+    let result = start_recorders_for_source(&state, source);
+    if result.is_err() {
+        // Never leave the guard set on a failed start, or short dictation stays blocked.
         state.batch_recording_in_progress.store(false, Ordering::SeqCst);
-        e.to_string()
-    })?;
-    // Disable VAD — user stops manually.
+    }
+    result
+}
+
+/// Mic batch-recording setup, factored out so Mic and Call share exactly one code
+/// path (VAD off — user stops manually; 1-hour hard ceiling in AudioRecorder).
+fn start_mic_batch(state: &State<AppState>) -> Result<(), String> {
+    let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
     recorder.set_vad_enabled(false);
-    // Allow up to 1 hour (hard ceiling in AudioRecorder).
     recorder.set_max_recording_secs(3600.0);
-    recorder.start_recording().map_err(|e| {
-        state.batch_recording_in_progress.store(false, Ordering::SeqCst);
-        e
-    })
+    recorder.start_recording()
+}
+
+/// Start the recorder(s) a batch `source` needs, per the tested `recorders_for_source`
+/// table (Task 12): Mic = existing cpal path; System = loopback only; Call = BOTH, so
+/// the two sides can be interleaved at stop. System/Call are Windows-only (spec §6);
+/// Call rolls the mic back if loopback fails so no half-open capture is left behind.
+fn start_recorders_for_source(
+    state: &State<AppState>,
+    source: batch::RecordingSource,
+) -> Result<(), String> {
+    let (uses_mic, uses_system) = batch::recorders_for_source(source);
+
+    // Reject System/Call up front on non-Windows — BEFORE starting the mic — so an
+    // unsupported platform never leaves a half-open mic capture running.
+    #[cfg(not(target_os = "windows"))]
+    if uses_system {
+        return Err("לכידת אודיו-מערכת נתמכת רק ב-Windows".to_string());
+    }
+
+    if uses_mic {
+        start_mic_batch(state)?;
+    }
+
+    #[cfg(target_os = "windows")]
+    if uses_system {
+        let mut sys = state.system_recorder.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = sys.start_recording() {
+            drop(sys);
+            // Roll back a mic we started for Call — no half-open capture behind us.
+            if uses_mic {
+                if let Ok(mut rec) = state.recorder.lock() {
+                    let _ = rec.stop_recording();
+                }
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Stop the batch recording, write the captured audio to a temporary WAV file,
