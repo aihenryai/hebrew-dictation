@@ -383,6 +383,20 @@ pub(crate) fn parse_deepgram_words(alt: &serde_json::Value) -> Vec<crate::srt::T
         .unwrap_or_default()
 }
 
+/// Build the Deepgram `/listen` URL for Call-mode multichannel transcription:
+/// the same nova-3 base as `transcribe_deepgram_batch` but WITH
+/// `multichannel=true` and deliberately WITHOUT `diarize`/`paragraphs`. Each
+/// channel is transcribed independently and the labeled text is assembled from
+/// the merged segments (`build_multichannel_result`), never from Deepgram's
+/// per-channel flat transcript. `auto` maps to Hebrew, matching the batch route.
+fn multichannel_url(language: &str) -> String {
+    let lang = if language == "auto" { "he" } else { language };
+    format!(
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&multichannel=true",
+        lang
+    )
+}
+
 // ── Unified entry point ──
 
 /// Languages accepted by the transcription APIs.
@@ -519,5 +533,25 @@ mod tests {
         assert_eq!(&wav[44..46], &32767i16.to_le_bytes());
         // Second sample (R): -32768 = 0x8000 little-endian.
         assert_eq!(&wav[46..48], &(-32768i16).to_le_bytes());
+    }
+
+    #[test]
+    fn multichannel_url_has_multichannel_but_no_diarize_or_paragraphs() {
+        // Same nova-3 base as the batch route, "auto" resolved to Hebrew…
+        let url = multichannel_url("auto");
+        assert!(url.contains("model=nova-3"));
+        assert!(url.contains("language=he"));
+        assert!(url.contains("smart_format=true"));
+        assert!(url.contains("punctuate=true"));
+        // …but Call mode is per-channel: multichannel ON, and NO diarize/paragraphs
+        // (the labeled text is built from segments, not the flat transcript).
+        assert!(url.contains("multichannel=true"));
+        assert!(!url.contains("diarize"));
+        assert!(!url.contains("paragraphs"));
+        // An explicit language passes through unchanged.
+        assert_eq!(
+            multichannel_url("he"),
+            "https://api.deepgram.com/v1/listen?model=nova-3&language=he&smart_format=true&punctuate=true&multichannel=true"
+        );
     }
 }
