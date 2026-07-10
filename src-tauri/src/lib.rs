@@ -662,11 +662,18 @@ fn start_recorders_for_source(
 /// and return its path. The frontend then calls `transcribe_file` with the path
 /// (same pipeline as file-upload), so no large sample buffer crosses the IPC bridge.
 #[tauri::command]
-async fn stop_batch_recording_to_file(state: State<'_, AppState>) -> Result<String, String> {
-    let samples = {
-        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        recorder.stop_recording()?
-    };
+async fn stop_batch_recording_to_file(
+    state: State<'_, AppState>,
+    source: Option<batch::RecordingSource>,
+) -> Result<String, String> {
+    let source = source.unwrap_or_default();
+    // Call is NOT a mono file path — it interleaves two channels and transcribes
+    // inline; the frontend must call `stop_call_recording` instead.
+    if matches!(source, batch::RecordingSource::Call) {
+        return Err("מצב שיחה נעצר דרך stop_call_recording ולא דרך מסלול-הקובץ".to_string());
+    }
+
+    let samples = stop_recorder_for_source(&state, source)?;
     state.batch_recording_in_progress.store(false, Ordering::SeqCst);
     restore_recorder_settings(&state);
 
@@ -681,6 +688,124 @@ async fn stop_batch_recording_to_file(state: State<'_, AppState>) -> Result<Stri
     let tmp_path = std::env::temp_dir().join(format!("hd-recording-{}.wav", epoch));
     write_wav_16k_mono(&tmp_path, &samples)?;
     Ok(tmp_path.to_string_lossy().to_string())
+}
+
+/// Stop and drain the recorder a non-Call `source` used, returning its mono samples.
+fn stop_recorder_for_source(
+    state: &State<AppState>,
+    source: batch::RecordingSource,
+) -> Result<Vec<f32>, String> {
+    match source {
+        batch::RecordingSource::Mic => {
+            let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+            recorder.stop_recording()
+        }
+        #[cfg(target_os = "windows")]
+        batch::RecordingSource::System => {
+            let mut sys = state.system_recorder.lock().map_err(|e| e.to_string())?;
+            sys.stop_recording()
+        }
+        #[cfg(target_os = "windows")]
+        batch::RecordingSource::Call => unreachable!("Call is handled before this call"),
+        #[cfg(not(target_os = "windows"))]
+        batch::RecordingSource::System | batch::RecordingSource::Call => {
+            Err("לכידת אודיו-מערכת נתמכת רק ב-Windows".to_string())
+        }
+    }
+}
+
+/// Stop a `Call` recording: drain BOTH recorders, interleave to stereo, and
+/// transcribe via Deepgram `multichannel=true` — bypassing the mono file path
+/// (`transcribe_file` → `decode_file_to_16k_mono` would collapse the channels).
+/// Returns a `TranscribeFileResult` so every existing consumer (inject/copy/TXT/
+/// DOCX/SRT) works unchanged. `opts.mode` is ignored: Call always uses Deepgram
+/// (spec §6). Mirrors `transcribe_file`'s one-batch-at-a-time guard + cancel.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn stop_call_recording(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    opts: batch::BatchOpts,
+) -> Result<TranscribeFileResult, String> {
+    if state.batch_in_progress.swap(true, Ordering::SeqCst) {
+        return Err("תמלול ארוך כבר רץ — המתן לסיומו או בטל אותו".to_string());
+    }
+    state.batch_cancel.store(false, Ordering::SeqCst);
+    let result = run_stop_call_recording(&app, &state, opts).await;
+    state.batch_in_progress.store(false, Ordering::SeqCst);
+    result
+}
+
+#[cfg(target_os = "windows")]
+async fn run_stop_call_recording(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    opts: batch::BatchOpts,
+) -> Result<TranscribeFileResult, String> {
+    // Clear the recording guard FIRST — mirrors cancel_batch_recording (lib.rs:610)
+    // and start_batch_recording's rollback. If either recorder lock is poisoned
+    // below, the `?` returns early; leaving this flag set would block short
+    // dictation (Alt+D) until app restart. `batch_in_progress` is cleared by the
+    // outer stop_call_recording, so without this only the recording guard leaks.
+    state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+
+    // Stop both captures (mic first, matching start order); always drain system so
+    // its buffer never leaks into a later session.
+    let mic = {
+        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        recorder.stop_recording()?
+    };
+    let system = {
+        let mut sys = state.system_recorder.lock().map_err(|e| e.to_string())?;
+        sys.stop_recording()?
+    };
+    restore_recorder_settings(state);
+
+    // Interleave L=mic / R=system; the near-silence guard runs on the COMBINED
+    // buffer (§6) — a one-sided call is NOT blocked because the buffer has content.
+    let interleaved = audio::interleave_stereo(&mic, &system);
+    let stereo_wav = call_stereo_wav_or_silent(&interleaved)?;
+
+    // Call forces Deepgram regardless of opts.mode; key was checked before recording,
+    // re-check defensively here.
+    let key = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        s.deepgram_api_key.clone()
+    };
+    let key = key
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "מצב שיחה דורש מפתח Deepgram. הוסף אותו בהגדרות.".to_string())?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .map_err(|e| format!("שגיאת לקוח רשת: {}", e))?;
+
+    let _ = app.emit(
+        "batch-progress",
+        serde_json::json!({ "stage": "transcribing", "pct": 0 }),
+    );
+
+    let notify = state.batch_cancel_notify.clone();
+    let fut =
+        api_transcribe::transcribe_deepgram_multichannel(&client, stereo_wav, &key, &opts.language);
+    let (text, segments) = tokio::select! {
+        r = fut => r.map_err(|e| e.to_string())?,
+        _ = notify.notified() => return Err(batch::CANCELLED.to_string()),
+    };
+    let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
+    Ok(TranscribeFileResult { text, segments })
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn stop_call_recording(
+    _app: AppHandle,
+    _state: State<'_, AppState>,
+    _opts: batch::BatchOpts,
+) -> Result<TranscribeFileResult, String> {
+    Err("מצב שיחה נתמך רק ב-Windows".to_string())
 }
 
 /// Cancel a batch recording in progress — discards the accumulated audio buffer.
@@ -1901,6 +2026,7 @@ pub fn run() {
             cancel_batch,
             start_batch_recording,
             stop_batch_recording_to_file,
+            stop_call_recording,
             cancel_batch_recording,
             delete_temp_recording,
             pick_audio_file,
