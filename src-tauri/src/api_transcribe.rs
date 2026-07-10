@@ -397,6 +397,51 @@ fn multichannel_url(language: &str) -> String {
     )
 }
 
+/// Turn a Deepgram *multichannel* response into `(labeled_text, merged_segments)`,
+/// mirroring `transcribe_deepgram_batch`'s return shape. `diarize` is off for
+/// multichannel, so `parse_deepgram_words` yields `speaker: None`; we therefore
+/// stamp each channel's index as the speaker (channel 0 = "me", channel 1 =
+/// "them") on every word BEFORE chunking. Both channels' cues are merged by
+/// `start_ms` (they share the one stereo-file clock) and the `text` is built
+/// from those merged cues — never from Deepgram's per-channel flat transcript,
+/// which defaults to channel 0 and would silently drop "them".
+fn build_multichannel_result(
+    body: &serde_json::Value,
+) -> (String, Vec<crate::srt::TimedSegment>) {
+    let mut segments: Vec<crate::srt::TimedSegment> = Vec::new();
+    for channel_idx in 0u32..2 {
+        let alt = &body["results"]["channels"][channel_idx as usize]["alternatives"][0];
+        let mut words = parse_deepgram_words(alt);
+        // diarize is off → the parser returns None; stamp the channel index
+        // explicitly on each word before chunking (spec §4.4).
+        for w in &mut words {
+            w.speaker = Some(channel_idx);
+        }
+        segments.extend(crate::srt::chunk_words_to_cues(
+            &words,
+            crate::srt::SRT_MAX_WORDS_PER_CUE,
+            crate::srt::SRT_MAX_MS_PER_CUE,
+        ));
+    }
+    // Both channels share the single stereo-file clock, so start_ms merges them
+    // chronologically. Stable sort keeps channel 0 before channel 1 on ties.
+    segments.sort_by_key(|s| s.start_ms);
+
+    let text = segments
+        .iter()
+        .map(|seg| {
+            // Single source of truth (srt::call_side_label), shared with
+            // render_srt's Call arm so the injected text and the SRT prefix
+            // can never drift apart.
+            let label = crate::srt::call_side_label(seg.speaker.unwrap_or(1));
+            format!("{}: {}", label, seg.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (text, segments)
+}
+
 // ── Unified entry point ──
 
 /// Languages accepted by the transcription APIs.
@@ -553,5 +598,44 @@ mod tests {
             multichannel_url("he"),
             "https://api.deepgram.com/v1/listen?model=nova-3&language=he&smart_format=true&punctuate=true&multichannel=true"
         );
+    }
+
+    #[test]
+    fn multichannel_stamps_channel_speaker_and_labels_text() {
+        // Deepgram multichannel response with diarize OFF: words carry NO `speaker`
+        // field, so the parser returns None and the channel index must be stamped
+        // explicitly. channels[0] = mic ("me"), channels[1] = system ("them").
+        // "them" speaks first in time, so the chronological merge must reorder it
+        // ahead of "me" — proving the merge is by start_ms, not append order.
+        let body = serde_json::json!({
+            "results": {
+                "channels": [
+                    { "alternatives": [{ "words": [
+                        { "word": "הכול", "punctuated_word": "הכול", "start": 1.0, "end": 1.3 },
+                        { "word": "טוב", "punctuated_word": "טוב", "start": 1.3, "end": 1.6 }
+                    ]}]},
+                    { "alternatives": [{ "words": [
+                        { "word": "מה", "punctuated_word": "מה", "start": 0.0, "end": 0.3 },
+                        { "word": "נשמע", "punctuated_word": "נשמע", "start": 0.3, "end": 0.6 }
+                    ]}]}
+                ]
+            }
+        });
+
+        let (text, segments) = build_multichannel_result(&body);
+
+        // Channel index stamped explicitly (parser returned None — diarize off).
+        assert_eq!(segments.len(), 2);
+        // Merged chronologically: channel 1 ("them", start 0) before channel 0
+        // ("me", start 1000).
+        assert_eq!(segments[0].speaker, Some(1));
+        assert_eq!(segments[0].text, "מה נשמע");
+        assert_eq!(segments[1].speaker, Some(0));
+        assert_eq!(segments[1].text, "הכול טוב");
+
+        // Labeled text in chronological order, with BOTH sides present.
+        assert_eq!(text, "הצד השני: מה נשמע\nאני: הכול טוב");
+        assert!(text.contains("אני:"));
+        assert!(text.contains("הצד השני:"));
     }
 }

@@ -89,6 +89,17 @@ pub fn format_srt_timestamp(ms: u64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", hours, minutes, seconds, millis)
 }
 
+/// The Call-mode side label for a channel-index speaker: interleaved channel 0
+/// is the local mic, any other channel is the far end. Single source of truth,
+/// shared by `render_srt`'s Call arm and the multichannel transcript builder.
+pub fn call_side_label(speaker: u32) -> &'static str {
+    if speaker == 0 {
+        "אני"
+    } else {
+        "הצד השני"
+    }
+}
+
 /// Render one or more files' cue lists into a single SRT document. Each
 /// file's cues are offset by the cumulative end time of all files before
 /// it (files play back-to-back, no artificial gap), and cue numbers are
