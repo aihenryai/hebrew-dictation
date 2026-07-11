@@ -643,10 +643,14 @@ fn start_recorders_for_source(
 
     #[cfg(target_os = "windows")]
     if uses_system {
-        let mut sys = state.system_recorder.lock().map_err(|e| e.to_string())?;
-        if let Err(e) = sys.start_recording() {
-            drop(sys);
-            // Roll back a mic we started for Call — no half-open capture behind us.
+        // Roll the mic back on ANY failure here — a poisoned system_recorder lock,
+        // not only a loopback-bind error, must not leave a half-open mic capture.
+        let sys_result = state
+            .system_recorder
+            .lock()
+            .map_err(|e| e.to_string())
+            .and_then(|mut sys| sys.start_recording());
+        if let Err(e) = sys_result {
             if uses_mic {
                 if let Ok(mut rec) = state.recorder.lock() {
                     let _ = rec.stop_recording();
@@ -682,7 +686,15 @@ async fn stop_batch_recording_to_file(
     restore_recorder_settings(&state);
 
     if samples.is_empty() || audio::is_effectively_silent(&samples, 0.005) {
-        return Err("לא נקלט אודיו — ודא שהמיקרופון מחובר ופעיל.".to_string());
+        // Source-aware hint: System captures loopback audio, not the mic — don't tell
+        // a System user to check their microphone.
+        let msg = match source {
+            batch::RecordingSource::System => {
+                "לא נקלט אודיו — ודאו שמתנגן קול במחשב ושלכידת-המערכת פעילה."
+            }
+            _ => "לא נקלט אודיו — ודא שהמיקרופון מחובר ופעיל.",
+        };
+        return Err(msg.to_string());
     }
 
     let epoch = std::time::SystemTime::now()
@@ -753,16 +765,22 @@ async fn run_stop_call_recording(
     // outer stop_call_recording, so without this only the recording guard leaks.
     state.batch_recording_in_progress.store(false, Ordering::SeqCst);
 
-    // Stop both captures (mic first, matching start order); always drain system so
-    // its buffer never leaks into a later session.
-    let mic = {
-        let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        recorder.stop_recording()?
-    };
-    let system = {
-        let mut sys = state.system_recorder.lock().map_err(|e| e.to_string())?;
-        sys.stop_recording()?
-    };
+    // Stop both captures, computing BOTH results before propagating any error: a
+    // failing mic stop (or a poisoned mic lock) must NOT skip draining the system
+    // recorder, whose WASAPI thread must always be joined so it never leaks into a
+    // later session.
+    let mic_result = state
+        .recorder
+        .lock()
+        .map_err(|e| e.to_string())
+        .and_then(|mut r| r.stop_recording());
+    let system_result = state
+        .system_recorder
+        .lock()
+        .map_err(|e| e.to_string())
+        .and_then(|mut s| s.stop_recording());
+    let mic = mic_result?;
+    let system = system_result?;
     restore_recorder_settings(state);
 
     // Interleave L=mic / R=system; the near-silence guard runs on the COMBINED

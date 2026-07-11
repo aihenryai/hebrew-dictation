@@ -609,7 +609,7 @@ mod silence_helper_tests {
 }
 
 pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate || samples.is_empty() {
+    if from_rate == to_rate || from_rate == 0 || samples.is_empty() {
         return samples.to_vec();
     }
 

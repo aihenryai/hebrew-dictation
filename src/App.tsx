@@ -53,6 +53,9 @@ interface TimedSegment {
   text: string;
   start_ms: number;
   end_ms: number;
+  // Diarization / Call channel index (0 = "אני", else "הצד השני"). Carried opaquely
+  // from the backend and sent back on export_srt; drives the Call SRT labels.
+  speaker?: number | null;
 }
 interface BatchResult {
   id: number;
@@ -2465,6 +2468,18 @@ function App() {
               </>
             )}
           </div>
+        )}
+
+        {/* Call always transcribes via Deepgram cloud (multichannel), even when the
+            "private/on-device" mode card is selected — surface that so a call-recording
+            user is never misled about where the audio goes. */}
+        {!batchRecording && recordSource === "call" && (
+          <p
+            role="note"
+            style={{ margin: "0 0 8px", fontSize: "0.8rem", opacity: 0.8, textAlign: "center" }}
+          >
+            🔒 שיחה מתומללת תמיד בענן (Deepgram) — גם אם בחרתם "פרטי — מכשיר".
+          </p>
         )}
 
         {/* Actions — pinned near the top so a growing result list never pushes them off-screen */}
