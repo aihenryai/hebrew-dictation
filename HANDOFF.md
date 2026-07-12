@@ -64,7 +64,17 @@ Today's mic capture uses `cpal` (cross-platform). To also capture the OTHER side
 
 ---
 
-## 🔜 START HERE NEXT SESSION — 4th recording mode + source-selector UI regroup (approved by Henry 2026-07-12, NOT started)
+## ✅ DONE 2026-07-12 — 4th recording mode (`CallLocal`) + source-selector UI regroup
+
+**State:** brainstorm (all 4 design Qs closed with Henry) → spec (`docs/superpowers/specs/2026-07-12-recording-modes-ux.md`, reviewer-approved) → 6-task TDD plan (`docs/superpowers/plans/2026-07-12-recording-modes-ux.md`, reviewer-approved) → **fully implemented via subagent-driven TDD, committed to `main` (`6949ed7`→`75863af`), NOT pushed (Henry controls the deploy).** `cargo test` = **55 passed / 1 ignored**, `cargo build` = **0 warnings**, clippy = clean for touched code (6 warnings are all pre-existing in untouched files), `tsc && vite build` = clean. Final two-stage review (spec-compliance + code-quality) = both ✅, no Critical/Important.
+
+**What shipped (per the design below):** enum `Call`→`CallCloud` + new `CallLocal`; pure `mix_to_mono` (audio.rs, avg+silence-pad); `CallLocal` drains BOTH recorders → mixes to mono → existing mono file path → **forced-local whisper**; pre-record model guard (symmetric to CallCloud's Deepgram-key guard); meeting-specific silence message. Frontend: two labeled groups ("הקלטה רגילה" / "פגישות"), benefit-led meeting cards ("עם זיהוי דוברים" / "פרטית במכשיר"), context-dependent cloud/local selector (shown only for mic/system), standalone transparency note deleted.
+
+**⏳ ONLY open item — MANUAL-VERIFY on real Windows audio (Henry, can't automate):** with a whisper model downloaded, `npm run tauri dev` → batch view → pick **פגישה — פרטית במכשיר**, speak while system audio plays, stop → expect one **local mono** transcript (no "אני/הצד השני"). Also: no-model → guard error fires *before* recording; cancel mid-CallLocal then start a meeting again works (system-recorder drain, the af30355 regression gate); the cloud/local cards appear only for mic/system. Then push when satisfied.
+
+---
+
+## 📐 Original design (approved by Henry 2026-07-12) — for reference
 
 **Goal:** add a 4th mode and reorganize the batch source selector for MAXIMUM UX clarity (Henry's explicit #1 priority — "מאוד מאוד חשוב שחוויית המשתמש תהיה מאוד מאוד ברורה").
 
