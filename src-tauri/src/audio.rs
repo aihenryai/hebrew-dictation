@@ -648,6 +648,23 @@ pub fn interleave_stereo(mic: &[f32], system: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Mix two 16 kHz mono buffers into one by averaging sample-wise, padding the
+/// shorter side with silence (`0.0`). Output length = `max(mic.len, system.len)`.
+/// Averaging (×0.5) — not summation — avoids clipping when both sides speak at once;
+/// the cost is that a one-sided moment plays at half amplitude (whisper tolerates
+/// level). Used by the `CallLocal` ("פגישה מקומית") stop path. Pairs with
+/// `interleave_stereo` (which keeps the channels separate for `CallCloud`).
+pub fn mix_to_mono(mic: &[f32], system: &[f32]) -> Vec<f32> {
+    let n = mic.len().max(system.len());
+    (0..n)
+        .map(|i| {
+            let m = mic.get(i).copied().unwrap_or(0.0);
+            let s = system.get(i).copied().unwrap_or(0.0);
+            (m + s) * 0.5
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod interleave_stereo_tests {
     use super::*;
@@ -690,5 +707,40 @@ mod interleave_stereo_tests {
         assert!(interleave_stereo(&[], &[]).is_empty());
         // One side empty still pads the other to a full stereo frame.
         assert_eq!(interleave_stereo(&[], &[0.5f32]), vec![0.0f32, 0.5]);
+    }
+}
+
+#[cfg(test)]
+mod mix_to_mono_tests {
+    use super::*;
+
+    #[test]
+    fn equal_lengths_average_sample_wise() {
+        // (m + s) * 0.5 per sample. Values chosen exact in f32.
+        let mic = [0.5f32, 0.25];
+        let system = [0.5f32, -0.25];
+        assert_eq!(mix_to_mono(&mic, &system), vec![0.5f32, 0.0]);
+    }
+
+    #[test]
+    fn mic_longer_pads_system_with_silence() {
+        // system missing samples count as 0.0 → (m + 0) * 0.5.
+        let mic = [0.5f32, 0.5];
+        let system = [0.5f32];
+        assert_eq!(mix_to_mono(&mic, &system), vec![0.5f32, 0.25]);
+    }
+
+    #[test]
+    fn system_longer_pads_mic_with_silence() {
+        let mic = [0.5f32];
+        let system = [0.5f32, 1.0];
+        assert_eq!(mix_to_mono(&mic, &system), vec![0.5f32, 0.5]);
+    }
+
+    #[test]
+    fn empty_and_one_sided() {
+        assert!(mix_to_mono(&[], &[]).is_empty());
+        // One side empty → the other is halved (0 + 0.5) * 0.5.
+        assert_eq!(mix_to_mono(&[], &[0.5f32]), vec![0.25f32]);
     }
 }
