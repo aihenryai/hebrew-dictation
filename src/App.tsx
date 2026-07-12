@@ -1100,16 +1100,19 @@ function App() {
     setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "processing" } : r));
 
     try {
-      // Call → dedicated backend command (stops both recorders, interleaves,
+      // calllocal is FORCED local (its card encodes the engine, so the cloud/local
+      // selector is hidden for it); mic/system honor the batchMode selector.
+      const fileMode = recordSource === "calllocal" ? "local" : batchMode;
+      // CallCloud → dedicated backend command (stops both recorders, interleaves,
       // multichannel Deepgram, returns tagged "אני:"/"הצד השני:" text + merged
-      // segments). Mic/System → existing mono file path, unchanged.
+      // segments). Mic/System/CallLocal → existing mono file path.
       const { text, segments } = isCallCloud
         ? await invoke<{ text: string; segments: TimedSegment[] }>("stop_call_recording", {
             opts: { mode: batchMode, language: "he", inject: false },
           })
         : await invoke<{ text: string; segments: TimedSegment[] }>(
             "transcribe_file",
-            { filePath, opts: { mode: batchMode, language: "he", inject: false } }
+            { filePath, opts: { mode: fileMode, language: "he", inject: false } }
           );
       setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "done", transcript: text, segments } : r));
     } catch (e) {
@@ -2403,30 +2406,6 @@ function App() {
           <h2 className="batch-view-title">תמלול קובץ</h2>
         </div>
 
-        {/* Mode selector */}
-        <div className="batch-mode-cards" role="group" aria-label="מצב תמלול">
-          <button
-            className={`batch-mode-card ${batchMode === "cloud" ? "active" : ""}`}
-            onClick={() => !batchRunning && !batchRecording && setBatchMode("cloud")}
-            disabled={batchRunning || batchRecording}
-            aria-pressed={batchMode === "cloud"}
-          >
-            <span className="batch-mode-icon" aria-hidden="true">☁</span>
-            <span className="batch-mode-name">מהיר — ענן</span>
-            <span className="batch-mode-desc">Deepgram · דורש מפתח API</span>
-          </button>
-          <button
-            className={`batch-mode-card ${batchMode === "local" ? "active" : ""}`}
-            onClick={() => !batchRunning && !batchRecording && setBatchMode("local")}
-            disabled={batchRunning || batchRecording}
-            aria-pressed={batchMode === "local"}
-          >
-            <span className="batch-mode-icon" aria-hidden="true">🔒</span>
-            <span className="batch-mode-name">פרטי — מכשיר</span>
-            <span className="batch-mode-desc">ללא אינטרנט · דורש מודל מורד</span>
-          </button>
-        </div>
-
         {/* batch-source-selector — recording source, chosen before recording, in two
             groups: "הקלטה רגילה" (mic / system) and "פגישות" (callcloud / calllocal).
             System + the whole "פגישות" group are Windows-only (WASAPI loopback) →
@@ -2492,6 +2471,33 @@ function App() {
               </>
             )}
           </>
+        )}
+
+        {/* Mode selector (cloud/local) — shown ONLY for the "regular" group (mic/system);
+            the meeting cards encode the engine themselves, so no selector for them (§3.2). */}
+        {(recordSource === "mic" || recordSource === "system") && (
+          <div className="batch-mode-cards" role="group" aria-label="מצב תמלול">
+            <button
+              className={`batch-mode-card ${batchMode === "cloud" ? "active" : ""}`}
+              onClick={() => !batchRunning && !batchRecording && setBatchMode("cloud")}
+              disabled={batchRunning || batchRecording}
+              aria-pressed={batchMode === "cloud"}
+            >
+              <span className="batch-mode-icon" aria-hidden="true">☁</span>
+              <span className="batch-mode-name">מהיר — ענן</span>
+              <span className="batch-mode-desc">Deepgram · דורש מפתח API</span>
+            </button>
+            <button
+              className={`batch-mode-card ${batchMode === "local" ? "active" : ""}`}
+              onClick={() => !batchRunning && !batchRecording && setBatchMode("local")}
+              disabled={batchRunning || batchRecording}
+              aria-pressed={batchMode === "local"}
+            >
+              <span className="batch-mode-icon" aria-hidden="true">🔒</span>
+              <span className="batch-mode-name">פרטי — מכשיר</span>
+              <span className="batch-mode-desc">ללא אינטרנט · דורש מודל מורד</span>
+            </button>
+          </div>
         )}
 
         {/* Actions — pinned near the top so a growing result list never pushes them off-screen */}
