@@ -79,10 +79,11 @@ type ApiProvider = "deepgram" | "groq";
 
 /** Recording input source, chosen before a batch recording and threaded into
  * `start_batch_recording` (Task 18). Default "mic" = existing behavior (zero
- * regression). "system" (WASAPI loopback) and "callcloud" (mic + system) are
+ * regression). "system" (WASAPI loopback), "callcloud" (mic + system → cloud
+ * multichannel) and "calllocal" (mic + system → mixed mono, local whisper) are
  * Windows-only — see IS_WINDOWS gating in the batch view. Wire values are
  * lowercase to match the app's existing `mode`/`language` invoke payloads. */
-type RecordingSource = "mic" | "system" | "callcloud";
+type RecordingSource = "mic" | "system" | "callcloud" | "calllocal";
 
 /** Settings sent to the backend. API keys are managed separately via set_api_key / clear_api_key. */
 interface AppSettings {
@@ -2426,25 +2427,28 @@ function App() {
           </button>
         </div>
 
-        {/* batch-source-selector — recording source (Mic / System / Call), chosen
-            before recording. System/Call are Windows-only (WASAPI loopback) →
-            hidden off-Windows. Reuses batch-mode-card styles; no new CSS.
-            (The machine anchor for git grep lives HERE in the comment, NOT in the
-            aria-label, which stays clean Hebrew per the repo's UI convention.) */}
+        {/* batch-source-selector — recording source, chosen before recording, in two
+            groups: "הקלטה רגילה" (mic / system) and "פגישות" (callcloud / calllocal).
+            System + the whole "פגישות" group are Windows-only (WASAPI loopback) →
+            hidden off-Windows. Group headers use inline styles (no new CSS). The git
+            grep anchors (calllocal) live in the code below, not the aria-labels. */}
         {!batchRecording && (
-          <div className="batch-mode-cards" role="group" aria-label="מקור הקלטה">
-            <button
-              className={`batch-mode-card ${recordSource === "mic" ? "active" : ""}`}
-              onClick={() => !batchRunning && setRecordSource("mic")}
-              disabled={batchRunning}
-              aria-pressed={recordSource === "mic"}
-            >
-              <span className="batch-mode-icon" aria-hidden="true">🎙</span>
-              <span className="batch-mode-name">מיקרופון</span>
-              <span className="batch-mode-desc">הקול שלכם בלבד</span>
-            </button>
-            {IS_WINDOWS && (
-              <>
+          <>
+            <div style={{ fontSize: "0.8rem", opacity: 0.7, margin: "8px 0 4px", textAlign: "center" }}>
+              הקלטה רגילה
+            </div>
+            <div className="batch-mode-cards" role="group" aria-label="הקלטה רגילה">
+              <button
+                className={`batch-mode-card ${recordSource === "mic" ? "active" : ""}`}
+                onClick={() => !batchRunning && setRecordSource("mic")}
+                disabled={batchRunning}
+                aria-pressed={recordSource === "mic"}
+              >
+                <span className="batch-mode-icon" aria-hidden="true">🎙</span>
+                <span className="batch-mode-name">מיקרופון</span>
+                <span className="batch-mode-desc">הקול שלכם בלבד</span>
+              </button>
+              {IS_WINDOWS && (
                 <button
                   className={`batch-mode-card ${recordSource === "system" ? "active" : ""}`}
                   onClick={() => !batchRunning && setRecordSource("system")}
@@ -2455,31 +2459,39 @@ function App() {
                   <span className="batch-mode-name">אודיו מערכת</span>
                   <span className="batch-mode-desc">מה שמתנגן במחשב</span>
                 </button>
-                <button
-                  className={`batch-mode-card ${recordSource === "callcloud" ? "active" : ""}`}
-                  onClick={() => !batchRunning && setRecordSource("callcloud")}
-                  disabled={batchRunning}
-                  aria-pressed={recordSource === "callcloud"}
-                >
-                  <span className="batch-mode-icon" aria-hidden="true">📞</span>
-                  <span className="batch-mode-name">שיחה</span>
-                  <span className="batch-mode-desc">אתם + הצד השני</span>
-                </button>
+              )}
+            </div>
+
+            {IS_WINDOWS && (
+              <>
+                <div style={{ fontSize: "0.8rem", opacity: 0.7, margin: "8px 0 4px", textAlign: "center" }}>
+                  פגישות
+                </div>
+                <div className="batch-mode-cards" role="group" aria-label="פגישות">
+                  <button
+                    className={`batch-mode-card ${recordSource === "callcloud" ? "active" : ""}`}
+                    onClick={() => !batchRunning && setRecordSource("callcloud")}
+                    disabled={batchRunning}
+                    aria-pressed={recordSource === "callcloud"}
+                  >
+                    <span className="batch-mode-icon" aria-hidden="true">📞</span>
+                    <span className="batch-mode-name">פגישה — עם זיהוי דוברים</span>
+                    <span className="batch-mode-desc">אתם + הצד השני, כל אחד בנפרד · מתומלל בענן</span>
+                  </button>
+                  <button
+                    className={`batch-mode-card ${recordSource === "calllocal" ? "active" : ""}`}
+                    onClick={() => !batchRunning && setRecordSource("calllocal")}
+                    disabled={batchRunning}
+                    aria-pressed={recordSource === "calllocal"}
+                  >
+                    <span className="batch-mode-icon" aria-hidden="true">🔒</span>
+                    <span className="batch-mode-name">פגישה — פרטית במכשיר</span>
+                    <span className="batch-mode-desc">אתם + הצד השני יחד · נשאר במחשב, בלי הפרדת דוברים</span>
+                  </button>
+                </div>
               </>
             )}
-          </div>
-        )}
-
-        {/* Call always transcribes via Deepgram cloud (multichannel), even when the
-            "private/on-device" mode card is selected — surface that so a call-recording
-            user is never misled about where the audio goes. */}
-        {!batchRecording && recordSource === "callcloud" && (
-          <p
-            role="note"
-            style={{ margin: "0 0 8px", fontSize: "0.8rem", opacity: 0.8, textAlign: "center" }}
-          >
-            🔒 שיחה מתומללת תמיד בענן (Deepgram) — גם אם בחרתם "פרטי — מכשיר".
-          </p>
+          </>
         )}
 
         {/* Actions — pinned near the top so a growing result list never pushes them off-screen */}
