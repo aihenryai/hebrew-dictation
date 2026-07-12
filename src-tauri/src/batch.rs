@@ -31,6 +31,9 @@ pub enum RecordingSource {
     System,
     /// Mic + system captured together, interleaved to stereo for multichannel (cloud/Deepgram).
     CallCloud,
+    /// Mic + system captured together, MIXED to one mono buffer and transcribed
+    /// LOCALLY (whisper). No speaker separation. Privacy: audio never leaves the machine.
+    CallLocal,
 }
 
 fn default_language() -> String {
@@ -91,6 +94,7 @@ pub fn recorders_for_source(source: RecordingSource) -> (bool, bool) {
         RecordingSource::Mic => (true, false),
         RecordingSource::System => (false, true),
         RecordingSource::CallCloud => (true, true),
+        RecordingSource::CallLocal => (true, true),
     }
 }
 
@@ -113,6 +117,7 @@ mod tests {
         assert_eq!(from_str::<RecordingSource>("\"mic\"").unwrap(), RecordingSource::Mic);
         assert_eq!(from_str::<RecordingSource>("\"system\"").unwrap(), RecordingSource::System);
         assert_eq!(from_str::<RecordingSource>("\"callcloud\"").unwrap(), RecordingSource::CallCloud);
+        assert_eq!(from_str::<RecordingSource>("\"calllocal\"").unwrap(), RecordingSource::CallLocal);
         // Zero-regression default: an absent/legacy `source` must fall back to Mic.
         assert_eq!(RecordingSource::default(), RecordingSource::Mic);
     }
@@ -133,8 +138,10 @@ mod tests {
         // keys off. Locked down so a Mic/System/Call mis-route fails HERE.
         assert_eq!(recorders_for_source(RecordingSource::Mic), (true, false));
         assert_eq!(recorders_for_source(RecordingSource::System), (false, true));
-        // CallCloud is the ONLY source that drives BOTH recorders → stereo/multichannel.
+        // Both meeting sources drive BOTH recorders: CallCloud → stereo/multichannel,
+        // CallLocal → mixed to mono.
         assert_eq!(recorders_for_source(RecordingSource::CallCloud), (true, true));
+        assert_eq!(recorders_for_source(RecordingSource::CallLocal), (true, true));
     }
 
     #[test]

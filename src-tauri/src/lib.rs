@@ -599,6 +599,16 @@ fn start_batch_recording(
         batch::ensure_call_deepgram_available(has_key)?;
     }
 
+    // CallLocal transcribes with the local whisper engine — fail BEFORE recording if
+    // no model is downloaded, so the user isn't left with an un-transcribable capture.
+    if matches!(source, batch::RecordingSource::CallLocal) {
+        let has_model = {
+            let s = state.settings.lock().map_err(|e| e.to_string())?;
+            model::is_model_downloaded(&s.preferred_model)
+        };
+        batch::ensure_local_meeting_model_available(has_model)?;
+    }
+
     if state.batch_recording_in_progress.swap(true, Ordering::SeqCst) {
         return Err("הקלטה כבר בתהליך".to_string());
     }
@@ -692,6 +702,9 @@ async fn stop_batch_recording_to_file(
             batch::RecordingSource::System => {
                 "לא נקלט אודיו — ודאו שמתנגן קול במחשב ושלכידת-המערכת פעילה."
             }
+            batch::RecordingSource::CallLocal => {
+                "לא נקלט אודיו בפגישה — ודאו שהמיקרופון פעיל ושמתנגן קול במחשב."
+            }
             _ => "לא נקלט אודיו — ודא שהמיקרופון מחובר ופעיל.",
         };
         return Err(msg.to_string());
@@ -706,7 +719,9 @@ async fn stop_batch_recording_to_file(
     Ok(tmp_path.to_string_lossy().to_string())
 }
 
-/// Stop and drain the recorder a non-Call `source` used, returning its mono samples.
+/// Stop and drain the recorder(s) a non-CallCloud `source` used, returning mono samples.
+/// `CallLocal` drains BOTH recorders and mixes them to mono here; `CallCloud` never
+/// reaches this fn (it transcribes inline via `stop_call_recording`).
 fn stop_recorder_for_source(
     state: &State<AppState>,
     source: batch::RecordingSource,
@@ -722,9 +737,31 @@ fn stop_recorder_for_source(
             sys.stop_recording()
         }
         #[cfg(target_os = "windows")]
+        batch::RecordingSource::CallLocal => {
+            // Drain BOTH recorders and mix to mono. Compute both results BEFORE
+            // propagating an error so a failing mic stop never skips joining the system
+            // (WASAPI) thread (mirrors run_stop_call_recording). The mixed mono buffer
+            // then flows through the caller's existing silence-guard + write_wav_16k_mono.
+            let mic_result = state
+                .recorder
+                .lock()
+                .map_err(|e| e.to_string())
+                .and_then(|mut r| r.stop_recording());
+            let system_result = state
+                .system_recorder
+                .lock()
+                .map_err(|e| e.to_string())
+                .and_then(|mut s| s.stop_recording());
+            let mic = mic_result?;
+            let system = system_result?;
+            Ok(audio::mix_to_mono(&mic, &system))
+        }
+        #[cfg(target_os = "windows")]
         batch::RecordingSource::CallCloud => unreachable!("CallCloud is handled before this call"),
         #[cfg(not(target_os = "windows"))]
-        batch::RecordingSource::System | batch::RecordingSource::CallCloud => {
+        batch::RecordingSource::System
+        | batch::RecordingSource::CallCloud
+        | batch::RecordingSource::CallLocal => {
             Err("לכידת אודיו-מערכת נתמכת רק ב-Windows".to_string())
         }
     }
