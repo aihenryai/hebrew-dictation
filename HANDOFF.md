@@ -60,7 +60,39 @@ Done via red-green-refactor (the Deepgram parser had **zero** tests before — n
 The original research that led here:
 Today's mic capture uses `cpal` (cross-platform). To also capture the OTHER side of a Zoom/Meet call (what's playing through the speakers, not just the mic), Windows needs **WASAPI loopback capture** — a distinct API mode, not just "another cpal input device." `cpal`'s own WASAPI backend is not confirmed to expose loopback directly; the dedicated [`wasapi`](https://docs.rs/wasapi) crate does, with a documented loopback capture example (simultaneous capture + render on separate threads) — that's the concrete starting point, verify at implementation time whether newer `cpal` has closed this gap. Real design questions Henry needs to weigh in on before implementation starts, not just engineering: (a) mix mic + loopback into one stream, or keep them as two channels/two transcripts merged after the fact (affects diarization quality — mixing loses the "which side of the call" signal for free, that a separate-channels approach would preserve); (b) new permission/UX flow (Windows will very likely surface its own "app is capturing audio" indicator, similar to screen-recording prompts) — needs product decisions, not just code. Recommend brainstorming this properly (spec+plan, like SRT export got) rather than jumping straight to implementation, given the open design questions.
 
-**Suggested order:** ~~diarization first~~ ✅ code-done (pending one live 2-speaker check) → ~~system-audio design pass~~ ✅ spec + reviewed 20-task plan done (2026-07-09) → **implement the plan** (subagent-driven TDD, Chunk 1 first).
+**Suggested order:** ~~diarization first~~ ✅ code-done (pending one live 2-speaker check) → ~~system-audio design pass~~ ✅ spec + reviewed 20-task plan done (2026-07-09) → ~~implement the plan~~ ✅ **DONE + pushed (`60b086c`, 2026-07-12)**.
+
+---
+
+## 🔜 START HERE NEXT SESSION — 4th recording mode + source-selector UI regroup (approved by Henry 2026-07-12, NOT started)
+
+**Goal:** add a 4th mode and reorganize the batch source selector for MAXIMUM UX clarity (Henry's explicit #1 priority — "מאוד מאוד חשוב שחוויית המשתמש תהיה מאוד מאוד ברורה").
+
+**The 4 modes, in 2 visual groups:**
+- **קבוצה א׳ — הקלטה רגילה:** 🎙 מיקרופון · 🔊 אודיו מערכת (both mono; both keep the cloud/local choice)
+- **קבוצה ב׳ — פגישות:**
+  - 📞 **פגישה בענן** — mic+system SEPARATED (stereo → Deepgram multichannel), labeled "אני:"/"הצד השני:". = today's `Call`. Cloud-only.
+  - 🔒 **פגישה מקומית** — mic+system MIXED into ONE mono transcript, transcribed LOCALLY (whisper), **NO speaker separation**. = the NEW mode. Privacy: audio never leaves the machine.
+
+**Why the new local mode:** `Call` is cloud-only (multichannel is Deepgram-only), so a privacy-conscious user can't transcribe a meeting without uploading audio. Mode 4 fills that gap; trade-off = losing "who said what" (local whisper has no diarization).
+
+**Open design questions for the (brief) brainstorm→spec:**
+1. Exact button labels + group headers / visual separation.
+2. **The cloud/local mode-card interaction (the crux):** today a separate "מצב תמלול" cloud/local selector (`batchMode`) exists. Once the meeting buttons ENCODE cloud vs local, that separate selector becomes redundant/confusing for meetings. Decide: hide cloud/local cards for meeting modes? apply them only to Mic/System? Henry's clarity bar lives here.
+3. Mode-4 mechanics: MIX mic+system to mono (new `mix_to_mono(mic, system)` — average the two 16k-mono buffers, pad shorter side with silence like `interleave_stereo` does) → existing `write_wav_16k_mono` → frontend `transcribe_file` with LOCAL mode. Force local, or default-local-allow-cloud?
+4. Backend `RecordingSource` naming: today `Mic`/`System`/`Call`; add a 4th (`Call`=cloud, add `CallLocal`/`Meeting`) or rename to `CallCloud`/`CallLocal` for clarity.
+
+**Technical starting points (grounded in shipped code):**
+- `recorders_for_source` (batch.rs): mode 4 drives BOTH recorders → `(true, true)`, like Call.
+- Mode-4 stop path = closer to the System file-path than to Call's inline multichannel: stop both → `mix_to_mono` → `write_wav_16k_mono` → return path → `transcribe_file` (local). Possibly a mixing branch inside `stop_batch_recording_to_file`.
+- Windows-only for both meeting modes (WASAPI). Reuse the shipped `SystemAudioRecorder`.
+- The Call cloud-transparency note added in `dfb14d7` (App.tsx) becomes moot/relocated once cloud-vs-local is explicit in the buttons — revisit it.
+
+**Process (same discipline as the shipped feature):** brainstorming (Henry DECLINED mockups → go straight to a tight spec) → `docs/superpowers/specs/2026-07-1X-recording-modes-ux.md` → spec-review loop → user review → `superpowers:writing-plans` → `superpowers:subagent-driven-development` TDD (red→green→atomic commit, controller verifies each, adversarial review at the end). Direct-to-main, no PR.
+
+**Baseline to build on:** `main` == `origin/main` @ `60b086c`; `cargo test` 50 passed +1 ignored; frontend `tsc && vite build` clean; signed installer at `src-tauri/target/release/bundle/nsis/הכתבה בעברית_2.11.0_x64-setup.exe`.
+
+---
 
 ### What shipped
 
