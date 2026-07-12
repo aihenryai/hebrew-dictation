@@ -68,6 +68,20 @@ pub fn ensure_call_deepgram_available(has_deepgram_key: bool) -> Result<(), Stri
     }
 }
 
+/// `CallLocal` ("פגישה מקומית") transcribes with the local whisper engine, so a
+/// model must be downloaded. Fail fast — BEFORE recording — with a guiding message,
+/// mirroring `ensure_call_deepgram_available`. NOTE: this checks the model *file* on
+/// disk; the engine must also be loaded in memory (checked later at transcribe time),
+/// so a narrow "downloaded but not loaded" window remains — the same pre-existing gap
+/// as the Mic + local batch path, accepted for v1 (spec §4.6).
+pub fn ensure_local_meeting_model_available(has_local_model: bool) -> Result<(), String> {
+    if has_local_model {
+        Ok(())
+    } else {
+        Err("פגישה מקומית דורשת מודל מקומי מורד. הורד אותו בהגדרות.".to_string())
+    }
+}
+
 /// Which physical recorders a batch `source` drives, as `(uses_mic, uses_system)`.
 /// Pure decision table (spec §3, §4.6) so the Mic/System/Call routing is unit-tested
 /// and can't silently regress — `start_recorders_for_source` in lib.rs keys off it,
@@ -121,5 +135,14 @@ mod tests {
         assert_eq!(recorders_for_source(RecordingSource::System), (false, true));
         // CallCloud is the ONLY source that drives BOTH recorders → stereo/multichannel.
         assert_eq!(recorders_for_source(RecordingSource::CallCloud), (true, true));
+    }
+
+    #[test]
+    fn local_meeting_requires_a_downloaded_model() {
+        // Model present → proceed.
+        assert!(ensure_local_meeting_model_available(true).is_ok());
+        // No local model → a guiding Hebrew error, raised BEFORE recording starts.
+        let err = ensure_local_meeting_model_available(false).unwrap_err();
+        assert!(err.contains("מודל מקומי"));
     }
 }
