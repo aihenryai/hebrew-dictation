@@ -591,7 +591,7 @@ fn start_batch_recording(
 
     // Call needs Deepgram (multichannel) — fail BEFORE recording if no key exists,
     // so the user isn't left with an un-transcribable capture (spec §6).
-    if matches!(source, batch::RecordingSource::Call) {
+    if matches!(source, batch::RecordingSource::CallCloud) {
         let has_key = {
             let s = state.settings.lock().map_err(|e| e.to_string())?;
             s.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty())
@@ -673,7 +673,7 @@ async fn stop_batch_recording_to_file(
     let source = source.unwrap_or_default();
     // Call is NOT a mono file path — it interleaves two channels and transcribes
     // inline; the frontend must call `stop_call_recording` instead.
-    if matches!(source, batch::RecordingSource::Call) {
+    if matches!(source, batch::RecordingSource::CallCloud) {
         return Err("מצב שיחה נעצר דרך stop_call_recording ולא דרך מסלול-הקובץ".to_string());
     }
 
@@ -722,9 +722,9 @@ fn stop_recorder_for_source(
             sys.stop_recording()
         }
         #[cfg(target_os = "windows")]
-        batch::RecordingSource::Call => unreachable!("Call is handled before this call"),
+        batch::RecordingSource::CallCloud => unreachable!("CallCloud is handled before this call"),
         #[cfg(not(target_os = "windows"))]
-        batch::RecordingSource::System | batch::RecordingSource::Call => {
+        batch::RecordingSource::System | batch::RecordingSource::CallCloud => {
             Err("לכידת אודיו-מערכת נתמכת רק ב-Windows".to_string())
         }
     }

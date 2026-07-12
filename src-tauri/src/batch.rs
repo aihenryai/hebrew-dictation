@@ -29,8 +29,8 @@ pub enum RecordingSource {
     Mic,
     /// WASAPI loopback of the default render device (Windows-only).
     System,
-    /// Mic + system captured together, interleaved to stereo for multichannel.
-    Call,
+    /// Mic + system captured together, interleaved to stereo for multichannel (cloud/Deepgram).
+    CallCloud,
 }
 
 fn default_language() -> String {
@@ -76,7 +76,7 @@ pub fn recorders_for_source(source: RecordingSource) -> (bool, bool) {
     match source {
         RecordingSource::Mic => (true, false),
         RecordingSource::System => (false, true),
-        RecordingSource::Call => (true, true),
+        RecordingSource::CallCloud => (true, true),
     }
 }
 
@@ -98,7 +98,7 @@ mod tests {
         // Frontend sends lowercase strings for the source toggle.
         assert_eq!(from_str::<RecordingSource>("\"mic\"").unwrap(), RecordingSource::Mic);
         assert_eq!(from_str::<RecordingSource>("\"system\"").unwrap(), RecordingSource::System);
-        assert_eq!(from_str::<RecordingSource>("\"call\"").unwrap(), RecordingSource::Call);
+        assert_eq!(from_str::<RecordingSource>("\"callcloud\"").unwrap(), RecordingSource::CallCloud);
         // Zero-regression default: an absent/legacy `source` must fall back to Mic.
         assert_eq!(RecordingSource::default(), RecordingSource::Mic);
     }
@@ -119,7 +119,7 @@ mod tests {
         // keys off. Locked down so a Mic/System/Call mis-route fails HERE.
         assert_eq!(recorders_for_source(RecordingSource::Mic), (true, false));
         assert_eq!(recorders_for_source(RecordingSource::System), (false, true));
-        // Call is the ONLY source that drives BOTH recorders → stereo/multichannel.
-        assert_eq!(recorders_for_source(RecordingSource::Call), (true, true));
+        // CallCloud is the ONLY source that drives BOTH recorders → stereo/multichannel.
+        assert_eq!(recorders_for_source(RecordingSource::CallCloud), (true, true));
     }
 }

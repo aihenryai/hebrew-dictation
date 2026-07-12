@@ -70,7 +70,7 @@ interface BatchResult {
   edited?: boolean;
   /** True for a Call recording — SRT export uses אני/הצד השני side labels instead
    * of the diarization דובר N: prefix (Task 20). Falsy/undefined for Mic/System. */
-  isCall?: boolean;
+  isCallCloud?: boolean;
 }
 let batchIdCounter = 0;
 type Language = "he" | "en" | "multi";
@@ -79,10 +79,10 @@ type ApiProvider = "deepgram" | "groq";
 
 /** Recording input source, chosen before a batch recording and threaded into
  * `start_batch_recording` (Task 18). Default "mic" = existing behavior (zero
- * regression). "system" (WASAPI loopback) and "call" (mic + system) are
+ * regression). "system" (WASAPI loopback) and "callcloud" (mic + system) are
  * Windows-only — see IS_WINDOWS gating in the batch view. Wire values are
  * lowercase to match the app's existing `mode`/`language` invoke payloads. */
-type RecordingSource = "mic" | "system" | "call";
+type RecordingSource = "mic" | "system" | "callcloud";
 
 /** Settings sent to the backend. API keys are managed separately via set_api_key / clear_api_key. */
 interface AppSettings {
@@ -1071,10 +1071,10 @@ function App() {
     // returns (text, segments) directly. Mic/System keep the existing file path,
     // now passing `source` so the backend drains the right recorder (System routes
     // to system_recorder inside stop_batch_recording_to_file).
-    const isCall = recordSource === "call";
+    const isCallCloud = recordSource === "callcloud";
 
     let filePath = "";
-    if (!isCall) {
+    if (!isCallCloud) {
       try {
         filePath = await invoke<string>("stop_batch_recording_to_file", { source: recordSource });
       } catch (e) {
@@ -1087,13 +1087,13 @@ function App() {
     const timeStr = now.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
     const fileName = `הקלטה ${timeStr}.wav`;
     const newId = ++batchIdCounter;
-    const newItem: BatchResult = { id: newId, fileName, filePath, transcript: "", status: "pending", isCall };
+    const newItem: BatchResult = { id: newId, fileName, filePath, transcript: "", status: "pending", isCallCloud };
 
     setBatchActiveResultId(newId);
     setBatchResults((prev) => [...prev, newItem]);
     setBatchRunning(true);
     setBatchPct(0);
-    setBatchStage(isCall ? "transcribing" : "decoding");
+    setBatchStage(isCallCloud ? "transcribing" : "decoding");
     batchCancelledRef.current = false;
 
     setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "processing" } : r));
@@ -1102,7 +1102,7 @@ function App() {
       // Call → dedicated backend command (stops both recorders, interleaves,
       // multichannel Deepgram, returns tagged "אני:"/"הצד השני:" text + merged
       // segments). Mic/System → existing mono file path, unchanged.
-      const { text, segments } = isCall
+      const { text, segments } = isCallCloud
         ? await invoke<{ text: string; segments: TimedSegment[] }>("stop_call_recording", {
             opts: { mode: batchMode, language: "he", inject: false },
           })
@@ -1190,14 +1190,14 @@ function App() {
   const exportSingleSrt = useCallback(async (
     segments: TimedSegment[],
     transcriptForName: string,
-    isCall: boolean | undefined,
+    isCallCloud: boolean | undefined,
     onErr: (msg: string) => void,
   ) => {
     if (segments.length === 0) return;
     try {
       await invoke<string>("export_srt", {
         items: [segments],
-        styles: [isCall ? "Call" : "Diarization"],
+        styles: [isCallCloud ? "Call" : "Diarization"],
         suggested_name: firstWordsName(transcriptForName),
       });
     } catch (e) {
@@ -1211,7 +1211,7 @@ function App() {
     if (eligible.length === 0) return;
     try {
       const items = eligible.map((r) => r.segments!);
-      const styles = eligible.map((r) => (r.isCall ? "Call" : "Diarization"));
+      const styles = eligible.map((r) => (r.isCallCloud ? "Call" : "Diarization"));
       const suggested_name = generateExportName(eligible);
       const path = await invoke<string>("export_srt", { items, styles, suggested_name });
       setExportNotice(`✅ נשמר: ${path}`);
@@ -2456,10 +2456,10 @@ function App() {
                   <span className="batch-mode-desc">מה שמתנגן במחשב</span>
                 </button>
                 <button
-                  className={`batch-mode-card ${recordSource === "call" ? "active" : ""}`}
-                  onClick={() => !batchRunning && setRecordSource("call")}
+                  className={`batch-mode-card ${recordSource === "callcloud" ? "active" : ""}`}
+                  onClick={() => !batchRunning && setRecordSource("callcloud")}
                   disabled={batchRunning}
-                  aria-pressed={recordSource === "call"}
+                  aria-pressed={recordSource === "callcloud"}
                 >
                   <span className="batch-mode-icon" aria-hidden="true">📞</span>
                   <span className="batch-mode-name">שיחה</span>
@@ -2473,7 +2473,7 @@ function App() {
         {/* Call always transcribes via Deepgram cloud (multichannel), even when the
             "private/on-device" mode card is selected — surface that so a call-recording
             user is never misled about where the audio goes. */}
-        {!batchRecording && recordSource === "call" && (
+        {!batchRecording && recordSource === "callcloud" && (
           <p
             role="note"
             style={{ margin: "0 0 8px", fontSize: "0.8rem", opacity: 0.8, textAlign: "center" }}
@@ -2629,7 +2629,7 @@ function App() {
                         {isSrtEligible(result) && (
                           <button
                             className="btn-secondary btn-sm"
-                            onClick={() => exportSingleSrt(result.segments!, result.transcript, result.isCall, setBatchError)}
+                            onClick={() => exportSingleSrt(result.segments!, result.transcript, result.isCallCloud, setBatchError)}
                             title="ייצוא כתוביות SRT למקטע זה"
                           >
                             🎬 SRT
