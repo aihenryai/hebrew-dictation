@@ -48,7 +48,7 @@ Done via red-green-refactor (the Deepgram parser had **zero** tests before — n
 - **Tests: 28/28 green** (`srt` 12, incl. 3 new speaker tests; `api_transcribe` 2 new parser tests — first ever for that parser). No new compiler/clippy warnings in the touched files.
 - ⏳ **SHIP-GATE (only open item):** one real diarized request — `nova-3` + `he` + `diarize=true` on a **2-speaker Hebrew** clip — to confirm Deepgram actually populates `speaker` in `words[]` (the flagged 2026-05 "Batch Diarization v2" nuance) and the exported SRT shows `דובר 1:/דובר 2:`. Needs Henry's Deepgram key + a two-person recording (or just run the app on any 2-voice audio → export SRT). **Not yet run. Not yet committed.**
 
-### 2. System-audio capture for meetings — ✅ ALL 20 TASKS CODE-COMPLETE (2026-07-10) · ⏳ pending real-audio manual verify
+### 2. System-audio capture for meetings — ✅ ALL 20 TASKS DONE + reviewed 2× + PUSHED to origin 2026-07-12 (Henry approved, NOT released) · ⏳ pending real-audio manual verify
 
 > **State:** brainstormed → spec approved (`docs/superpowers/specs/2026-07-09-system-audio-capture-design.md`, `e44977e`) → **20-task TDD implementation plan** authored + adversarially reviewed (`docs/superpowers/plans/2026-07-09-system-audio-capture.md`) → **fully implemented under strict TDD via subagent-driven-development (2026-07-10).**
 > **Design locked:** three sources (`Mic`/`System`/`Call`). Call captures mic + system separately → stereo WAV (L=mic, R=system) → Deepgram `multichannel=true` → "אני"/"הצד השני". Batch-only v1, cloud-only (multichannel is Deepgram-only), Windows-only via the `wasapi` crate.
