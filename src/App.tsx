@@ -2406,6 +2406,33 @@ function App() {
           <h2 className="batch-view-title">תמלול קובץ</h2>
         </div>
 
+        {/* Engine toggle (cloud/local) — a LIGHT segmented control at the top. Sets the
+            engine for REGULAR recording (mic/system). Meeting cards encode their own
+            engine, so the toggle dims + disables while a meeting source is selected —
+            kept visually lighter than the source cards so the two axes read differently. */}
+        {!batchRecording && (() => {
+          const meetingSelected = recordSource === "callcloud" || recordSource === "calllocal";
+          return (
+            <div className={`engine-toggle ${meetingSelected ? "is-disabled" : ""}`} role="group" aria-label="מנוע תמלול">
+              <span>מנוע תמלול:</span>
+              <div className="engine-toggle-group">
+                <button
+                  className={`engine-toggle-btn ${batchMode === "cloud" ? "active" : ""}`}
+                  onClick={() => !batchRunning && setBatchMode("cloud")}
+                  disabled={batchRunning || meetingSelected}
+                  aria-pressed={batchMode === "cloud"}
+                >☁ ענן</button>
+                <button
+                  className={`engine-toggle-btn ${batchMode === "local" ? "active" : ""}`}
+                  onClick={() => !batchRunning && setBatchMode("local")}
+                  disabled={batchRunning || meetingSelected}
+                  aria-pressed={batchMode === "local"}
+                >💾 מקומי</button>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* batch-source-selector — recording source, chosen before recording, in two
             groups: "הקלטה רגילה" (mic / system) and "פגישות" (callcloud / calllocal).
             System + the whole "פגישות" group are Windows-only (WASAPI loopback) →
@@ -2444,7 +2471,7 @@ function App() {
             {IS_WINDOWS && (
               <>
                 <div style={{ fontSize: "0.8rem", opacity: 0.7, margin: "8px 0 4px", textAlign: "center" }}>
-                  פגישות
+                  פגישות <span style={{ opacity: 0.65 }}>· קובעות מנוע בעצמן</span>
                 </div>
                 <div className="batch-mode-cards" role="group" aria-label="פגישות">
                   <button
@@ -2471,33 +2498,6 @@ function App() {
               </>
             )}
           </>
-        )}
-
-        {/* Mode selector (cloud/local) — shown ONLY for the "regular" group (mic/system);
-            the meeting cards encode the engine themselves, so no selector for them (§3.2). */}
-        {(recordSource === "mic" || recordSource === "system") && (
-          <div className="batch-mode-cards" role="group" aria-label="מצב תמלול">
-            <button
-              className={`batch-mode-card ${batchMode === "cloud" ? "active" : ""}`}
-              onClick={() => !batchRunning && !batchRecording && setBatchMode("cloud")}
-              disabled={batchRunning || batchRecording}
-              aria-pressed={batchMode === "cloud"}
-            >
-              <span className="batch-mode-icon" aria-hidden="true">☁</span>
-              <span className="batch-mode-name">מהיר — ענן</span>
-              <span className="batch-mode-desc">Deepgram · דורש מפתח API</span>
-            </button>
-            <button
-              className={`batch-mode-card ${batchMode === "local" ? "active" : ""}`}
-              onClick={() => !batchRunning && !batchRecording && setBatchMode("local")}
-              disabled={batchRunning || batchRecording}
-              aria-pressed={batchMode === "local"}
-            >
-              <span className="batch-mode-icon" aria-hidden="true">🔒</span>
-              <span className="batch-mode-name">פרטי — מכשיר</span>
-              <span className="batch-mode-desc">ללא אינטרנט · דורש מודל מורד</span>
-            </button>
-          </div>
         )}
 
         {/* Actions — pinned near the top so a growing result list never pushes them off-screen */}

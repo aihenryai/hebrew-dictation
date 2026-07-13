@@ -1742,6 +1742,50 @@ body:has(.toolbar-idle) #root {
   text-align: center;
 }
 
+/* engine-toggle — compact cloud/local segmented control at the top of the batch view.
+   Deliberately lighter than the big source cards so "what to record" (cards) and "how
+   to transcribe" (this toggle) read as two different axes. Dims + disables while a
+   meeting source is selected, because meeting cards encode their own engine. */
+.engine-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  margin: 0 0 0.9rem;
+  font-size: 0.82rem;
+  color: #9fb0c9;
+}
+.engine-toggle.is-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.engine-toggle-group {
+  display: inline-flex;
+  border: 1.5px solid #2a3a5e;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.engine-toggle-btn {
+  padding: 0.35rem 0.95rem;
+  background: #16213e;
+  border: none;
+  color: #ccc;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: background 0.15s, color 0.15s;
+}
+.engine-toggle-btn:hover:not(:disabled):not(.active) {
+  background: #1c2d52;
+}
+.engine-toggle-btn.active {
+  background: #1a2d4a;
+  color: #e8e8e8;
+  box-shadow: inset 0 0 0 1.5px #4da6ff;
+}
+.engine-toggle-btn:disabled {
+  cursor: default;
+}
+
 /* Empty state */
 .batch-empty-state {
   display: flex;
