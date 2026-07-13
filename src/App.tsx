@@ -352,6 +352,9 @@ let historyIdCounter = 0;
 function App() {
   const [status, setStatus] = useState<AppStatus>("idle");
   const [view, setView] = useState<AppView>("main");
+  // Which view "חזור" from settings returns to — so settings opened from the batch
+  // screen returns there, not to main. Each settings entry point sets it.
+  const [settingsReturn, setSettingsReturn] = useState<AppView>("main");
   const [transcript, setTranscript] = useState("");
   const [editableTranscript, setEditableTranscript] = useState("");
   const [history, setHistory] = useState<{ id: number; text: string; timestamp: string }[]>([]);
@@ -1739,7 +1742,7 @@ function App() {
       <main className="container compact" dir="rtl">
         <div className="settings-header">
           <h2>הגדרות</h2>
-          <button className="btn-back" onClick={() => setView("main")}>חזור</button>
+          <button className="btn-back" onClick={() => setView(settingsReturn)}>חזור</button>
         </div>
 
         {/* Engine */}
@@ -2404,6 +2407,15 @@ function App() {
         <div className="batch-view-header">
           <button className="btn-back" onClick={() => setView("main")} aria-label="חזור">חזור</button>
           <h2 className="batch-view-title">תמלול קובץ</h2>
+          <button
+            className="btn-settings"
+            style={{ marginInlineStart: "auto" }}
+            onClick={() => { setSettingsReturn("batch"); setView("settings"); }}
+            title="הגדרות"
+            aria-label="הגדרות"
+          >
+            <span className="gear" aria-hidden="true">⚙</span> הגדרות
+          </button>
         </div>
 
         {/* Engine toggle (cloud/local) — a LIGHT segmented control at the top. Sets the
@@ -2812,7 +2824,7 @@ function App() {
         >
           {status === "recording" ? "⏹ עצור" : "🎤 הכתב"}
         </button>
-        <button className="btn-settings-inline" onClick={() => setView("settings")} title="הגדרות" aria-label="הגדרות">⚙</button>
+        <button className="btn-settings" onClick={() => { setSettingsReturn("main"); setView("settings"); }} title="הגדרות" aria-label="הגדרות"><span className="gear" aria-hidden="true">⚙</span> הגדרות</button>
       </div>
 
       {/* Recording progress bar — hidden in unlimited mode */}
