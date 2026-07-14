@@ -1360,16 +1360,29 @@ function App() {
       // the wizard re-ran every launch. Now: capture the error, finish the
       // wizard, and surface a toast on the main view.
       let keyError: string | null = null;
+      const provider: ApiProvider | null =
+        wizardChoice === "api" ? "deepgram" : wizardChoice === "groq" ? "groq" : null;
+
       try {
-        if (wizardChoice === "api" && wizardApiKey) {
-          await setApiKey("deepgram", wizardApiKey);
-          setDeepgramKey("••••••••");
-        } else if (wizardChoice === "groq" && wizardApiKey) {
-          await setApiKey("groq", wizardApiKey);
-          setGroqKey("••••••••");
+        if (provider && wizardApiKey) {
+          await setApiKey(provider, wizardApiKey);
+          if (provider === "deepgram") setDeepgramKey("••••••••");
+          else setGroqKey("••••••••");
         }
       } catch (e) {
         keyError = String(e);
+      }
+
+      // VERIFY the key actually reached secure storage — never just assume the save
+      // worked. Before this check, an empty/dropped wizardApiKey silently skipped
+      // set_api_key entirely and the user finished the wizard in an API mode with NO
+      // key and nothing telling them, which read as "I entered a key and it vanished".
+      let keyMissing = false;
+      if (provider && !keyError) {
+        try {
+          const check = (await invoke("get_settings")) as RedactedSettings;
+          keyMissing = !(provider === "groq" ? check.has_groq_key : check.has_deepgram_key);
+        } catch { /* can't verify — don't block the user */ }
       }
 
       // Apply chosen mode regardless of key save outcome.
@@ -1402,6 +1415,8 @@ function App() {
         setError(
           `המפתח לא נשמר באחסון המאובטח (Credential Manager). נסה שוב מההגדרות. פרטים: ${keyError}`
         );
+      } else if (keyMissing) {
+        setError("לא נשמר מפתח API. אפשר להוסיף אותו עכשיו דרך ⚙ הגדרות.");
       }
     };
 
@@ -1523,6 +1538,12 @@ function App() {
             <div
               className={`wizard-card ${wizardChoice === "api" ? "selected" : ""}`}
               onClick={() => {
+                // Only reset when actually SWITCHING to this card. Re-clicking the
+                // already-selected card — including a click that BUBBLES UP from the key
+                // input or the "בדוק" button nested inside it — must never wipe the key
+                // the user just typed. That was silently dropping the key: the wizard then
+                // saw an empty wizardApiKey and skipped set_api_key entirely, with no error.
+                if (wizardChoice === "api") return;
                 setWizardChoice("api");
                 setWizardProviderKey("deepgram");
                 setWizardApiKey("");
@@ -1542,7 +1563,9 @@ function App() {
                 <li>💡 כשהקרדיט נגמר — אפשר לעבור ל-Groq (זול פי 5) או למצב מקומי</li>
               </ul>
               {wizardChoice === "api" && (
-                <div className="wizard-guide">
+                /* stopPropagation: clicks on the key input / "בדוק" button must not reach
+                   the parent card's onClick (belt-and-braces with the guard above). */
+                <div className="wizard-guide" onClick={(e) => e.stopPropagation()}>
                   <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
                   <ol>
                     <li>
@@ -1602,6 +1625,8 @@ function App() {
             <div
               className={`wizard-card ${wizardChoice === "groq" ? "selected" : ""}`}
               onClick={() => {
+                // Same guard as the Deepgram card — see the comment there.
+                if (wizardChoice === "groq") return;
                 setWizardChoice("groq");
                 setWizardProviderKey("groq");
                 setWizardApiKey("");
@@ -1621,7 +1646,8 @@ function App() {
                 <li>💡 רלוונטי בעיקר אחרי שה-$200 של Deepgram ניצלו</li>
               </ul>
               {wizardChoice === "groq" && (
-                <div className="wizard-guide">
+                /* stopPropagation — see the Deepgram card. */
+                <div className="wizard-guide" onClick={(e) => e.stopPropagation()}>
                   <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
                   <ol>
                     <li>
