@@ -130,7 +130,10 @@ button {
    reachable from more than one screen (main controls + the batch/file-transcription
    header) without going back to the main screen. Turquoise sets it apart from the blue
    primary actions. */
-.btn-settings {
+/* NOTE: must NOT be called `.btn-settings` — that name is already taken further down
+   (line ~548) by a fixed 36px round icon button. Reusing it forced this labeled button
+   into a 36px circle with the text spilling outside the frame. */
+.btn-settings-labeled {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -146,14 +149,40 @@ button {
   flex-shrink: 0;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.btn-settings:hover {
+.btn-settings-labeled:hover {
   background: rgba(45, 212, 191, 0.12);
   color: #5ee7d6;
   border-color: #5ee7d6;
 }
-.btn-settings .gear {
+.btn-settings-labeled .gear {
   font-size: 1.05rem;
   line-height: 1;
+}
+
+/* Compact round variant — used in the tight main controls row next to the big record
+   button, where a labeled pill would compete with the primary action. Same turquoise. */
+.btn-settings-icon {
+  background: transparent;
+  color: #2dd4bf;
+  border: 1px solid #2dd4bf;
+  border-radius: 50%;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  font-size: 1.15rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.2s;
+}
+.btn-settings-icon:hover {
+  background: rgba(45, 212, 191, 0.12);
+  color: #5ee7d6;
+  border-color: #5ee7d6;
+  transform: rotate(30deg);
 }
 
 .btn-record:hover {
@@ -1697,11 +1726,20 @@ body:has(.toolbar-idle) #root {
   padding-bottom: 0.4rem;
   border-bottom: 1px solid #2a3a5e;
 }
+/* The window is narrow (.container is 340px at its base size), so the header must not
+   be able to overflow: the buttons keep their size and the TITLE is the shrink valve. */
+.batch-view-header .btn-back {
+  flex-shrink: 0;
+}
 .batch-view-title {
   font-size: 1.05rem;
   font-weight: 600;
   color: #e8e8e8;
   margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Mode cards */
