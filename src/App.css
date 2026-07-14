@@ -159,31 +159,6 @@ button {
   line-height: 1;
 }
 
-/* Compact round variant — used in the tight main controls row next to the big record
-   button, where a labeled pill would compete with the primary action. Same turquoise. */
-.btn-settings-icon {
-  background: transparent;
-  color: #2dd4bf;
-  border: 1px solid #2dd4bf;
-  border-radius: 50%;
-  width: 38px;
-  height: 38px;
-  flex-shrink: 0;
-  box-sizing: border-box;
-  font-size: 1.15rem;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.2s;
-}
-.btn-settings-icon:hover {
-  background: rgba(45, 212, 191, 0.12);
-  color: #5ee7d6;
-  border-color: #5ee7d6;
-  transform: rotate(30deg);
-}
 
 .btn-record:hover {
   background: #3d8be0;

@@ -2824,7 +2824,7 @@ function App() {
         >
           {status === "recording" ? "⏹ עצור" : "🎤 הכתב"}
         </button>
-        <button className="btn-settings-icon" onClick={() => { setSettingsReturn("main"); setView("settings"); }} title="הגדרות" aria-label="הגדרות">⚙</button>
+        <button className="btn-settings-labeled" onClick={() => { setSettingsReturn("main"); setView("settings"); }} title="הגדרות" aria-label="הגדרות"><span className="gear" aria-hidden="true">⚙</span> הגדרות</button>
       </div>
 
       {/* Recording progress bar — hidden in unlimited mode */}
