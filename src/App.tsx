@@ -2509,7 +2509,7 @@ function App() {
             {IS_WINDOWS && (
               <>
                 <div style={{ fontSize: "0.8rem", opacity: 0.7, margin: "8px 0 4px", textAlign: "center" }}>
-                  פגישות <span style={{ opacity: 0.65 }}>· קובעות מנוע בעצמן</span>
+                  פגישות
                 </div>
                 <div className="batch-mode-cards" role="group" aria-label="פגישות">
                   <button
@@ -2530,7 +2530,7 @@ function App() {
                   >
                     <span className="batch-mode-icon" aria-hidden="true">🔒</span>
                     <span className="batch-mode-name">פגישה — פרטית במכשיר</span>
-                    <span className="batch-mode-desc">אתם + הצד השני יחד · נשאר במחשב, בלי הפרדת דוברים</span>
+                    <span className="batch-mode-desc">אתם + הצד השני יחד, ללא הפרדה לדוברים · נשאר במחשב</span>
                   </button>
                 </div>
               </>
