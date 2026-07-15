@@ -1,6 +1,31 @@
-# Hebrew Dictation — Session Handoff (2026-07-05)
+# Hebrew Dictation — Session Handoff
 
 > **Next session: read this + `memory/hebrew-dictation.md` + `memory/hebrew-dictation-changelog.md` to continue.**
+
+---
+
+## ✅ v2.12.0 — FULLY RELEASED (2026-07-14) — meeting transcription
+
+**Released end-to-end + verified each hop (not assumed):**
+- **App:** `main` @ `b91e076`, version bumped in all 3 files (package.json / Cargo.toml / tauri.conf.json). All work pushed to `origin/main`.
+- **GitHub Release [v2.12.0](https://github.com/aihenryai/hebrew-dictation/releases/tag/v2.12.0)** = **Latest**, signed `.exe` (204MB) + `.sig` + `latest.json`. ✅ **macOS block in `latest.json` preserved byte-identical** (still points to v2.10.1 — mac auto-update NOT broken). Updater endpoint `releases/latest/download/latest.json` verified HTTP 200 → `2.12.0`, both platform blocks present.
+- **Auto-update IS LIVE:** every Windows user on 2.11.0 gets 2.12.0 on next launch.
+- **Website** `bintechai.com/hebrew-dictation` (repo `Henry-AI-website` @ `c1f8d7d`) → 2.12.0, real "מה חדש" copy (2 meeting-mode cards replacing SRT/batch), new answer-first `<section>` in `prerender-seo.js` content + 2 `featureList` entries. Both domains verified live HTTP 200 with the new content. (No arrows — site RTL rule.)
+
+**What shipped in 2.12.0** (full brainstorm→spec→plan→subagent-TDD, specs/plans in `docs/superpowers/{specs,plans}/2026-07-12-recording-modes-ux.md`):
+1. 🔒 **`CallLocal` — private on-device meeting:** mic+system → `audio::mix_to_mono` → **forced-local whisper**, no speaker separation, audio never leaves the machine. Pre-record model guard. `cargo test` 55/1, two-stage review ✅.
+2. 📞 **`CallCloud`** (renamed from `Call`) — speaker separation "אני:/הצד השני:". **Real-audio VERIFIED in a live Zoom call 2026-07-13.**
+3. 🎛 **Source-selector regroup:** two groups (הקלטה רגילה / פגישות) + a **light `engine-toggle`** (☁ ענן / 💾 מקומי) at the top that dims for meetings. Meeting cards benefit-labeled, symmetric desc lines ("כל אחד בנפרד" vs "יחד, ללא הפרדה לדוברים"). ⚠️ the "· קובעות מנוע בעצמן" header note was tried and **Henry rejected it as redundant — do not re-add**.
+4. ⚙ **Settings reachable from the batch screen too** — labeled turquoise `.btn-settings-labeled` (⚙ הגדרות) on home + batch header; tracks a **return view** so "חזור" from settings returns to origin. ⚠️ **CSS class-name collision lesson:** a labeled settings button was first named `.btn-settings`, which already existed (a 36px round icon rule) → it was forced into a circle with the label spilling out of the frame. Renamed to `.btn-settings-labeled`. **Before adding a class, grep App.css for the name.** The `.container` is only **340px** wide — measure header/controls rows for overflow (DOM measurement harness works when screenshots don't).
+5. 🐞 **Onboarding API-key silent-discard bug FIXED** (`4f4ac3c`): the `.wizard-card` div's `onClick` reset the form and the key `<input>`/"בדוק" button were nested inside it, so a click bubbled up and wiped the typed key → `set_api_key` never called, no error. Fixed 3 ways (early-return on re-click, `stopPropagation`, and `completeOnboarding` now re-reads `get_settings` to VERIFY the key landed). Full write-up in `memory/hebrew-dictation.md`.
+
+### ⏳ ONLY open item — real-audio manual verify of the LOCAL meeting mode (Henry, can't automate)
+`CallCloud` was verified in Zoom; **`CallLocal` (🔒 פגישה — פרטית במכשיר) has NOT been exercised on real audio yet.** With a whisper model downloaded (Henry has `small`): install 2.12.0 → תמלול קובץ → 🔒 פגישה — פרטית במכשיר → record while system audio plays → stop → expect ONE local mono transcript, **no "אני:/הצד השני:"**. Low-risk (reuses the same dual-recorder capture Zoom already proved; only the mix+local-transcribe tail is unexercised on live audio), but not yet confirmed. If it fails, that's the thing to debug next session.
+
+### Backlog (unchanged, not scheduled)
+English→Hebrew translation · Windows code-signing cert (kills SmartScreen "unknown publisher") · Local-API MCP wrapper (#1 local API shipped, #2 MCP adapter pending) — see the "Voicebox comparison" section below.
+
+---
 
 ## ✅ v2.11.0 — FULLY RELEASED (2026-07-05)
 
