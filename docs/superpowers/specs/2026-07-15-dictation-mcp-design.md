@@ -69,8 +69,8 @@ Becomes a small struct:
 #[derive(Clone, Default)]
 pub struct LastTranscript {
     pub text: String,
-    pub seq: u64,      // monotonic; increments once per successful injection
-    pub at_ms: u128,   // unix epoch millis of the last update (0 if never)
+    pub seq: u64,     // monotonic; increments once per successful injection
+    pub at_ms: u64,   // unix epoch millis of the last update (0 if never)
 }
 // state field:
 last_transcript: Arc<Mutex<LastTranscript>>,
@@ -90,14 +90,16 @@ Becomes a call to a **pure, unit-testable helper** (the TDD seam):
 
 ```rust
 /// Record a freshly injected transcript: replace text, bump seq, stamp time.
-pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u128) {
+pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
     last.text = text.to_string();
     last.seq = last.seq.wrapping_add(1);
     last.at_ms = now_ms;
 }
 ```
 
-Call site passes `now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)`.
+Call site passes `now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)`.
+
+**Seq resets to 0 on app restart** (in-memory counter, intentionally not persisted). This is *safe by design*: `wait_for_dictation` always re-reads the current `seq` as its baseline at call time (§4.3), so a reset never makes a stale transcript look fresh. Do not "fix" this into a persisted counter.
 
 ### 3.3 API response
 
@@ -109,7 +111,7 @@ pub fn transcript_json(last: &LastTranscript) -> String {
 }
 ```
 
-`local_api::start` takes `Arc<Mutex<LastTranscript>>` instead of `Arc<Mutex<String>>`.
+`local_api::start` takes `Arc<Mutex<LastTranscript>>` instead of `Arc<Mutex<String>>`. The request handler stays panic-free exactly like today: lock the mutex, and on a poisoned lock fall back to a default/empty transcript (mirrors the current `unwrap_or_default()`), then call `transcript_json`.
 
 **Backward compatibility:** the JSON only *adds* `seq` and `at`; the existing `text` key is unchanged, so any current reader of `.text` keeps working. Disabled API = no listener, identical to today.
 
@@ -125,8 +127,8 @@ pub fn transcript_json(last: &LastTranscript) -> String {
 
 ### 4.1 Stack & layout
 
-- Node + **TypeScript ^5.5**, `@modelcontextprotocol/sdk ^1.x`, `zod ^4` — matches `pro-image-mcp`.
-- Transport: **stdio** (the standard for Claude Code / Cursor local servers).
+- Node + **TypeScript ^5.5**, `@modelcontextprotocol/sdk ^1.x`, `zod ^4` — same dependency versions as `pro-image-mcp`, and the same `src/index.ts` + `test-client.mjs` file layout.
+- Transport: **stdio** (the standard for Claude Code / Cursor local servers). NB: the MCP-Dev siblings use *different* transports — `pro-image-mcp` is a Cloudflare Worker (HTTP, `@cloudflare/vitest-pool-workers`) and `video-animator-mcp` is Node/Express — so **do not copy `pro-image-mcp`'s Workers vitest config**; use a plain Node `vitest` (or `node --test`) setup for `test/client.test.ts`.
 - Layout:
   - `src/index.ts` — MCP server, registers the 3 tools.
   - `src/client.ts` — `DictationClient`: `fetchTranscript()` + `waitForNext()`. Isolated from the MCP wiring so it is unit-testable against a mock HTTP server.
@@ -149,6 +151,8 @@ waitForNext(sinceSeq: number, timeoutMs: number, pollMs = 500):
 ```
 
 Polling (not server long-poll) keeps the Rust side single-threaded and unchanged — the wait lives entirely in Node. This matches the HANDOFF's "pull-based" note.
+
+**Mid-wait failure:** if the API becomes unreachable *during* a wait (e.g., the app restarts inside the timeout window), the next `fetchTranscript()` throws `DictationUnavailableError`, which propagates out of `waitForNext` and aborts the wait — no silent retry loop. The tool surfaces the same actionable "API not reachable" error (§4.4).
 
 ### 4.3 Tools
 
@@ -188,7 +192,7 @@ No remote trigger: the recording is always started by Henry's own hotkey/UI. The
 
 - **Rust:** `GET /transcript` returns `{text, seq, at}`; `seq` increments exactly once per successful injection (dictation and streaming paths both go through `inject_text_defocused`); `cargo test` covers `bump_transcript` + `transcript_json`; `cargo build` clean; disabled-API behavior unchanged.
 - **MCP:** the 3 tools work over stdio; `wait_for_dictation` resolves on a new dictation and times out gracefully; unreachable-API errors are actionable; `npm test` green; `test-client.mjs` smoke run lists the tools and calls `dictation_status`.
-- **Docs:** `README.md` shows the exact registration snippet for Claude Code (`.mcp.json`) and Cursor.
+- **Docs:** `README.md` shows the exact registration snippet for Claude Code (`.mcp.json`) and Cursor, **and states plainly that `wait_for_dictation` does not start the mic** — it waits for the user to dictate via the app's own hotkey/UI (the name could otherwise imply a remote trigger).
 
 ---
 
