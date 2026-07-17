@@ -1,6 +1,8 @@
-//! Opt-in local-only HTTP API — exposes the last dictated transcript on
-//! `127.0.0.1` so other local tools/scripts (agents, pipelines) can read the
-//! most recent dictation programmatically, without going through the UI.
+//! Opt-in local-only HTTP API — exposes the last completed transcript on
+//! `127.0.0.1` so other local tools/scripts (agents, pipelines) can read it
+//! programmatically, without going through the UI. Usually that's the most
+//! recent dictation, but the user can also paste an older transcript from the
+//! UI — see `LastTranscript` for what the transcript and its `seq` mean.
 //!
 //! Off by default (`local_api_enabled` in settings, no UI yet — set it in
 //! settings.json): this is a new network listener, so dictation must never
@@ -11,11 +13,19 @@
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Method, Response, Server};
 
-/// The last completed transcript, plus a monotonic freshness signal. `seq`
-/// increments once per completed utterance so a consumer can tell a NEW
-/// dictation from the one it already saw. In-memory only: `seq` resets to 0 on
-/// app restart, which is safe because every waiter re-reads its baseline `seq`
-/// at call time (see the MCP server's `wait_for_dictation`).
+/// The last completed transcript, plus a monotonic freshness signal, so a
+/// consumer can tell a NEW transcript from the one it already saw.
+///
+/// `seq` counts completed-transcript *events*, not spoken utterances: it covers
+/// a whole non-streaming dictation, a whole streaming session, and any
+/// transcript the user pastes from the UI (an edited transcript, or an older
+/// batch-file result). A paste bumps `seq` too, and stamps `at_ms` with the
+/// paste time, not the recording time — so `at_ms` is when this transcript was
+/// recorded here, not when the audio was spoken.
+///
+/// In-memory only: `seq` resets to 0 on app restart, which is safe because
+/// every waiter re-reads its baseline `seq` at call time (see the MCP server's
+/// `wait_for_dictation`).
 #[derive(Clone, Default)]
 pub struct LastTranscript {
     pub text: String,
@@ -24,7 +34,9 @@ pub struct LastTranscript {
 }
 
 /// Record a completed transcript: replace text, bump seq, stamp time.
-pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
+/// Private on purpose: `record_utterance` is the only way to mutate the state,
+/// so the blank-text guard cannot be bypassed by a caller reaching past it.
+fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
     last.text = text.to_string();
     last.seq = last.seq.wrapping_add(1);
     last.at_ms = now_ms;
@@ -33,9 +45,13 @@ pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
 /// Record a completed transcript: a whole non-streaming dictation, a whole
 /// streaming session, or a transcript pasted from the UI. Callers pass the
 /// COMPLETE text — never a streaming segment, or `seq` would tick per fragment.
-/// Empty text is ignored so a no-op recording never looks like a new dictation.
+///
+/// Blank text (empty or whitespace-only) is ignored so a no-op recording never
+/// looks like a new dictation — the UI's paste button has no frontend guard, so
+/// a cleared textarea reaches us as `" "`. The guard trims only to decide; the
+/// text is recorded verbatim.
 pub fn record_utterance(last: &Mutex<LastTranscript>, text: &str) {
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return;
     }
     // Recover from a poisoned lock rather than skipping forever: poisoning is
@@ -50,7 +66,7 @@ pub fn record_utterance(last: &Mutex<LastTranscript>, text: &str) {
 /// parses fine. Note `text`'s *meaning* did change for streaming dictation: it
 /// now holds the whole session's transcript rather than the last segment.
 /// `at` is `at_ms`: unix epoch milliseconds.
-pub fn transcript_json(last: &LastTranscript) -> String {
+fn transcript_json(last: &LastTranscript) -> String {
     serde_json::json!({
         "text": last.text,
         "seq": last.seq,
@@ -60,7 +76,7 @@ pub fn transcript_json(last: &LastTranscript) -> String {
 }
 
 /// Unix epoch millis, saturating to 0 if the clock is before the epoch.
-pub fn now_unix_ms() -> u64 {
+fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -141,6 +157,31 @@ mod tests {
         assert_eq!(guard.seq, 0, "an empty utterance must never bump seq");
         assert_eq!(guard.text, "");
         assert_eq!(guard.at_ms, 0, "an ignored utterance must not stamp the clock");
+    }
+
+    #[test]
+    fn record_utterance_ignores_whitespace_only_text() {
+        let last = Mutex::new(LastTranscript::default());
+        // The UI's paste button has no frontend guard, so a whitespace-only
+        // textarea reaches this helper. It's a no-op, not a new dictation.
+        record_utterance(&last, "   \n\t ");
+
+        let guard = last.lock().unwrap();
+        assert_eq!(guard.seq, 0, "whitespace-only text must never bump seq");
+        assert_eq!(guard.text, "");
+    }
+
+    #[test]
+    fn record_utterance_records_text_untrimmed() {
+        let last = Mutex::new(LastTranscript::default());
+        record_utterance(&last, "  שלום  ");
+
+        let guard = last.lock().unwrap();
+        assert_eq!(guard.seq, 1, "surrounding whitespace does not make it a no-op");
+        assert_eq!(
+            guard.text, "  שלום  ",
+            "the guard trims only to decide; the recorded text stays verbatim"
+        );
     }
 
     #[test]
