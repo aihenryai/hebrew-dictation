@@ -89,7 +89,9 @@ Fix: **stop stamping inside `inject_text_defocused`** (leave it purely about inj
 | Non-streaming | the `inject_text` command (`lib.rs:1337-1340`) | called once with the whole transcript |
 | Streaming | `stop_streaming_transcription` (`lib.rs:1106`) | `session.stop()` returns the **accumulated** `final_text` (built at `streaming.rs:167-171`); `state: State<'_, AppState>` is already in scope |
 
-Result: `seq` increments exactly once per utterance, and `text` is the whole thing on both paths. An empty streaming session (nothing said) must not bump `seq`.
+Result: `seq` increments exactly once per utterance, and `text` is the whole thing on both paths. Empty text must not bump `seq` on either site (a silent streaming session, or a user clearing the editable transcript box and re-pasting).
+
+**Precision, so the MCP docs don't overpromise:** `seq` counts *completed-transcript events*, which is one-per-utterance for the automatic dictation flows — but a user who manually re-pastes an edited transcript ("הדבק בחלון הפעיל") deliberately produces another event, and therefore another bump. That is correct behavior (the text may have been edited, and it is an explicit user action), so `wait_for_dictation` should describe itself as "waits for the next dictation" rather than guaranteeing a strict one-bump-per-spoken-utterance law.
 
 Both sites call a **pure, unit-testable helper** (the TDD seam):
 

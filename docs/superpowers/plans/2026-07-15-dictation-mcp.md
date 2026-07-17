@@ -241,8 +241,16 @@ and replace the `/transcript` body construction (currently the `let text = last_
 
 - [ ] **Step 2: Change the state type (2 mechanical sites in `lib.rs`)**
 
-1. State field (~line 59):
+1. State field (~line 59) — **and fix the doc comment above it (~57-58), which this
+change makes wrong.** It currently says "Last text actually injected … (dictation or
+streaming)", but after this task the streaming half holds the *accumulated session*
+transcript stamped once per session, and `streaming.rs:163` discards the injection
+result anyway, so "actually injected" was never guaranteed there. Replace both lines:
+
 ```rust
+    /// Last completed utterance: the full transcript of a non-streaming dictation,
+    /// or of a whole streaming session. Bumped once per completed utterance (see
+    /// `local_api::bump_transcript`) — backs the opt-in local API's `/transcript`.
     last_transcript: Arc<Mutex<local_api::LastTranscript>>,
 ```
 
@@ -278,7 +286,10 @@ one-line wrapper; it becomes the stamp site for the complete transcript:
 #[tauri::command]
 fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     let result = inject_text_defocused(&app, &text);
-    if result.is_ok() {
+    // Same empty guard as the streaming site: the transcript textarea is
+    // user-editable, so a cleared field + "הדבק בחלון הפעיל" must not bump seq
+    // (it would resolve a waiting wait_for_dictation with nothing).
+    if result.is_ok() && !text.is_empty() {
         if let Some(state) = app.try_state::<AppState>() {
             if let Ok(mut last) = state.last_transcript.lock() {
                 local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
