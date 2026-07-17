@@ -4,6 +4,41 @@
 
 ---
 
+## 🆕 2026-07-15 — dictation MCP server + a latent `/transcript` bug fixed. NOT RELEASED.
+
+Full brainstorm → spec → plan → subagent-TDD, two review gates per task. Spec: `docs/superpowers/specs/2026-07-15-dictation-mcp-design.md`. Plan: `docs/superpowers/plans/2026-07-15-dictation-mcp.md`.
+
+**App (`main`, `43cf9fd`→`0b5dbee`, 63 tests / 1 ignored, 0 warnings):**
+- `GET /transcript` now returns **`{text, seq, at}`** (additive — `text` still there). `seq` = monotonic counter, `at` = unix ms.
+- 🐞 **Latent bug fixed:** `streaming_enabled` defaults **true**, and `streaming.rs:163` injects **per final segment**. The old stamp lived inside `inject_text_defocused`, so the shipped `/transcript` returned only the **last fragment** of a streaming dictation — i.e. it has been returning fragments to anyone using it since it shipped. Stamping moved to the two **utterance boundaries**: the `inject_text` command (`lib.rs`) and `stop_streaming_transcription`. `local_api::record_utterance` is now the single mutation door (`bump_transcript`/`transcript_json`/`now_unix_ms` are private, so the empty-guard can't be bypassed).
+- ⚠️ **`seq` counts completed-transcript EVENTS, not spoken utterances** — a paste of an older batch result bumps it too and stamps `at` with *paste* time. This distinction escaped into docs **four times** during the build (field comment → struct doc → module header → tool description). If you touch this, grep the whole crate for the claim; don't just fix the site you were pointed at.
+
+**MCP server — NEW: `AI-Tools/MCP-Dev/hebrew-dictation-mcp/` (its OWN git repo, `574319d`→`e184adb`, 12 tests):**
+- Node/TS, `@modelcontextprotocol/sdk` ^1.29, **stdio**. `src/client.ts` (all logic, zero MCP imports, unit-tested vs a real local mock HTTP server) + `src/index.ts` (pure wiring). README has the `.mcp.json` snippet.
+- Tools: **`get_last_transcript`** (non-blocking) · **`wait_for_dictation`** (blocks until `seq` exceeds a per-call baseline) · **`dictation_status`** (diagnostics).
+- ⚠️ **It never starts the mic.** It only watches the counter; you dictate with the app's own hotkey. The name misleads — the descriptions say so explicitly.
+- ⚠️ **`timeout_seconds` defaults to 55, not 120, on purpose.** The MCP SDK's `DEFAULT_REQUEST_TIMEOUT_MSEC = 60000`, so a client aborts the tool call at 60s with a generic error before a longer wait could return gracefully. Measured: 55.4s graceful, 4.6s margin. The 1..600 range is real but >55 needs the *client's* request timeout raised. Proper fix (progress notifications) deferred — needs a `progressToken` the client may never send; analysis is in a `// TODO` in `index.ts`.
+
+### ⏳ What's left — NOT done
+
+1. **🎤 The one hop never tested end-to-end (needs a human + mic).** Everything from `/transcript` rightward was verified against a live Rust server driving a live MCP client. Left of it — mic → Deepgram → `final_text` accumulation → `record_utterance` — is untested. **Sharpest surviving assumption: is `final_text` complete when `record_utterance` reads it?** `stop()` waits **at most 5s** (`streaming.rs:120`) for Deepgram's trailing `is_final` messages; a late one means `seq` bumps with a **truncated** sentence. (It truncates the UI identically, so it's pre-existing and symmetric — but the MCP is the first consumer that can't eyeball the result.)
+
+   Set `"local_api_enabled": true` in settings.json, restart the app, run this, then press Alt+D, say **one multi-clause sentence**, press Alt+D again:
+   ```
+   powershell -NoProfile -Command "while($true){try{$r=Invoke-RestMethod http://127.0.0.1:5757/transcript;Write-Host ('seq={0}  text={1}' -f $r.seq,$r.text)}catch{Write-Host 'not reachable'};Start-Sleep 1}"
+   ```
+   **Pass = `seq` rises by exactly 1 (not 3) and `text` is the whole sentence.** Falsifies both the per-fragment-bump and truncation risks at once. This is spec §6's acceptance criterion.
+
+2. **Not released, not registered.** No GitHub Release, no version bump, no auto-update. The MCP server isn't in any `.mcp.json` yet.
+
+3. **Open decision — the non-streaming injection gate.** `inject_text` records only `if result.is_ok()`, while `stop_streaming_transcription` records unconditionally. So with `streaming_enabled: false`, a dictation whose injection fails (`injector.rs:42,45` can error; `App.tsx:495-501` swallows it with an empty `catch {}`) never bumps `seq` — `wait_for_dictation` times out and the agent reports "no dictation" though the user spoke, silently. Not a regression (matches old behavior), but it contradicts the "last completed transcript" concept. Either record on both paths regardless of injection, or document the gate.
+
+4. **Known UX seam (inherent, not a bug).** The app injects into whatever holds OS focus — when you dictate *for the agent*, that's the Claude Code prompt box. The sentence lands in your input box **and** returns through the tool, so you must clear the box before pressing enter. Unavoidable while "no remote-record trigger" stays a non-goal.
+
+5. **Deferred, recorded in TODOs:** `outputSchema` for the three tools (purely additive later) and `structuredContent` shape consistency (**not** additive once automation writes against it — currently a non-issue only because the package is `"private": true`, publishing is a spec non-goal, and the sole consumer is in-workspace). Minor: `dictation_status`'s `reachable` can never be `false` (the unreachable path returns `isError` instead); `record_utterance` is arguably misnamed given `seq` counts events not utterances; README doesn't name the `local_api_port` setting.
+
+---
+
 ## ✅ v2.12.0 — FULLY RELEASED (2026-07-14) — meeting transcription
 
 **Released end-to-end + verified each hop (not assumed):**
@@ -150,11 +185,17 @@ Today's mic capture uses `cpal` (cross-platform). To also capture the OTHER side
 
 Henry compared hebrew-dictation to Voicebox and flagged three items to "add to the plans." Ordered by leverage — none scheduled yet:
 
-**1. Local API — ✅ SHIPPED (2026-07-09).** Henry built it in a parallel session; consolidated + committed here (`108f4f5`): `src-tauri/src/local_api.rs` — a `tiny_http` server on `127.0.0.1:5757`, `GET /transcript` returns the last injected transcript as JSON, **opt-in** (`local_api_enabled` in settings.json, off by default), bind failure non-fatal. Verified wired: `inject_text_defocused` writes `last_transcript` after every successful injection (dictation *and* streaming). Remaining polish: no unit tests, no UI toggle, no WebSocket live stream. **This unblocks #2 (the MCP wrapper).** Original research below —
+**1. Local API — ✅ SHIPPED (2026-07-09), then materially reworked 2026-07-15 (see the top section).** `src-tauri/src/local_api.rs` — a `tiny_http` server on `127.0.0.1:5757`, **opt-in** (`local_api_enabled` in settings.json, off by default; port via `local_api_port`), bind failure non-fatal.
+
+> ⚠️ **This bullet used to claim:** *"`GET /transcript` returns the last injected transcript… Verified wired: `inject_text_defocused` writes `last_transcript` after every successful injection (dictation and streaming)."* **That wiring was real but WRONG, and this sentence is what recorded the bug as verified-correct.** `streaming_enabled` defaults true and streaming injects **per segment**, so `/transcript` returned only the *last fragment* of a dictation. Fixed 2026-07-15: `GET /transcript` now returns `{text, seq, at}`, and stamping happens at the two **utterance boundaries** (the `inject_text` command; `stop_streaming_transcription`), never inside `inject_text_defocused`. Full detail in the top section.
+
+Remaining polish: no UI toggle, no WebSocket live stream. (Unit tests: now 7 in `local_api.rs`.) **This unblocked #2 (the MCP wrapper) — now built.** Original research below —
 
 **1-orig. Local API (REST/WebSocket on `127.0.0.1`) — highest leverage, the real gap.** The app is UI+hotkey only, no programmatic surface; Voicebox exposes `POST /generate` on `127.0.0.1:17493`. A small local server here (e.g. `GET /transcribe` → last transcript, or a WebSocket live stream) would let the **cloud-agent and the video pipeline consume dictation without driving the UI**. The transcription pipeline already exists (Deepgram/Groq/whisper-rs via `run_transcribe_file`) and the app already runs tokio → it's "wrap the existing pipeline in an embedded server." ⚠️ **Impl note:** `tauri-plugin-http` is an *outbound* client (a fetch replacement), **not** a server — to host an endpoint use embedded `axum`/`tiny_http` on a background task, not that plugin. **Design point first:** localhost still lets any local process — and browser pages via `fetch('http://127.0.0.1:…')` — reach it; gate anything that can trigger recording or return history behind a token (a read-only "last transcript" endpoint is low-risk). **Enabler for #2.**
 
-**2. MCP server around the dictation — builds on #1.** Voicebox's MCP lets agents *speak* in the cloned voice; the inverse here gives Claude Code/Cursor voice *dictation into the agent session* (dictate-into-agent, not just into a text field). Best built as a thin wrapper over #1's local API rather than re-embedding the transcription logic — so **#1 first, then #2 is a small adapter.** Realistic shape: pull-based `dictate()` / `get_last_transcript()` (MCP has no server→model push mid-tool-call, so live-streaming into a running turn isn't a natural fit). Home: `AI-Tools/MCP-Dev/`.
+**2. MCP server around the dictation — ✅ BUILT 2026-07-15 (see the top section).** Lives at `AI-Tools/MCP-Dev/hebrew-dictation-mcp/` — **its own git repo**, deliberately, so its commits never land in the shared `claude-dev` root repo the nightly job owns. Node/TS + `@modelcontextprotocol/sdk` ^1.29, stdio, three tools. The predicted shape was right: pull-based, no server→model push. NOT released/registered anywhere yet — see the top section for what's left.
+
+*Original research:* Voicebox's MCP lets agents *speak* in the cloned voice; the inverse here gives Claude Code/Cursor voice *dictation into the agent session* (dictate-into-agent, not just into a text field). Best built as a thin wrapper over #1's local API rather than re-embedding the transcription logic — so **#1 first, then #2 is a small adapter.**
 
 **3. LLM text-cleanup — ⚠️ ALREADY EXISTS, do NOT rebuild.** Henry's read was "the app injects raw STT with no punctuation/disfluency cleanup," and he rightly YAGNI-flagged it. Code check: it's **already shipped as "Smart Cleanup / רישוף חכם" (`enhance.rs`, spec `docs/superpowers/specs/2026-06-15-smart-cleanup-design.md`)** — runs the transcript through Groq Llama-3.3-70b to strip fillers (אהה/אמ/יעני/כאילו), repetitions and false-starts and fix Hebrew punctuation, with a hallucination guard (>2× raw length → reject) and graceful fallback to raw text on any error. It's **opt-in** (`enhance_enabled` setting), wired via the `enhance_text` command. The cloud batch path also already sends `smart_format=true&punctuate=true`, so cloud transcripts are already punctuated. → **Not an engineering gap.** The only real questions: (a) product — should Smart Cleanup be more discoverable / default-on? (b) does it cover the **streaming**-inject path or only batch? (streaming bypasses the command path per the v2.11.0 focus-bug fix — verify). Nothing to build unless Henry wants it always-on.
 
