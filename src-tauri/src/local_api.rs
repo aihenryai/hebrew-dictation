@@ -11,6 +11,33 @@
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Method, Response, Server};
 
+/// The last completed transcript, plus a monotonic freshness signal. `seq`
+/// increments once per completed utterance so a consumer can tell a NEW
+/// dictation from the one it already saw. In-memory only: `seq` resets to 0 on
+/// app restart, which is safe because every waiter re-reads its baseline `seq`
+/// at call time (see the MCP server's `wait_for_dictation`).
+#[derive(Clone, Default)]
+pub struct LastTranscript {
+    pub text: String,
+    pub seq: u64,
+    pub at_ms: u64,
+}
+
+/// Record a freshly injected transcript: replace text, bump seq, stamp time.
+pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
+    last.text = text.to_string();
+    last.seq = last.seq.wrapping_add(1);
+    last.at_ms = now_ms;
+}
+
+/// Unix epoch millis, saturating to 0 if the clock is before the epoch.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Spawn the server on its own blocking OS thread — no async runtime
 /// integration needed for a single read-only endpoint.
 pub fn start(port: u16, last_transcript: Arc<Mutex<String>>) {
@@ -41,4 +68,27 @@ pub fn start(port: u16, last_transcript: Arc<Mutex<String>>) {
             let _ = request.respond(response);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_transcript_increments_seq_and_replaces_text() {
+        let mut last = LastTranscript::default();
+        assert_eq!(last.seq, 0, "fresh state starts at seq 0");
+        assert_eq!(last.text, "");
+        assert_eq!(last.at_ms, 0);
+
+        bump_transcript(&mut last, "שלום", 1_000);
+        assert_eq!(last.seq, 1);
+        assert_eq!(last.text, "שלום");
+        assert_eq!(last.at_ms, 1_000);
+
+        bump_transcript(&mut last, "עולם", 2_000);
+        assert_eq!(last.seq, 2, "each injection bumps seq exactly once");
+        assert_eq!(last.text, "עולם");
+        assert_eq!(last.at_ms, 2_000);
+    }
 }
