@@ -4,7 +4,7 @@
 
 **Goal:** Expose the hebrew-dictation app's last transcript to MCP clients (Claude Code / Cursor / automation), with a reliable "is this dictation fresh?" signal.
 
-**Architecture:** Two halves. (A) A tiny additive change to the app's Rust Local API: a monotonic `seq` counter bumped on every successful transcript injection, surfaced as `GET /transcript` → `{text, seq, at}`. (B) A new standalone Node/TypeScript MCP server (`hebrew-dictation-mcp/`) that polls that endpoint over stdio-MCP and exposes three tools. All wait/poll logic lives in Node — the Rust side stays single-threaded and otherwise untouched. No remote-record trigger, no auth token (read-only endpoint).
+**Architecture:** Two halves. (A) An additive change to the app's Rust Local API: a monotonic `seq` counter bumped **once per completed utterance** (not per streaming segment — see spec §3.2, this also fixes a latent bug in the shipped endpoint), surfaced as `GET /transcript` → `{text, seq, at}`. (B) A new standalone Node/TypeScript MCP server (`hebrew-dictation-mcp/`) that polls that endpoint over stdio-MCP and exposes three tools. All wait/poll logic lives in Node — the Rust side stays single-threaded and otherwise untouched. No remote-record trigger, no auth token (read-only endpoint).
 
 **Tech Stack:** Rust (Tauri app, `tiny_http`, `serde_json`) · Node 20+ / TypeScript ^5.5 · `@modelcontextprotocol/sdk` ^1.29 · `zod` ^4 · `vitest` (plain Node pool)
 
@@ -19,7 +19,7 @@
 | File | Responsibility |
 |---|---|
 | `src-tauri/src/local_api.rs` | **Owns the whole "last transcript" concept**: the `LastTranscript` struct, `bump_transcript`, `now_unix_ms`, `transcript_json`, plus the HTTP server. All new pure helpers + their unit tests live here — one file, one responsibility. |
-| `src-tauri/src/lib.rs` | Only 4 mechanical edits: state field type (~:59), the injection update site (~:1317), state init (~:1912), the `local_api::start` call (~:1963). No new logic. |
+| `src-tauri/src/lib.rs` | 5 edits, no new logic of its own — it only calls `local_api`'s helpers: state field type (~:59), state init (~:1912), **remove** the old stamp from `inject_text_defocused` (~:1317), **add** the stamp at the two utterance boundaries — the `inject_text` command (~:1338) and `stop_streaming_transcription` (~:1106). |
 
 **Half B — new sibling project (`AI-Tools/MCP-Dev/hebrew-dictation-mcp/`):**
 
@@ -73,7 +73,11 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd src-tauri && cargo test local_api::tests::bump_transcript_increments_seq_and_replaces_text`
+> All commands in Chunk 1 run from the **repo root** (`hebrew-dictation/`) and use
+> `--manifest-path`, so the shell's cwd never drifts and the `git add` paths in each
+> commit step stay valid. Do not `cd src-tauri`.
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml local_api::tests::bump_transcript_increments_seq_and_replaces_text`
 Expected: FAIL — compile error, `cannot find type LastTranscript` / `cannot find function bump_transcript`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -81,12 +85,12 @@ Expected: FAIL — compile error, `cannot find type LastTranscript` / `cannot fi
 Add near the top of `src-tauri/src/local_api.rs`, after the existing `use` lines:
 
 ```rust
-/// The last successfully injected transcript, plus a monotonic freshness
-/// signal. `seq` increments once per injection so a consumer can tell a NEW
+/// The last completed transcript, plus a monotonic freshness signal. `seq`
+/// increments once per completed utterance so a consumer can tell a NEW
 /// dictation from the one it already saw. In-memory only: `seq` resets to 0 on
 /// app restart, which is safe because every waiter re-reads its baseline `seq`
 /// at call time (see the MCP server's `wait_for_dictation`).
-#[derive(Clone, Default, Debug, PartialEq)]
+#[derive(Clone, Default)]
 pub struct LastTranscript {
     pub text: String,
     pub seq: u64,
@@ -109,9 +113,15 @@ pub fn now_unix_ms() -> u64 {
 }
 ```
 
+> **Expect a transient `dead_code` warning** for `now_unix_ms` until Task 3 wires it up
+> (it's `pub` inside a *private* module and has no caller yet). This is expected — do
+> **not** "fix" it with `#[allow(dead_code)]`, which would then linger forever. It
+> disappears on its own at Task 3. `bump_transcript`/`transcript_json` are exempt
+> because their tests count as usage.
+
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd src-tauri && cargo test local_api::tests::bump_transcript_increments_seq_and_replaces_text`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml local_api::tests::bump_transcript_increments_seq_and_replaces_text`
 Expected: PASS (1 passed).
 
 - [ ] **Step 5: Commit**
@@ -157,7 +167,7 @@ Add inside the existing `mod tests`:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd src-tauri && cargo test local_api::tests::transcript_json`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml local_api::tests::transcript_json`
 Expected: FAIL — `cannot find function transcript_json`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -180,7 +190,7 @@ pub fn transcript_json(last: &LastTranscript) -> String {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd src-tauri && cargo test local_api::tests::transcript_json`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml local_api::tests::transcript_json`
 Expected: PASS (2 passed).
 
 - [ ] **Step 5: Commit**
@@ -192,13 +202,23 @@ git commit -m "feat(local-api): serialize transcript as {text, seq, at}"
 
 ---
 
-### Task 3: Wire the new state through the app
+### Task 3: Wire the state through the app — stamping on *complete utterances*
 
-Pure mechanical rewiring — no new logic, no new tests. The existing suite is the regression gate.
+Rewiring, no new unit tests (the pure helpers are already covered; these sites are
+integration glue). The existing suite is the regression gate, and **Step 5's manual
+check is the real behavioral gate** — it is what proves the fragment bug is dead.
+
+> **Read this before touching `lib.rs`.** The naive move — bumping `seq` where the old
+> code stamped, inside `inject_text_defocused` — is **wrong**. `streaming_enabled`
+> defaults to `true` (`settings.rs:264`), and `streaming.rs:163` calls
+> `inject_text_defocused` **once per final segment**. Stamping there makes `seq` tick
+> per *fragment* and leaves `text` holding only the last segment. See spec §3.2.
+> Instead: strip the stamp out of `inject_text_defocused` and stamp the **complete**
+> text at each of its two callers' utterance boundaries.
 
 **Files:**
 - Modify: `src-tauri/src/local_api.rs` (the `start` signature + handler)
-- Modify: `src-tauri/src/lib.rs` (4 sites: ~:59, ~:1317, ~:1912, ~:1963)
+- Modify: `src-tauri/src/lib.rs` (5 sites: ~:59, ~:1106, ~:1317, ~:1338, ~:1912)
 
 - [ ] **Step 1: Change the server signature + handler**
 
@@ -219,7 +239,7 @@ and replace the `/transcript` body construction (currently the `let text = last_
                 };
 ```
 
-- [ ] **Step 2: Update the 4 call sites in `lib.rs`**
+- [ ] **Step 2: Change the state type (2 mechanical sites in `lib.rs`)**
 
 1. State field (~line 59):
 ```rust
@@ -231,39 +251,102 @@ and replace the `/transcript` body construction (currently the `let text = last_
             last_transcript: Arc::new(Mutex::new(local_api::LastTranscript::default())),
 ```
 
-3. The injection update site (~line 1317) — replace the `*last = text.to_string();` body:
+The spawn (~line 1963) needs no textual change — `state.last_transcript.clone()` clones the Arc, whose inner type just changed. Verify it still compiles.
+
+- [ ] **Step 3: REMOVE the stamp from `inject_text_defocused` (~line 1315)**
+
+Delete this whole block — this function goes back to being purely about injection:
+
 ```rust
     if result.is_ok() {
         if let Some(state) = app.try_state::<AppState>() {
             if let Ok(mut last) = state.last_transcript.lock() {
-                local_api::bump_transcript(&mut last, text, local_api::now_unix_ms());
+                *last = text.to_string();
             }
         }
     }
 ```
 
-4. The spawn (~line 1963) needs no textual change — `state.last_transcript.clone()` now clones the new Arc type. Verify it still compiles.
+Leave the surrounding `let result = injector::inject_text(...)` and the window-restore code below it untouched; `result` is still returned at the end of the function.
 
-- [ ] **Step 3: Verify the whole suite + build**
+- [ ] **Step 4: ADD the stamp at the two utterance boundaries**
 
-Run: `cd src-tauri && cargo test`
+**(a) Non-streaming — the `inject_text` command (~line 1337).** It is currently a
+one-line wrapper; it becomes the stamp site for the complete transcript:
+
+```rust
+#[tauri::command]
+fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
+    let result = inject_text_defocused(&app, &text);
+    if result.is_ok() {
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(mut last) = state.last_transcript.lock() {
+                local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
+            }
+        }
+    }
+    result
+}
+```
+
+**(b) Streaming — `stop_streaming_transcription` (~line 1106).** `session.stop()`
+already returns the accumulated full text, and `state: State<'_, AppState>` is in
+scope. Replace `let text = active.session.stop().await?; Ok(text)` with:
+
+```rust
+    let text = active.session.stop().await?;
+
+    // One seq bump per streaming session = the whole utterance, not per segment.
+    // Skip empty sessions so a no-op recording never looks like a new dictation.
+    if !text.is_empty() {
+        if let Ok(mut last) = state.last_transcript.lock() {
+            local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
+        }
+    }
+
+    Ok(text)
+```
+
+`state.last_transcript` is a `std::sync::Mutex`, so this `lock()` is sync — fine here because the guard is dropped before the next `await`.
+
+- [ ] **Step 5: Verify the whole suite + build**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml`
 Expected: PASS — the previously-green **55 passed / 1 ignored** plus the 3 new tests = **58 passed / 1 ignored**. No pre-existing test may regress.
 
-Run: `cd src-tauri && cargo build`
-Expected: 0 warnings in `local_api.rs` / `lib.rs`. (6 clippy warnings in *untouched* files are pre-existing — leave them alone.)
+Run: `cargo build --manifest-path src-tauri/Cargo.toml`
+Expected: 0 warnings in `local_api.rs` / `lib.rs` (the `now_unix_ms` dead_code warning from Task 1 is now gone).
 
-- [ ] **Step 4: Sanity-check the endpoint shape by hand (optional but cheap)**
+Run: `cargo clippy --manifest-path src-tauri/Cargo.toml`
+Expected: no *new* warnings in the two touched files. 6 pre-existing warnings live in untouched files — leave them alone.
 
-Set `"local_api_enabled": true` in `%APPDATA%/hebrew-dictation/settings.json`, run `npm run tauri dev` from the repo root, dictate once (Alt+D), then:
+- [ ] **Step 6: BEHAVIORAL GATE — verify the fragment bug is actually dead**
 
-Run: `curl http://127.0.0.1:5757/transcript`
-Expected: `{"text":"<what you said>","seq":1,"at":<13-digit ms>}` — and `seq` increments on a second dictation.
+This is the step that proves the whole design. Do not skip it.
 
-- [ ] **Step 5: Commit**
+Set `"local_api_enabled": true` in `%APPDATA%/hebrew-dictation/settings.json`, confirm
+`"streaming_enabled": true` (the default — we are deliberately testing the hard path),
+then run `npm run tauri dev` from the repo root.
+
+1. Press Alt+D and dictate **one long multi-segment sentence** (talk for ~10s without stopping, so Deepgram emits several `is_final` segments), then stop.
+2. Run: `curl http://127.0.0.1:5757/transcript`
+
+Expected: `{"text":"<THE ENTIRE SENTENCE>","seq":1,"at":<13-digit ms>}`
+- ✅ `text` is the **whole** sentence — not the last fragment.
+- ✅ `seq` is **1**, not one-per-segment.
+3. Dictate a second sentence → `seq` becomes exactly **2**.
+
+If `seq` jumped by more than 1 per sentence, or `text` is a fragment, the stamp is still
+firing per-segment — re-check Step 3 actually removed the old block.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src-tauri/src/local_api.rs src-tauri/src/lib.rs
-git commit -m "feat(local-api): expose seq/at on GET /transcript"
+git commit -m "feat(local-api): expose seq/at, stamp once per complete utterance
+
+Also fixes a latent bug in the shipped endpoint: with streaming on (the
+default), /transcript returned only the last segment of a dictation."
 ```
 
 ---
@@ -273,11 +356,34 @@ git commit -m "feat(local-api): expose seq/at on GET /transcript"
 ### Task 4: Scaffold `hebrew-dictation-mcp/`
 
 **Files:**
-- Create: `../hebrew-dictation-mcp/package.json`, `tsconfig.json`, `vitest.config.ts`, `.gitignore`
+- Create: `../hebrew-dictation-mcp/` + `package.json`, `tsconfig.json`, `vitest.config.ts`, `.gitignore`
 
-> All paths in Chunk 2 are relative to `AI-Tools/MCP-Dev/hebrew-dictation-mcp/` (a **sibling** of the app repo, not inside it).
+> All paths in Chunk 2 are relative to `AI-Tools/MCP-Dev/hebrew-dictation-mcp/` (a **sibling** of the app repo, not inside it). Chunk 1 left you in the `hebrew-dictation` repo — Step 1 moves you out of it.
 
-- [ ] **Step 1: Create `package.json`**
+- [ ] **Step 1: Create the directory and make it its OWN git repo**
+
+⚠️ **`git init` is mandatory, not optional.** `MCP-Dev/` itself belongs to the shared
+`claude-dev` root repo, whose commits are owned by the nightly backup job — the root
+`CLAUDE.md` forbids hand-committing there, and that rule explicitly covers subfolders
+that aren't their own repo. Without `git init`, Chunk 2's five commits would land in
+that shared repo alongside parallel sessions' work. The app next door
+(`hebrew-dictation/`) is itself a nested repo — this follows the same established
+pattern.
+
+```bash
+cd ..
+mkdir -p hebrew-dictation-mcp/src hebrew-dictation-mcp/test
+cd hebrew-dictation-mcp
+git init
+```
+
+Verify you are NOT in the root repo before committing anything:
+
+Run: `git rev-parse --show-toplevel`
+Expected: a path ending in `hebrew-dictation-mcp` — **not** `claude-dev`. If it says
+`claude-dev`, stop: `git init` did not take, and committing would pollute the shared repo.
+
+- [ ] **Step 2: Create `package.json`**
 
 ```json
 {
@@ -303,7 +409,7 @@ git commit -m "feat(local-api): expose seq/at on GET /transcript"
 }
 ```
 
-- [ ] **Step 2: Create `tsconfig.json`**
+- [ ] **Step 3: Create `tsconfig.json`**
 
 ```json
 {
@@ -322,7 +428,7 @@ git commit -m "feat(local-api): expose seq/at on GET /transcript"
 }
 ```
 
-- [ ] **Step 3: Create `vitest.config.ts` (plain Node — NOT the Workers pool)**
+- [ ] **Step 4: Create `vitest.config.ts` (plain Node — NOT the Workers pool)**
 
 ```ts
 import { defineConfig } from "vitest/config";
@@ -335,22 +441,24 @@ export default defineConfig({
 });
 ```
 
-- [ ] **Step 4: Create `.gitignore`**
+- [ ] **Step 5: Create `.gitignore`**
 
 ```
 node_modules/
 dist/
 ```
 
-- [ ] **Step 5: Install and verify the toolchain**
+`package-lock.json` is deliberately **not** ignored — it is committed for reproducible builds.
+
+- [ ] **Step 6: Install and verify the toolchain**
 
 Run: `npm install`
-Expected: installs cleanly, no peer-dep errors.
+Expected: installs cleanly, no peer-dep errors. Generates `package-lock.json`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add package.json tsconfig.json vitest.config.ts .gitignore
+git add package.json package-lock.json tsconfig.json vitest.config.ts .gitignore
 git commit -m "chore(dictation-mcp): scaffold the MCP server project"
 ```
 
@@ -404,7 +512,7 @@ describe("fetchTranscript", () => {
   });
 
   it("throws DictationUnavailableError when nothing is listening", async () => {
-    // Port 1 is privileged/unused — a connection here is refused immediately.
+    // Nothing is bound to port 1, so the connection is refused immediately.
     const client = new DictationClient(1);
 
     await expect(client.fetchTranscript()).rejects.toBeInstanceOf(
@@ -520,16 +628,21 @@ describe("waitForNext", () => {
   });
 
   it("aborts (does not silently retry) if the API dies mid-wait", async () => {
-    const port = await startMock(() =>
-      JSON.stringify({ text: "ישן", seq: 5, at: 1 }),
-    );
+    // Kill the server from inside the 2nd poll, so the wait is genuinely
+    // in-flight when the API disappears — not dead before it started.
+    let calls = 0;
+    const port = await startMock(() => {
+      if (++calls === 2) {
+        server!.close();
+      }
+      return JSON.stringify({ text: "ישן", seq: 5, at: 1 });
+    });
     const client = new DictationClient(port);
-    await new Promise<void>((resolve) => server!.close(() => resolve()));
-    server = undefined;
 
     await expect(client.waitForNext(5, 2_000, 10)).rejects.toBeInstanceOf(
       DictationUnavailableError,
     );
+    server = undefined; // already closed above; keep afterEach from double-closing
   });
 });
 ```
@@ -775,13 +888,18 @@ console.log("tools:", tools.map((t) => t.name).join(", "));
 const status = await client.callTool({ name: "dictation_status", arguments: {} });
 console.log("dictation_status:", status.content[0].text);
 
+// Exercise the get_last_transcript handler end-to-end too — it has no unit test
+// (it's pure wiring), so this is its only coverage.
+const last = await client.callTool({ name: "get_last_transcript", arguments: {} });
+console.log("get_last_transcript:", last.content[0].text || "(empty)");
+
 await client.close();
 ```
 
 - [ ] **Step 2: Run the smoke test**
 
 Run: `npm run build && npm run smoke`
-Expected output: `tools: get_last_transcript, wait_for_dictation, dictation_status` followed by a `dictation_status:` line — either "Local API is up…" (app running with the API on) or the actionable "not reachable" message (app closed). **Either is a pass** — what's being proven is that the tools register and errors surface cleanly.
+Expected output: `tools: get_last_transcript, wait_for_dictation, dictation_status`, then a `dictation_status:` line and a `get_last_transcript:` line — either real values (app running with the API on) or the actionable "not reachable" message (app closed). **Either is a pass** — what's being proven is that the tools register, dispatch, and surface errors cleanly rather than crashing.
 
 - [ ] **Step 3: Write `README.md`**
 
@@ -851,7 +969,8 @@ git commit -m "docs(dictation-mcp): smoke client and README"
 
 ## Done criteria
 
-- `cd src-tauri && cargo test` → 58 passed / 1 ignored; `cargo build` → 0 new warnings.
-- `curl http://127.0.0.1:5757/transcript` → `{"text":…,"seq":N,"at":…}`; `seq` rises by 1 per dictation.
-- `hebrew-dictation-mcp`: `npm test` → 5 passed; `npm run smoke` lists 3 tools.
+- `cargo test --manifest-path src-tauri/Cargo.toml` → 58 passed / 1 ignored; `cargo build` → 0 new warnings; `cargo clippy` → no new warnings in the 2 touched files.
+- **The behavioral gate (Task 3, Step 6) passed:** with `streaming_enabled: true`, one long multi-segment sentence yields `seq` +1 and the **complete** sentence in `text` — not a fragment, not one bump per segment.
+- `hebrew-dictation-mcp` is its **own git repo** (`git rev-parse --show-toplevel` ends in `hebrew-dictation-mcp`, not `claude-dev`) — no Chunk 2 commit landed in the shared root repo.
+- `hebrew-dictation-mcp`: `npm test` → 5 passed; `npm run smoke` lists 3 tools and prints both a `dictation_status:` and a `get_last_transcript:` line without crashing.
 - README carries the registration snippet and the "does not start the mic" note.

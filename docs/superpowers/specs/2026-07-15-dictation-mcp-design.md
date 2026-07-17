@@ -76,17 +76,22 @@ pub struct LastTranscript {
 last_transcript: Arc<Mutex<LastTranscript>>,
 ```
 
-### 3.2 Update site
+### 3.2 Update sites — stamp on a *complete utterance*, not on every injection
 
-Today (`lib.rs:1317`), inside `inject_text_defocused`, after a successful injection:
+**This corrects a latent bug in the shipped Local API, not just an MCP concern.**
 
-```rust
-if let Ok(mut last) = state.last_transcript.lock() {
-    *last = text.to_string();
-}
-```
+`streaming_enabled` defaults to **true** (`settings.rs:264`). With streaming on, `streaming.rs:163` calls `inject_text_defocused` **once per final segment**. So today's stamping — which lives *inside* `inject_text_defocused` (`lib.rs:1317`) — means `/transcript` currently returns only the **last segment** of a streaming dictation, never the full utterance. Naively bumping `seq` in that same place would make `seq` tick per fragment, and `wait_for_dictation` would hand the agent the *first fragment* of a sentence.
 
-Becomes a call to a **pure, unit-testable helper** (the TDD seam):
+Fix: **stop stamping inside `inject_text_defocused`** (leave it purely about injection) and stamp the complete text at the two points where an utterance is actually finished. `inject_text_defocused` has exactly two callers, and each maps to one boundary:
+
+| Path | Boundary to stamp | Why it's complete there |
+|---|---|---|
+| Non-streaming | the `inject_text` command (`lib.rs:1337-1340`) | called once with the whole transcript |
+| Streaming | `stop_streaming_transcription` (`lib.rs:1106`) | `session.stop()` returns the **accumulated** `final_text` (built at `streaming.rs:167-171`); `state: State<'_, AppState>` is already in scope |
+
+Result: `seq` increments exactly once per utterance, and `text` is the whole thing on both paths. An empty streaming session (nothing said) must not bump `seq`.
+
+Both sites call a **pure, unit-testable helper** (the TDD seam):
 
 ```rust
 /// Record a freshly injected transcript: replace text, bump seq, stamp time.
@@ -190,7 +195,7 @@ No remote trigger: the recording is always started by Henry's own hotkey/UI. The
 
 ## 6. Acceptance criteria
 
-- **Rust:** `GET /transcript` returns `{text, seq, at}`; `seq` increments exactly once per successful injection (dictation and streaming paths both go through `inject_text_defocused`); `cargo test` covers `bump_transcript` + `transcript_json`; `cargo build` clean; disabled-API behavior unchanged.
+- **Rust:** `GET /transcript` returns `{text, seq, at}`; `seq` increments **exactly once per complete utterance** on *both* paths — verified by hand with streaming ON (the default): one multi-segment sentence must produce `seq +1` and the **full** sentence as `text`, not a fragment. `cargo test` covers `bump_transcript` + `transcript_json`; `cargo build` clean; disabled-API behavior unchanged.
 - **MCP:** the 3 tools work over stdio; `wait_for_dictation` resolves on a new dictation and times out gracefully; unreachable-API errors are actionable; `npm test` green; `test-client.mjs` smoke run lists the tools and calls `dictation_status`.
 - **Docs:** `README.md` shows the exact registration snippet for Claude Code (`.mcp.json`) and Cursor, **and states plainly that `wait_for_dictation` does not start the mic** — it waits for the user to dictate via the app's own hotkey/UI (the name could otherwise imply a remote trigger).
 
