@@ -54,9 +54,12 @@ struct AppState {
     /// Set true while a long batch-view recording is in progress (separate from
     /// short dictation) so Alt+D cannot overwrite the buffer mid-session.
     batch_recording_in_progress: Arc<AtomicBool>,
-    /// Last completed utterance: the full transcript of a non-streaming dictation,
-    /// or of a whole streaming session. Bumped once per completed utterance (see
-    /// `local_api::bump_transcript`) — backs the opt-in local API's `/transcript`.
+    /// The last completed transcript: a whole non-streaming dictation, a whole
+    /// streaming session, or any transcript the user pastes from the UI (an
+    /// edited transcript, or an older batch-file result). `seq` counts
+    /// completed-transcript *events*, not spoken utterances — a paste bumps it
+    /// too, and stamps `at_ms` with the paste time, not the recording time.
+    /// See `local_api::record_utterance` — backs the local API's `/transcript`.
     last_transcript: Arc<Mutex<local_api::LastTranscript>>,
 }
 
@@ -1107,12 +1110,7 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
     let text = active.session.stop().await?;
 
     // One seq bump per streaming session = the whole utterance, not per segment.
-    // Skip empty sessions so a no-op recording never looks like a new dictation.
-    if !text.is_empty() {
-        if let Ok(mut last) = state.last_transcript.lock() {
-            local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
-        }
-    }
+    local_api::record_utterance(&state.last_transcript, &text);
 
     Ok(text)
 }
@@ -1339,14 +1337,9 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
 #[tauri::command]
 fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     let result = inject_text_defocused(&app, &text);
-    // Same empty guard as the streaming site: the transcript textarea is
-    // user-editable, so a cleared field + "הדבק בחלון הפעיל" must not bump seq
-    // (it would resolve a waiting wait_for_dictation with nothing).
-    if result.is_ok() && !text.is_empty() {
+    if result.is_ok() {
         if let Some(state) = app.try_state::<AppState>() {
-            if let Ok(mut last) = state.last_transcript.lock() {
-                local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
-            }
+            local_api::record_utterance(&state.last_transcript, &text);
         }
     }
     result

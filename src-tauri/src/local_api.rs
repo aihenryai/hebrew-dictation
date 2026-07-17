@@ -23,16 +23,32 @@ pub struct LastTranscript {
     pub at_ms: u64,
 }
 
-/// Record a freshly injected transcript: replace text, bump seq, stamp time.
+/// Record a completed transcript: replace text, bump seq, stamp time.
 pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
     last.text = text.to_string();
     last.seq = last.seq.wrapping_add(1);
     last.at_ms = now_ms;
 }
 
+/// Record a completed transcript: a whole non-streaming dictation, a whole
+/// streaming session, or a transcript pasted from the UI. Callers pass the
+/// COMPLETE text — never a streaming segment, or `seq` would tick per fragment.
+/// Empty text is ignored so a no-op recording never looks like a new dictation.
+pub fn record_utterance(last: &Mutex<LastTranscript>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    // Recover from a poisoned lock rather than skipping forever: poisoning is
+    // permanent, and LastTranscript has no cross-field invariant a panic could
+    // break. Matches this crate's existing `into_inner()` convention.
+    let mut guard = last.lock().unwrap_or_else(|e| e.into_inner());
+    bump_transcript(&mut guard, text, now_unix_ms());
+}
+
 /// Serialize the transcript state for `GET /transcript`.
-/// Additive: `text` keeps its existing meaning, `seq`/`at` are new keys, so
-/// any existing consumer reading `.text` keeps working unchanged.
+/// `seq`/`at` are additive keys, so an existing consumer reading `.text` still
+/// parses fine. Note `text`'s *meaning* did change for streaming dictation: it
+/// now holds the whole session's transcript rather than the last segment.
 /// `at` is `at_ms`: unix epoch milliseconds.
 pub fn transcript_json(last: &LastTranscript) -> String {
     serde_json::json!({
@@ -67,12 +83,11 @@ pub fn start(port: u16, last_transcript: Arc<Mutex<LastTranscript>>) {
 
         for request in server.incoming_requests() {
             let response = if request.method() == &Method::Get && request.url() == "/transcript" {
-                let body = match last_transcript.lock() {
-                    Ok(last) => transcript_json(&last),
-                    // Stay panic-free on a poisoned lock, exactly like the
-                    // previous `unwrap_or_default()` behavior.
-                    Err(_) => transcript_json(&LastTranscript::default()),
-                };
+                // Recover from a poisoned lock (see `record_utterance`): reporting
+                // an empty transcript forever would be indistinguishable from a
+                // genuinely empty one, silently hanging every waiting consumer.
+                let last = last_transcript.lock().unwrap_or_else(|e| e.into_inner());
+                let body = transcript_json(&last);
                 let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..])
                     .expect("static header is valid");
                 Response::from_string(body).with_header(header)
@@ -115,6 +130,39 @@ mod tests {
         assert_eq!(v["text"], "בדיקה");
         assert_eq!(v["seq"], 1);
         assert_eq!(v["at"], 1_700_000_000_000u64);
+    }
+
+    #[test]
+    fn record_utterance_ignores_empty_text() {
+        let last = Mutex::new(LastTranscript::default());
+        record_utterance(&last, "");
+
+        let guard = last.lock().unwrap();
+        assert_eq!(guard.seq, 0, "an empty utterance must never bump seq");
+        assert_eq!(guard.text, "");
+        assert_eq!(guard.at_ms, 0, "an ignored utterance must not stamp the clock");
+    }
+
+    #[test]
+    fn record_utterance_bumps_once_on_non_empty_text() {
+        let last = Mutex::new(LastTranscript::default());
+        record_utterance(&last, "שלום עולם");
+
+        let guard = last.lock().unwrap();
+        assert_eq!(guard.seq, 1);
+        assert_eq!(guard.text, "שלום עולם");
+        assert!(guard.at_ms > 0, "a recorded utterance stamps the wall clock");
+    }
+
+    #[test]
+    fn record_utterance_bumps_again_on_second_call() {
+        let last = Mutex::new(LastTranscript::default());
+        record_utterance(&last, "ראשון");
+        record_utterance(&last, "שני");
+
+        let guard = last.lock().unwrap();
+        assert_eq!(guard.seq, 2, "each completed transcript bumps seq exactly once");
+        assert_eq!(guard.text, "שני");
     }
 
     #[test]
