@@ -30,6 +30,18 @@ pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
     last.at_ms = now_ms;
 }
 
+/// Serialize the transcript state for `GET /transcript`.
+/// Additive: `text` keeps its existing meaning, `seq`/`at` are new keys, so
+/// any existing consumer reading `.text` keeps working unchanged.
+pub fn transcript_json(last: &LastTranscript) -> String {
+    serde_json::json!({
+        "text": last.text,
+        "seq": last.seq,
+        "at": last.at_ms,
+    })
+    .to_string()
+}
+
 /// Unix epoch millis, saturating to 0 if the clock is before the epoch.
 pub fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -90,5 +102,25 @@ mod tests {
         assert_eq!(last.seq, 2, "each injection bumps seq exactly once");
         assert_eq!(last.text, "עולם");
         assert_eq!(last.at_ms, 2_000);
+    }
+
+    #[test]
+    fn transcript_json_includes_text_seq_and_at() {
+        let mut last = LastTranscript::default();
+        bump_transcript(&mut last, "בדיקה", 1_700_000_000_000);
+
+        let v: serde_json::Value = serde_json::from_str(&transcript_json(&last)).unwrap();
+        assert_eq!(v["text"], "בדיקה");
+        assert_eq!(v["seq"], 1);
+        assert_eq!(v["at"], 1_700_000_000_000u64);
+    }
+
+    #[test]
+    fn transcript_json_on_empty_state_is_valid_json() {
+        let last = LastTranscript::default();
+        let v: serde_json::Value = serde_json::from_str(&transcript_json(&last)).unwrap();
+        assert_eq!(v["text"], "");
+        assert_eq!(v["seq"], 0);
+        assert_eq!(v["at"], 0);
     }
 }
