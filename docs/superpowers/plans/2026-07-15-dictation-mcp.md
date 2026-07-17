@@ -644,7 +644,17 @@ describe("waitForNext", () => {
     let calls = 0;
     const port = await startMock(() => {
       if (++calls === 2) {
-        server!.close();
+        // Tear down AFTER this response flushes, so poll 2 succeeds and poll 3
+        // hits a genuinely dead API (ECONNREFUSED) — modelling "the app
+        // restarted between polls".
+        // closeAllConnections() is REQUIRED: close() alone only shuts the
+        // listening socket, leaving fetch's pooled keep-alive socket served
+        // forever — the wait would then run to `timeout` and this test would
+        // silently prove nothing. (Measured: 129 polls served after close().)
+        setTimeout(() => {
+          server!.close();
+          server!.closeAllConnections();
+        }, 0);
       }
       return JSON.stringify({ text: "ישן", seq: 5, at: 1 });
     });
@@ -911,6 +921,11 @@ await client.close();
 
 Run: `npm run build && npm run smoke`
 Expected output: `tools: get_last_transcript, wait_for_dictation, dictation_status`, then a `dictation_status:` line and a `get_last_transcript:` line — either real values (app running with the API on) or the actionable "not reachable" message (app closed). **Either is a pass** — what's being proven is that the tools register, dispatch, and surface errors cleanly rather than crashing.
+
+> Note: `StdioClientTransport` does not forward the parent shell's env (it passes a safe
+> subset), so the smoke test always probes **5757** even if you exported
+> `DICTATION_API_PORT`. That's fine — either result passes. The README's `.mcp.json`
+> `"env"` block is a different mechanism and does work.
 
 - [ ] **Step 3: Write `README.md`**
 
