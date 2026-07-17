@@ -54,9 +54,10 @@ struct AppState {
     /// Set true while a long batch-view recording is in progress (separate from
     /// short dictation) so Alt+D cannot overwrite the buffer mid-session.
     batch_recording_in_progress: Arc<AtomicBool>,
-    /// Last text actually injected into the user's target app (dictation or
-    /// streaming) — backs the opt-in local API's `/transcript` endpoint.
-    last_transcript: Arc<Mutex<String>>,
+    /// Last completed utterance: the full transcript of a non-streaming dictation,
+    /// or of a whole streaming session. Bumped once per completed utterance (see
+    /// `local_api::bump_transcript`) — backs the opt-in local API's `/transcript`.
+    last_transcript: Arc<Mutex<local_api::LastTranscript>>,
 }
 
 #[tauri::command]
@@ -1104,6 +1105,15 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
 
     // Close the WebSocket and return the accumulated final text.
     let text = active.session.stop().await?;
+
+    // One seq bump per streaming session = the whole utterance, not per segment.
+    // Skip empty sessions so a no-op recording never looks like a new dictation.
+    if !text.is_empty() {
+        if let Ok(mut last) = state.last_transcript.lock() {
+            local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
+        }
+    }
+
     Ok(text)
 }
 
@@ -1312,14 +1322,6 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
 
     let result = injector::inject_text(text, &injector::InjectionMethod::Clipboard);
 
-    if result.is_ok() {
-        if let Some(state) = app.try_state::<AppState>() {
-            if let Ok(mut last) = state.last_transcript.lock() {
-                *last = text.to_string();
-            }
-        }
-    }
-
     if main_was_visible {
         if let Some(w) = &main_window {
             let _ = w.show();
@@ -1336,7 +1338,18 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
 
 #[tauri::command]
 fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
-    inject_text_defocused(&app, &text)
+    let result = inject_text_defocused(&app, &text);
+    // Same empty guard as the streaming site: the transcript textarea is
+    // user-editable, so a cleared field + "הדבק בחלון הפעיל" must not bump seq
+    // (it would resolve a waiting wait_for_dictation with nothing).
+    if result.is_ok() && !text.is_empty() {
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(mut last) = state.last_transcript.lock() {
+                local_api::bump_transcript(&mut last, &text, local_api::now_unix_ms());
+            }
+        }
+    }
+    result
 }
 
 /// Export the user's dictation history to a TXT or DOCX file. The frontend
@@ -1909,7 +1922,7 @@ pub fn run() {
                 batch_cancel_notify: Arc::new(tokio::sync::Notify::new()),
                 batch_in_progress: Arc::new(AtomicBool::new(false)),
                 batch_recording_in_progress: Arc::new(AtomicBool::new(false)),
-                last_transcript: Arc::new(Mutex::new(String::new())),
+                last_transcript: Arc::new(Mutex::new(local_api::LastTranscript::default())),
             }
         })
         .setup(|app| {

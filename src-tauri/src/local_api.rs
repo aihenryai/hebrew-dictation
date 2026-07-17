@@ -33,6 +33,7 @@ pub fn bump_transcript(last: &mut LastTranscript, text: &str, now_ms: u64) {
 /// Serialize the transcript state for `GET /transcript`.
 /// Additive: `text` keeps its existing meaning, `seq`/`at` are new keys, so
 /// any existing consumer reading `.text` keeps working unchanged.
+/// `at` is `at_ms`: unix epoch milliseconds.
 pub fn transcript_json(last: &LastTranscript) -> String {
     serde_json::json!({
         "text": last.text,
@@ -52,7 +53,7 @@ pub fn now_unix_ms() -> u64 {
 
 /// Spawn the server on its own blocking OS thread — no async runtime
 /// integration needed for a single read-only endpoint.
-pub fn start(port: u16, last_transcript: Arc<Mutex<String>>) {
+pub fn start(port: u16, last_transcript: Arc<Mutex<LastTranscript>>) {
     std::thread::spawn(move || {
         let addr = format!("127.0.0.1:{}", port);
         let server = match Server::http(&addr) {
@@ -66,11 +67,12 @@ pub fn start(port: u16, last_transcript: Arc<Mutex<String>>) {
 
         for request in server.incoming_requests() {
             let response = if request.method() == &Method::Get && request.url() == "/transcript" {
-                let text = last_transcript
-                    .lock()
-                    .map(|t| t.clone())
-                    .unwrap_or_default();
-                let body = serde_json::json!({ "text": text }).to_string();
+                let body = match last_transcript.lock() {
+                    Ok(last) => transcript_json(&last),
+                    // Stay panic-free on a poisoned lock, exactly like the
+                    // previous `unwrap_or_default()` behavior.
+                    Err(_) => transcript_json(&LastTranscript::default()),
+                };
                 let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..])
                     .expect("static header is valid");
                 Response::from_string(body).with_header(header)
