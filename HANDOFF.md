@@ -4,6 +4,39 @@
 
 ---
 
+## 🐞 2026-07-19 — REAL BUG FOUND IN SHIPPED CODE, NOT YET FIXED: `enhance_inner` ignores `finish_reason`
+
+Found while designing translation; **it is independent of that feature and affects Smart Cleanup today.**
+
+`enhance_inner` (`enhance.rs:143-178`) sends no `max_tokens` and reads `choices[0].message.content` **without ever checking `choices[0].finish_reason`**. If Groq stops at its completion cap, the result is a **half-finished text** — and because it is *shorter* than the input, it sails past `validate_output`'s only two guards (empty, and >2× length). The user gets a silently truncated cleanup with no error.
+
+Low impact today (cleanup runs on single dictation utterances, so the cap is rarely reached, and the user sees the result). **It would have been severe for translation**, where the Hebrew replaces the English and the original is unrecoverable.
+
+**Fix (~5 lines, worth doing on its own):** read `choices[0].finish_reason` — a *sibling* of the `message` object already read at `:174` — and treat `"length"` as a new `EnhanceError::Truncated`. ⚠️ Match explicitly on `"length"`; do **not** write `!= "stop"`, because the file's `as_str().unwrap_or("")` idiom would make an absent field fail every response.
+
+---
+
+## 🧊 2026-07-19 — EN→HE translation: spec written and 3× reviewed, then SHELVED (Henry's call)
+
+Spec: `docs/superpowers/specs/2026-07-19-en-to-he-translation-design.md` — brainstormed with Henry, three full review rounds, all issues fixed. **No code written.** Stopped at the pre-implementation gate because the scope grew far beyond the original "add an `EnhanceMode` variant" framing *and* a feasibility check came back badly.
+
+**⛔ The feasibility finding — read this before reviving the feature.** Groq free tier for `llama-3.3-70b-versatile`: **12,000 TPM / 100,000 TPD** ([official](https://console.groq.com/docs/rate-limits)). A 1-hour podcast ≈ 60,000 chars ≈ 20 chunks ≈ **~50,000 tokens**, so:
+- TPM caps throughput at ~4-5 chunks/minute → a 1-hour file takes **4-5 minutes minimum**, no matter how fast Groq is. Pacing is required, not just backoff.
+- **One podcast burns half the daily token budget.** Two per day hits the cap.
+
+→ **If revived, decide the provider first.** Henry has `OPENAI_API_KEY` and `GEMINI_API_KEY` too; bulk translation is a completely different load profile from cleaning one dictated sentence, and the two need not share a provider. Do not start implementing before this is settled.
+
+**What the spec settled (Henry's decisions, don't re-litigate):** picked files only (not dictation, recordings, or meeting modes) · per-action checkbox, never a persistent global mode · failures are loud, English left intact · Hebrew replaces the English · chunked translation (a single call is provably unworkable — spec §4.1).
+
+**Non-obvious traps the reviews found, all already written into the spec:**
+1. The 2× output ceiling **rejects correct short translations** — `"AI"` → `"בינה מלאכותית"` is 6.5×. The ceiling must become mode-owned.
+2. **`ivrit-*` whisper models force Hebrew regardless of the language argument** (`whisper.rs` ~82-86, ~187-192), so an English file would decode to garbage and then be "translated". Needs a pre-flight guard.
+3. **Translation desynchronizes `transcript` from `segments`**, so SRT export would emit English subtitles under a Hebrew transcript. Needs a `translated` flag in `isSrtEligible` — *not* reuse of `edited`.
+4. Batch **hardcodes `language: "he"`** (`App.tsx:1006`) and never reads the global setting.
+5. Meeting-mode text carries `"אני: "` / `"הצד השני: "` as plain content an LLM would mangle.
+
+---
+
 ## 🆕 2026-07-19 — dictation MCP server + a latent `/transcript` bug fixed. NOT RELEASED.
 
 Full brainstorm → spec → plan → subagent-TDD, two review gates per task. Spec: `docs/superpowers/specs/2026-07-19-dictation-mcp-design.md`. Plan: `docs/superpowers/plans/2026-07-19-dictation-mcp.md`.
