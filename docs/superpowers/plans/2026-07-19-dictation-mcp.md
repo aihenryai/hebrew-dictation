@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (Tauri app, `tiny_http`, `serde_json`) · Node 20+ / TypeScript ^5.5 · `@modelcontextprotocol/sdk` ^1.29 · `zod` ^4 · `vitest` (plain Node pool)
 
-**Spec:** `docs/superpowers/specs/2026-07-15-dictation-mcp-design.md`
+**Spec:** `docs/superpowers/specs/2026-07-19-dictation-mcp-design.md`
 
 ---
 

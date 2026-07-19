@@ -4,9 +4,9 @@
 
 ---
 
-## 🆕 2026-07-15 — dictation MCP server + a latent `/transcript` bug fixed. NOT RELEASED.
+## 🆕 2026-07-19 — dictation MCP server + a latent `/transcript` bug fixed. NOT RELEASED.
 
-Full brainstorm → spec → plan → subagent-TDD, two review gates per task. Spec: `docs/superpowers/specs/2026-07-15-dictation-mcp-design.md`. Plan: `docs/superpowers/plans/2026-07-15-dictation-mcp.md`.
+Full brainstorm → spec → plan → subagent-TDD, two review gates per task. Spec: `docs/superpowers/specs/2026-07-19-dictation-mcp-design.md`. Plan: `docs/superpowers/plans/2026-07-19-dictation-mcp.md`.
 
 **App (`main`, `43cf9fd`→`0b5dbee`, 63 tests / 1 ignored, 0 warnings):**
 - `GET /transcript` now returns **`{text, seq, at}`** (additive — `text` still there). `seq` = monotonic counter, `at` = unix ms.
@@ -185,15 +185,15 @@ Today's mic capture uses `cpal` (cross-platform). To also capture the OTHER side
 
 Henry compared hebrew-dictation to Voicebox and flagged three items to "add to the plans." Ordered by leverage — none scheduled yet:
 
-**1. Local API — ✅ SHIPPED (2026-07-09), then materially reworked 2026-07-15 (see the top section).** `src-tauri/src/local_api.rs` — a `tiny_http` server on `127.0.0.1:5757`, **opt-in** (`local_api_enabled` in settings.json, off by default; port via `local_api_port`), bind failure non-fatal.
+**1. Local API — ✅ SHIPPED (2026-07-09), then materially reworked 2026-07-19 (see the top section).** `src-tauri/src/local_api.rs` — a `tiny_http` server on `127.0.0.1:5757`, **opt-in** (`local_api_enabled` in settings.json, off by default; port via `local_api_port`), bind failure non-fatal.
 
-> ⚠️ **This bullet used to claim:** *"`GET /transcript` returns the last injected transcript… Verified wired: `inject_text_defocused` writes `last_transcript` after every successful injection (dictation and streaming)."* **That wiring was real but WRONG, and this sentence is what recorded the bug as verified-correct.** `streaming_enabled` defaults true and streaming injects **per segment**, so `/transcript` returned only the *last fragment* of a dictation. Fixed 2026-07-15: `GET /transcript` now returns `{text, seq, at}`, and stamping happens at the two **utterance boundaries** (the `inject_text` command; `stop_streaming_transcription`), never inside `inject_text_defocused`. Full detail in the top section.
+> ⚠️ **This bullet used to claim:** *"`GET /transcript` returns the last injected transcript… Verified wired: `inject_text_defocused` writes `last_transcript` after every successful injection (dictation and streaming)."* **That wiring was real but WRONG, and this sentence is what recorded the bug as verified-correct.** `streaming_enabled` defaults true and streaming injects **per segment**, so `/transcript` returned only the *last fragment* of a dictation. Fixed 2026-07-19: `GET /transcript` now returns `{text, seq, at}`, and stamping happens at the two **utterance boundaries** (the `inject_text` command; `stop_streaming_transcription`), never inside `inject_text_defocused`. Full detail in the top section.
 
 Remaining polish: no UI toggle, no WebSocket live stream. (Unit tests: now 7 in `local_api.rs`.) **This unblocked #2 (the MCP wrapper) — now built.** Original research below —
 
 **1-orig. Local API (REST/WebSocket on `127.0.0.1`) — highest leverage, the real gap.** The app is UI+hotkey only, no programmatic surface; Voicebox exposes `POST /generate` on `127.0.0.1:17493`. A small local server here (e.g. `GET /transcribe` → last transcript, or a WebSocket live stream) would let the **cloud-agent and the video pipeline consume dictation without driving the UI**. The transcription pipeline already exists (Deepgram/Groq/whisper-rs via `run_transcribe_file`) and the app already runs tokio → it's "wrap the existing pipeline in an embedded server." ⚠️ **Impl note:** `tauri-plugin-http` is an *outbound* client (a fetch replacement), **not** a server — to host an endpoint use embedded `axum`/`tiny_http` on a background task, not that plugin. **Design point first:** localhost still lets any local process — and browser pages via `fetch('http://127.0.0.1:…')` — reach it; gate anything that can trigger recording or return history behind a token (a read-only "last transcript" endpoint is low-risk). **Enabler for #2.**
 
-**2. MCP server around the dictation — ✅ BUILT 2026-07-15 (see the top section).** Lives at `AI-Tools/MCP-Dev/hebrew-dictation-mcp/` — **its own git repo**, deliberately, so its commits never land in the shared `claude-dev` root repo the nightly job owns. Node/TS + `@modelcontextprotocol/sdk` ^1.29, stdio, three tools. The predicted shape was right: pull-based, no server→model push. NOT released/registered anywhere yet — see the top section for what's left.
+**2. MCP server around the dictation — ✅ BUILT 2026-07-19 (see the top section).** Lives at `AI-Tools/MCP-Dev/hebrew-dictation-mcp/` — **its own git repo**, deliberately, so its commits never land in the shared `claude-dev` root repo the nightly job owns. Node/TS + `@modelcontextprotocol/sdk` ^1.29, stdio, three tools. The predicted shape was right: pull-based, no server→model push. NOT released/registered anywhere yet — see the top section for what's left.
 
 *Original research:* Voicebox's MCP lets agents *speak* in the cloned voice; the inverse here gives Claude Code/Cursor voice *dictation into the agent session* (dictate-into-agent, not just into a text field). Best built as a thin wrapper over #1's local API rather than re-embedding the transcription logic — so **#1 first, then #2 is a small adapter.**
 

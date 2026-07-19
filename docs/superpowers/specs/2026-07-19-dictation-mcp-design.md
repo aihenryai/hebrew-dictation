@@ -1,6 +1,6 @@
 # Dictation MCP — Design Spec
 
-- **Date:** 2026-07-15
+- **Date:** 2026-07-19
 - **Status:** Draft (pending spec-review loop + user approval)
 - **Author:** Claude (brainstormed with Henry)
 - **Backlog origin:** HANDOFF "Voicebox comparison" item #2 — an MCP server around the dictation that builds on the shipped Local API (#1). Gives coding agents (Claude Code / Cursor) voice dictation *into the agent session*, and lets automation (video pipeline / cloud-agent) read the latest dictation programmatically.
