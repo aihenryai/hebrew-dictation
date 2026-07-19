@@ -114,20 +114,30 @@ Chunking dissolves all three: every call is small, fast, individually verifiable
 A pure, unit-tested Rust function — the TDD seam:
 
 ```rust
-/// Split `text` into chunks of at most `max_chars`, breaking only at sentence
-/// boundaries so no chunk starts or ends mid-sentence. A single sentence longer
-/// than `max_chars` becomes its own (over-long) chunk rather than being cut.
+/// Split `text` into chunks of at most `max_chars`, preferring sentence
+/// boundaries. LOSSLESS: `chunks.concat() == text` exactly — chunks keep their
+/// trailing separators and are never trimmed.
 pub fn split_for_translation(text: &str, max_chars: usize) -> Vec<String>
 ```
-- `max_chars = 3000` (≈500 English words). Output ≈2500 Hebrew chars ≈1200 tokens — completes in seconds, far from any completion cap.
-- Splits on sentence-final punctuation (`.` `!` `?` and their newline-adjacent forms). **Never splits mid-sentence**; an over-long sentence passes through whole (rare, and the ceiling in §3.1 still bounds its output).
+
+**The contract is exact concatenation, and that is load-bearing.** The batch transcript is newline-formatted — `transcribe_deepgram_batch` requests `paragraphs=true` and reads `alt["paragraphs"]["transcript"]` (`api_transcribe.rs:308, 333-334`) — so a space-join of *trimmed* chunks provably cannot reproduce the input. The temptation is then to weaken §7's test to a whitespace-normalized comparison. **Do not.** A split bug that drops a sentence yields a shorter Hebrew result that passes `validate_output`, passes the §3.1 ceiling, and passes `finish_reason` — i.e. it recreates the truncation bug of §4.3 inside our own code, where no guard is watching. Exact `concat()` equality is the only thing standing between a split bug and silent text loss.
+
+Rules, in order:
+- `max_chars = 3000` (≈500 English words). Output ≈2500 Hebrew chars ≈1200-2000 tokens — completes in 3-8s, orders of magnitude below any completion cap.
+- Prefer the last **sentence-final punctuation** (`.` `!` `?`, including newline-adjacent forms) at or before `max_chars`.
+- **Hard floor — the degenerate case must not regress to a single call.** If no sentence boundary exists within `max_chars * 2`, fall back to the last **whitespace** before that limit; if there is no whitespace either, split at `max_chars * 2` exactly. ASR output with sparse or absent punctuation is a real occurrence, and without this floor the whole 60,000-char transcript becomes one chunk — precisely the single call §4.1 proves cannot work, failing later as a timeout whose diagnosis points at the wrong layer.
+- **Never emits an empty or whitespace-only chunk.** One would reach `validate_output` → `EnhanceError::Empty` → whole-translation failure (§6), so a stray trailing separator could kill an hour-long job on its last chunk.
 - Chunking lives in **Rust, not TypeScript** — this project has a Rust test suite and no frontend test infrastructure, so the logic belongs where it can be tested.
+
+**Separators survive the round trip at the orchestrator, not the API.** Chunks retain their trailing whitespace, but the model must not be asked to reproduce it. Per chunk, the orchestrator splits off the trailing whitespace, sends only the content, and **re-appends the original separator** to the translation. That preserves the paragraph structure `paragraphs=true` produced, without depending on the LLM to echo newlines.
 
 ### 4.3 Per-chunk truncation guard (the silent-data-loss bug)
 
 `enhance_inner` currently sends no `max_tokens` and reads `choices[0].message.content` without inspecting `finish_reason` (`enhance.rs:143-178`). A truncated completion returns **half a translation**, which — being *shorter* than the input — passes every existing guard. Combined with "Hebrew replaces English", that silently overwrites the transcript with half a result and the original is unrecoverable. It is invisible to §6's table and grows more likely with length.
 
-**Fix:** `enhance_inner` must read `choices[0].finish_reason` and treat anything other than `"stop"` (notably `"length"`) as an error — a new `EnhanceError::Truncated`. This is required for the cleanup path too, not only translation.
+**Fix:** `enhance_inner` must read `choices[0].finish_reason` — a **sibling** of the `message` object it already reads at `enhance.rs:174` — and treat `"length"` as a new `EnhanceError::Truncated`. This is required for the cleanup path too, not only translation.
+
+> ⚠️ **Match explicitly on `"length"`; do not write `!= "stop"`.** `enhance_inner` uses the `as_str().unwrap_or("")` idiom throughout, so an absent field would default to `""`, and `"" != "stop"` would make **every** response fail. Absent must be treated as OK.
 
 ### 4.4 Orchestration, progress and cancel
 
@@ -137,11 +147,19 @@ async fn translate_transcript(app: AppHandle, state: State<'_, AppState>, text: 
     -> Result<String, String>
 ```
 - Groq key required; clear Hebrew error if absent.
-- `split_for_translation(&text, 3000)` → translate each chunk with `EnhanceMode::EnToHe`, **30s** per chunk.
-- Emits a `translation-progress` event per chunk (`{done, total}`) — the app already uses Tauri events for live transcription, so this follows the existing pattern.
-- **Checks the cancel flag between chunks**, so cancelling actually stops the work. (Today `cancel_batch` trips flags consumed only by decode/transcribe, and the loop's cancel check sits at the top of each iteration — an in-flight translation would otherwise run to completion after the user cancels.)
+- `split_for_translation(&text, 3000)` → translate each chunk with `EnhanceMode::EnToHe`, **30s** per chunk (3-8s typical → 4-8× margin).
+- **Progress reuses the existing `batch-progress` event**, emitting `{stage: "translating", pct: done/total*100}`. The frontend already has exactly one listener for it (`App.tsx:681-684`) which sets both `batchStage` and `batchPct`, so this needs **zero new frontend wiring** — a new event name would require a second listener and a second state path for one progress bar.
+- **Checks the cancel flag between chunks.** `cancel_batch` stores `true` into `state.batch_cancel` (`lib.rs:916-922`), and this command takes `State<'_, AppState>`, so it can `.load()` between chunks; the flag is reset only at the top of `transcribe_file` (`:386`), so it is clean when translation starts. On cancel, return the existing **`batch::CANCELLED` sentinel (`"בוטל"`)** — the frontend special-cases that literal (`App.tsx:1013`, `:1123`) to mark the item *cancelled* rather than *error*. Any other string would surface a cancelled translation as a red error, contradicting §6.
 - **Any chunk failing fails the whole translation** — never return a partial. Returning "chunks 1-3 of 7" would recreate the truncation bug at a different layer.
-- Joins the translated chunks with a single space/newline preserving paragraph breaks.
+- Rejoins as described in §4.2 (translated content + each chunk's original trailing separator).
+
+### 4.4.1 Per-chunk retry — required, not polish
+
+Chunking turns one request into ~20 that must **all** succeed. Without retry, at a per-request success rate `p` the job succeeds at `p²⁰`: even 1% per-request flakiness gives ~18% total failure, each one discarding 2-3 minutes of completed work. And 20 requests inside ~2 minutes is exactly the shape that trips a provider rate limit — `classify_status` already maps 429 → `RateLimited` (`enhance.rs:129`), which §6 escalates to whole-translation failure. `enhance.rs` has no retry today and never needed it at one call per dictation.
+
+**Retry each chunk up to 3 attempts with exponential backoff (1s, 4s), honouring `Retry-After` when present, for `RateLimited` / `Timeout` / `Network` only.** Do **not** retry `Unauthorized` (a bad key will not fix itself), `Truncated`, `Empty` or `Suspicious` (deterministic for the same input — retrying just burns quota and time).
+
+> ⏳ **Implementation-time check, deliberately not guessed here:** verify the actual Groq TPM/RPM ceiling for `llama-3.3-70b-versatile` on Henry's tier against this workload (~45,000 tokens inside ~2 minutes for a 1-hour podcast). If the tier's limit is below that, backoff alone will not save it and the design needs pacing between chunks. This is the single most likely reason §8's flagship "1-hour podcast translates end to end" criterion fails in practice.
 
 ### 4.5 Known limitation — no cross-chunk context
 
@@ -185,7 +203,9 @@ Fix: add `translated?: boolean` to `BatchResult`, set it on success, and extend 
 
 ### 5.4 Translation stage in the UI
 
-`batchStage` is `"decoding" | "transcribing" | "done"`. Translation bolts a deliberately-slow multi-call stage onto the end of each file; with no stage the view would sit looking finished while it runs, which reads as a hang — the opposite of §4.6's loud-failure intent. Add a **`"translating"`** stage showing chunk progress (`מתרגם… 3/7`) from the `translation-progress` event. Precedent: the live path already does `setStatus("enhancing")` (`App.tsx:550`).
+Translation bolts a deliberately-slow multi-call stage onto the end of each file; with no stage the view sits looking finished while it runs, which reads as a hang — the opposite of §4.6's loud-failure intent. Add a **`"translating"`** stage showing progress (`מתרגם…` + the existing percentage bar).
+
+`batchStage` is `useState("")` — an **untyped string** (`App.tsx:430`), not a union, so adding a stage is cheaper than a typed enum would be: emit `{stage: "translating", pct}` on the existing `batch-progress` event (§4.4) and the existing listener does the rest. Precedent for a post-transcription stage: the live path already does `setStatus("enhancing")` (`App.tsx:550`).
 
 ---
 
@@ -195,10 +215,11 @@ Fix: add `translated?: boolean` to `BatchResult`, set it on success, and extend 
 |---|---|
 | Local engine + `ivrit-*` model | Refused **before** transcription (§5.2); nothing spent. |
 | No Groq key | Clear Hebrew error; transcript stays English. |
-| Any chunk: 401/403/429/timeout(30s)/network | Existing `EnhanceError` strings surface; **whole** translation fails; transcript stays English. |
-| Any chunk truncated (`finish_reason != "stop"`) | New `EnhanceError::Truncated` (§4.3); whole translation fails; transcript stays English. |
-| Any chunk empty or over ceiling | `validate_output` rejects (§3.1); whole translation fails. |
-| User cancels mid-translation | Stops at the next chunk boundary (§4.4); transcript stays English. |
+| Any chunk: 429 / timeout(30s) / network | **Retried up to 3× with backoff** (§4.4.1). Still failing → existing `EnhanceError` string surfaces; **whole** translation fails; transcript stays English. |
+| Any chunk: 401/403 | **Not retried** — surfaces immediately; whole translation fails. |
+| Any chunk truncated (`finish_reason == "length"`) | New `EnhanceError::Truncated` (§4.3); not retried; whole translation fails. |
+| Any chunk empty or over ceiling | `validate_output` rejects (§3.1); not retried; whole translation fails. |
+| User cancels mid-translation | Stops at the next chunk boundary and returns `batch::CANCELLED` (`"בוטל"`), so the item shows as **cancelled, not error** (§4.4); transcript stays English. |
 | Transcription itself fails | Unchanged — translation never runs. |
 
 In every failure the item remains a normal, **SRT-eligible English result**. Failure is always visible and never destructive.
@@ -211,8 +232,13 @@ In every failure the item remains a normal, **SRT-eligible English result**. Fai
 - `from_str("en_to_he")` → `EnToHe`; unknown → `HeGeneral`.
 - `build_messages(EnToHe, …)` → 4 messages, translate prompt, English example `user`, Hebrew example `assistant`, real text **last**.
 - `max_output_chars`: `HeGeneral` returns exactly `raw*2` (no behaviour change); `EnToHe` admits `"AI"`→`"בינה מלאכותית"` (13 ≤ 202 for raw=2) and still rejects a runaway at raw=5000 (ceiling 15000).
-- `split_for_translation`: text under the limit → one chunk; multi-sentence text → splits only at sentence ends, no chunk exceeds `max_chars`, **rejoining the chunks reproduces the input** (no text lost or duplicated — the property that matters most); a single over-long sentence becomes one over-long chunk rather than being cut.
-- `finish_reason != "stop"` → `EnhanceError::Truncated` (parser-level test on a canned response body).
+- `split_for_translation` — the most important tests in this feature, because this is where silent text loss would live:
+  - **`chunks.concat() == text` EXACTLY** (not whitespace-normalized) for: single-sentence text, multi-paragraph newline-formatted text (the real Deepgram `paragraphs=true` shape), and text ending in a trailing newline.
+  - Splits at sentence ends when it can; no chunk exceeds `max_chars` unless the floor rule applies.
+  - **Degenerate input with no punctuation at all** → splits at whitespace and produces multiple chunks, none exceeding `max_chars * 2` (guards the §4.2 regression to a single call).
+  - **No empty or whitespace-only chunk is ever emitted**, including for text with a trailing separator.
+- `finish_reason == "length"` → `EnhanceError::Truncated`; **absent `finish_reason` → OK, not an error** (parser-level tests on canned response bodies; the absent case guards the `unwrap_or("")` trap in §4.3).
+- Retry policy is unit-testable at the classification level: `RateLimited`/`Timeout`/`Network` are retryable; `Unauthorized`/`Truncated`/`Empty`/`Suspicious` are not.
 
 **Frontend:**
 - `isSrtEligible` false when `translated` is true; still true for an untranslated done result.
@@ -228,6 +254,7 @@ In every failure the item remains a normal, **SRT-eligible English result**. Fai
 - A translated item offers **no** SRT export (per-item *and* combined); TXT/Word still work; untranslated items still offer SRT.
 - Smart Cleanup **off** does not block translation.
 - Ticked + local engine + `ivrit-*` model refuses up-front with an actionable message.
-- Cancelling mid-translation stops at the next chunk boundary and leaves the English intact.
+- Cancelling mid-translation stops at the next chunk boundary, shows the item as **cancelled (not error)**, and leaves the English intact.
+- A transcript with **no sentence punctuation** still splits into multiple chunks and translates (§4.2 floor).
 - Any failure leaves a visible error and an intact English transcript.
 - The existing **63 passing / 1 ignored** stay green; `cargo build` no new warnings; `tsc && vite build` clean.
