@@ -86,6 +86,10 @@ pub enum EnhanceError {
     Timeout,
     Empty,
     Suspicious,
+    /// The model hit its output-token cap (`finish_reason == "length"`) and the
+    /// text is cut off. Caught explicitly because a truncated result is SHORTER
+    /// than its input, so it slips past the length guard in `validate_output`.
+    Truncated,
     Other(String),
 }
 
@@ -104,9 +108,31 @@ impl fmt::Display for EnhanceError {
             EnhanceError::Suspicious => {
                 write!(f, "תוצאת הרישוף חשודה — מוחזר הטקסט המקורי")
             }
+            EnhanceError::Truncated => {
+                write!(f, "הרישוף נקטע לפני שהסתיים — מוחזר הטקסט המקורי")
+            }
             EnhanceError::Other(s) => write!(f, "{}", s),
         }
     }
+}
+
+/// Interpret a chat-completion response body: reject a truncated completion,
+/// then extract and validate the content. Pure, so the truncation guard is
+/// unit-tested on canned bodies rather than a live API.
+///
+/// `finish_reason == "length"` means the model stopped at its output cap and the
+/// text is cut off — rejected up front, because the partial is shorter than the
+/// input and would otherwise pass `validate_output`. An ABSENT finish_reason is
+/// treated as OK; we match explicitly on "length" rather than `!= "stop"`, since
+/// the `as_str().unwrap_or("")` below reads a missing field as "" — which would
+/// make every response without the field fail.
+fn parse_completion(body: &serde_json::Value, raw: &str) -> Result<String, EnhanceError> {
+    let finish_reason = body["choices"][0]["finish_reason"].as_str().unwrap_or("");
+    if finish_reason == "length" {
+        return Err(EnhanceError::Truncated);
+    }
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    validate_output(raw, content)
 }
 
 /// Hallucination guard. Empty output → `Empty`. Output longer than 2× the raw
@@ -171,11 +197,7 @@ pub async fn enhance_inner(
         .await
         .map_err(|e| EnhanceError::Other(format!("פענוח תשובת רישוף נכשל: {}", e)))?;
 
-    let content = body["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("");
-
-    validate_output(text, content)
+    parse_completion(&body, text)
 }
 
 #[cfg(test)]
@@ -219,5 +241,69 @@ mod tests {
     #[test]
     fn validate_accepts_and_trims_normal() {
         assert_eq!(validate_output("שלום שלום", "  שלום  ").unwrap(), "שלום");
+    }
+
+    /// A `finish_reason` of "length" means the model hit its output cap and the
+    /// text is cut off. Because the partial is SHORTER than the input it would
+    /// otherwise sail past `validate_output`, so this must be caught here.
+    #[test]
+    fn parse_rejects_truncated_completion() {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "content": "a valid-looking but partial answer" }
+            }]
+        });
+        assert!(matches!(
+            parse_completion(&body, "the original raw transcript text"),
+            Err(EnhanceError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_normal_stop() {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": { "content": "שלום" }
+            }]
+        });
+        assert_eq!(parse_completion(&body, "שלום שלום").unwrap(), "שלום");
+    }
+
+    /// The `unwrap_or("")` trap: an ABSENT finish_reason must be treated as OK.
+    /// A naive `!= "stop"` check would make every response with no such field fail.
+    #[test]
+    fn parse_absent_finish_reason_is_ok() {
+        let body = serde_json::json!({
+            "choices": [{ "message": { "content": "שלום" } }]
+        });
+        assert_eq!(parse_completion(&body, "שלום שלום").unwrap(), "שלום");
+    }
+
+    /// Truncation is checked BEFORE content validation, so a truncated-and-empty
+    /// completion reports the more informative `Truncated`, not `Empty`.
+    #[test]
+    fn parse_truncated_beats_empty() {
+        let body = serde_json::json!({
+            "choices": [{ "finish_reason": "length", "message": { "content": "" } }]
+        });
+        assert!(matches!(
+            parse_completion(&body, "raw"),
+            Err(EnhanceError::Truncated)
+        ));
+    }
+
+    /// A complete (`stop`) response with empty content still delegates to
+    /// `validate_output` and reports `Empty`.
+    #[test]
+    fn parse_stop_with_empty_content_is_empty() {
+        let body = serde_json::json!({
+            "choices": [{ "finish_reason": "stop", "message": { "content": "   " } }]
+        });
+        assert!(matches!(
+            parse_completion(&body, "raw"),
+            Err(EnhanceError::Empty)
+        ));
     }
 }
