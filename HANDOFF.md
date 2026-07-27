@@ -4,15 +4,11 @@
 
 ---
 
-## 🐞 2026-07-19 — REAL BUG FOUND IN SHIPPED CODE, NOT YET FIXED: `enhance_inner` ignores `finish_reason`
+## ✅ 2026-07-19 — FIXED: `enhance_inner` silently accepted truncated Groq completions (`dd082f8`)
 
-Found while designing translation; **it is independent of that feature and affects Smart Cleanup today.**
+Found while designing translation; **independent of that feature — it was a real defect in the shipped Smart Cleanup path.** `enhance_inner` read `choices[0].message.content` without checking `finish_reason`, so a completion Groq cut off at its output cap returned partial text that — being shorter than the input — passed `validate_output`'s only guards (empty, >2× length). Silent truncated cleanup, no error.
 
-`enhance_inner` (`enhance.rs:143-178`) sends no `max_tokens` and reads `choices[0].message.content` **without ever checking `choices[0].finish_reason`**. If Groq stops at its completion cap, the result is a **half-finished text** — and because it is *shorter* than the input, it sails past `validate_output`'s only two guards (empty, and >2× length). The user gets a silently truncated cleanup with no error.
-
-Low impact today (cleanup runs on single dictation utterances, so the cap is rarely reached, and the user sees the result). **It would have been severe for translation**, where the Hebrew replaces the English and the original is unrecoverable.
-
-**Fix (~5 lines, worth doing on its own):** read `choices[0].finish_reason` — a *sibling* of the `message` object already read at `:174` — and treat `"length"` as a new `EnhanceError::Truncated`. ⚠️ Match explicitly on `"length"`; do **not** write `!= "stop"`, because the file's `as_str().unwrap_or("")` idiom would make an absent field fail every response.
+Fixed via a pure `parse_completion(body, raw)`: `finish_reason == "length"` → new `EnhanceError::Truncated`, then the existing content validation. Matched explicitly on `"length"` (not `!= "stop"` — the file's `as_str().unwrap_or("")` reads an absent field as `""`, which would fail every response). 5 parser-level tests on canned bodies including the absent-field trap. `cargo test` **68 / 1 ignored**, clippy clean. Not released — ships with the next build.
 
 ---
 
@@ -230,7 +226,7 @@ Remaining polish: no UI toggle, no WebSocket live stream. (Unit tests: now 7 in 
 
 *Original research:* Voicebox's MCP lets agents *speak* in the cloned voice; the inverse here gives Claude Code/Cursor voice *dictation into the agent session* (dictate-into-agent, not just into a text field). Best built as a thin wrapper over #1's local API rather than re-embedding the transcription logic — so **#1 first, then #2 is a small adapter.**
 
-**3. LLM text-cleanup — ⚠️ ALREADY EXISTS, do NOT rebuild.** Henry's read was "the app injects raw STT with no punctuation/disfluency cleanup," and he rightly YAGNI-flagged it. Code check: it's **already shipped as "Smart Cleanup / רישוף חכם" (`enhance.rs`, spec `docs/superpowers/specs/2026-06-15-smart-cleanup-design.md`)** — runs the transcript through Groq Llama-3.3-70b to strip fillers (אהה/אמ/יעני/כאילו), repetitions and false-starts and fix Hebrew punctuation, with a hallucination guard (>2× raw length → reject) and graceful fallback to raw text on any error. It's **opt-in** (`enhance_enabled` setting), wired via the `enhance_text` command. The cloud batch path also already sends `smart_format=true&punctuate=true`, so cloud transcripts are already punctuated. → **Not an engineering gap.** The only real questions: (a) product — should Smart Cleanup be more discoverable / default-on? (b) does it cover the **streaming**-inject path or only batch? (streaming bypasses the command path per the v2.11.0 focus-bug fix — verify). Nothing to build unless Henry wants it always-on.
+**3. LLM text-cleanup — ⚠️ ALREADY EXISTS, do NOT rebuild.** Henry's read was "the app injects raw STT with no punctuation/disfluency cleanup," and he rightly YAGNI-flagged it. Code check: it's **already shipped as "Smart Cleanup / רישוף חכם" (`enhance.rs`, spec `docs/superpowers/specs/2026-06-15-smart-cleanup-design.md`)** — runs the transcript through Groq Llama-3.3-70b to strip fillers (אהה/אמ/יעני/כאילו), repetitions and false-starts and fix Hebrew punctuation, with a hallucination guard (>2× raw length → reject; plus a truncation guard added 2026-07-19 — `finish_reason=="length"` → reject, see the top section) and graceful fallback to raw text on any error. It's **opt-in** (`enhance_enabled` setting), wired via the `enhance_text` command. The cloud batch path also already sends `smart_format=true&punctuate=true`, so cloud transcripts are already punctuated. → **Not an engineering gap.** The only real questions: (a) product — should Smart Cleanup be more discoverable / default-on? (b) does it cover the **streaming**-inject path or only batch? (streaming bypasses the command path per the v2.11.0 focus-bug fix — verify). Nothing to build unless Henry wants it always-on.
 
 ## Key facts (unchanged, still accurate)
 
