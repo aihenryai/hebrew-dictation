@@ -4,6 +4,16 @@
 
 ---
 
+## 🔬 2026-07-19 — RESEARCH: on-device vs cloud for Hebrew cleanup → recommend switching Groq → Gemini
+
+Full cited report (3 research legs — Hebrew models, Windows/Rust runtime, cloud alternative): **`docs/research/2026-07-19-hebrew-cleanup-provider.md`**. Triggered by the macOS app [ghost-pepper](https://github.com/matthartman/ghost-pepper) (on-device dictation + cleanup). No code written.
+
+**The finding:** on-device Hebrew cleanup is viable but lands in the worst quadrant — the only trustworthy ≤8B Hebrew model is **DictaLM-2.0-Instruct 7B**, but 7B on a CPU-only mid-range laptop is *tens of seconds* per cleanup (painful), while the fast 1–3B tier has weak Hebrew. Plus a real engineering landmine (whisper.cpp + llama.cpp both static-link `ggml` → Windows `LNK2005`; must run llama.cpp as a **sidecar**, not a 2nd FFI crate).
+
+**The recommendation:** the rate-limit pain is a **Groq-specific artifact** (100k TPD is unusually low). **Switch Smart Cleanup Groq → Gemini 2.5 Flash-Lite** — free/pennies, a ~3-line change (Gemini has an OpenAI-wire endpoint; `enhance_inner` already speaks it; the `finish_reason` fix carries over), and a *measured Hebrew quality upgrade* (Gemini beats Groq's Llama-3.3-70b on the rewriting proxy AND on Nikud — Groq scores a catastrophic 4.05). ⭐ **This also un-shelves the translation feature** — its only blocker was Groq's daily-token cap, which Gemini doesn't have. **The provider question left open in the translation spec is now answered: Gemini.** On-device stays a *later, opt-in "private cleanup" tier* (DictaLM-7B sidecar, explicitly slower — the CallLocal analogue), only if there's demand. **Not yet decided/approved by Henry.**
+
+---
+
 ## ✅ 2026-07-19 — FIXED: `enhance_inner` silently accepted truncated Groq completions (`dd082f8`)
 
 Found while designing translation; **independent of that feature — it was a real defect in the shipped Smart Cleanup path.** `enhance_inner` read `choices[0].message.content` without checking `finish_reason`, so a completion Groq cut off at its output cap returned partial text that — being shorter than the input — passed `validate_output`'s only guards (empty, >2× length). Silent truncated cleanup, no error.
