@@ -33,6 +33,18 @@ Spec: `docs/superpowers/specs/2026-07-19-en-to-he-translation-design.md` — bra
 
 ---
 
+## 📦 2026-07-19 — v2.13.0 RELEASE PREPARED (version bumped, green) — awaiting Henry's signed build
+
+Version bumped **2.12.0 → 2.13.0** in all 4 files (package.json, Cargo.toml, tauri.conf.json, Cargo.lock, commit `e1fc6ec`). Release candidate verified: `cargo test` **68/1**, `tsc && vite build` clean. **Not pushed, not built, not released** — the signed build needs Henry's `TAURI_SIGNING_PRIVATE_KEY`.
+
+What 2.13.0 contains: the `/transcript` `{text, seq, at}` rework (was returning fragments under streaming) + the `finish_reason` truncation fix in Smart Cleanup. No consumer-facing UI change — this is a reliability release plus a dev-only opt-in API.
+
+**Henry's remaining steps are a runbook** (build → rename → merge latest.json keeping the darwin block → `gh release create` → website version bump only): it was written to the session scratchpad (`v2.13.0-runbook.md` + `v2.13.0-release-notes.md`). If that scratchpad is gone, the recipe is in `memory/hebrew-dictation.md` and the v2.12.0 changelog entry; the only new wrinkles this round are (a) the website "מה חדש" headline is an editorial call since there's no consumer feature, and (b) `prerender-seo.js` showed no dictation version string — verify before bumping it.
+
+⚠️ **The MCP server cannot work until 2.13.0 is installed** — the running 2.12.0 returns `{text}` only, which the MCP's payload validator correctly rejects. So the mic-verify (below, #1) and MCP registration both wait on this build.
+
+---
+
 ## 🆕 2026-07-19 — dictation MCP server + a latent `/transcript` bug fixed. NOT RELEASED.
 
 Full brainstorm → spec → plan → subagent-TDD, two review gates per task. Spec: `docs/superpowers/specs/2026-07-19-dictation-mcp-design.md`. Plan: `docs/superpowers/plans/2026-07-19-dictation-mcp.md`.
