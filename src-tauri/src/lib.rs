@@ -1337,10 +1337,15 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
 #[tauri::command]
 fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     let result = inject_text_defocused(&app, &text);
-    if result.is_ok() {
-        if let Some(state) = app.try_state::<AppState>() {
-            local_api::record_utterance(&state.last_transcript, &text);
-        }
+    // Record regardless of injection outcome: the transcript was completed
+    // (the user spoke it, Whisper/Deepgram transcribed it) whether or not the
+    // OS-level clipboard-paste into the active field then succeeded. Matches
+    // `stop_streaming_transcription`, which already records unconditionally.
+    // Gating this on `result.is_ok()` would mean an unrelated focus/clipboard
+    // failure silently hides a real dictation from `/transcript` and its
+    // MCP consumer (`wait_for_dictation` would time out as if nothing was said).
+    if let Some(state) = app.try_state::<AppState>() {
+        local_api::record_utterance(&state.last_transcript, &text);
     }
     result
 }
