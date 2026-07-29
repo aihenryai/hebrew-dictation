@@ -45,7 +45,13 @@ Spec: `docs/superpowers/specs/2026-07-19-en-to-he-translation-design.md` — bra
 
 ---
 
-## 📦 2026-07-19 — v2.12.1 RELEASE PREPARED (version bumped, green) — awaiting Henry's signed build
+## ✅ 2026-07-29 — v2.12.1 FULLY RELEASED (reliability release, no consumer-facing feature)
+
+App `main` @ `bfd93ed`-equivalent (app repo HEAD `a789ab3`, pushed). **GitHub Release [v2.12.1](https://github.com/aihenryai/hebrew-dictation/releases/tag/v2.12.1)**, signed `.exe` + `.sig` + `latest.json` (darwin-aarch64 block preserved byte-identical, still v2.10.1). Updater endpoint verified 200 → `2.12.1`, both platform blocks present. **Website** (`Henry-AI-website` `bfd93ed`) bumped: `DOWNLOAD_URL` + both version badges in `HebrewDictation.tsx`, `softwareVersion`/`downloadUrl`/`installUrl` + the "latest version" mention in `prerender-seo.js`. Verified live: `bintechai.com/hebrew-dictation` 200 w/ `softwareVersion:2.12.1`, `henry-ai-website.pages.dev/hebrew-dictation` 301→bintechai.com (pre-existing canonical redirect, not new) resolving 200 w/ 2.12.1, GitHub download link 200. Contains the local-api `/transcript` fix, the Smart Cleanup `finish_reason` truncation fix, and the 2026-07-29 injection-gate fix above. No "מה חדש" feature cards added — there's no new user-facing capability this round, matching the release-recipe note that a version bump alone is correct when that's genuinely all that changed.
+
+⚠️ **The MCP server can now be exercised** — 2.12.1 (once the user installs it) returns `{text, seq, at}`, satisfying the MCP's payload validator. Mic-verify (below, #1) still needs Henry.
+
+## (superseded by the above) 📦 2026-07-19 — v2.12.1 RELEASE PREPARED (version bumped, green) — awaiting Henry's signed build
 
 Version bumped **2.12.0 → 2.12.1** in all 4 files (package.json, Cargo.toml, tauri.conf.json, Cargo.lock, commit `e1fc6ec`). Release candidate verified: `cargo test` **68/1**, `tsc && vite build` clean. **Not pushed, not built, not released** — the signed build needs Henry's `TAURI_SIGNING_PRIVATE_KEY`.
 
