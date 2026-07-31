@@ -1,143 +1,183 @@
 # Hebrew TTS Narration — Phase 1 (Local, Generic Voice) — Design Spec
 
-- **Date:** 2026-07-31
+- **Date:** 2026-07-31 · **Revised same day** (rev 2 — architecture corrected after primary-source verification; see §2.1)
 - **Status:** Draft (pending spec-review loop + user approval)
-- **Author:** Claude (brainstormed with Henry)
-- **Backlog origin:** `HANDOFF.md` backlog item #4 ("the actual Voicebox-shaped feature") and its full background research in `HANDOFF-TTS-VOICE-GENERATION.md` (same repo). That research picked VoxCPM2 as the best open-source Hebrew **voice-cloning** model, but flagged it needs a real NVIDIA GPU + CUDA + Python/PyTorch — too heavy to be a zero-friction "local" tier the way `whisper-rs` is for STT. This spec is the brainstorm that resolves that gap.
+- **Author:** Claude (brainstormed with Henry; rev 2 reflection pass verified every load-bearing claim against primary sources)
+- **Backlog origin:** `HANDOFF.md` backlog item #4 ("the actual Voicebox-shaped feature") and its research in `HANDOFF-TTS-VOICE-GENERATION.md`. That research picked VoxCPM2 as the best open-source Hebrew **voice-cloning** model, but VoxCPM2 hard-requires NVIDIA GPU + CUDA + Python/PyTorch — it cannot be the zero-friction "local" tier that `whisper-rs` is for STT. This spec fills that gap with a generic-voice local tier; cloning is Phase 2.
 
 ---
 
 ## 1. Problem & goals
 
-Hebrew-dictation is voice→text. Henry wants the inverse: text→voice, in Hebrew, wrapped for non-technical users the same way this app wraps `whisper-rs` behind Alt+D — no Python, no pip install, no GPU shopping list.
+Hebrew-dictation is voice→text. Henry wants the inverse: text→voice, in Hebrew, wrapped for non-technical users the same way this app wraps `whisper-rs` behind Alt+D — nothing for the user to install or configure beyond clicking "download" inside the app.
 
-The app already has a working precedent for "local" in the STT direction: `whisper-rs` (pure Rust bindings to whisper.cpp) ships as a downloadable model file, runs on any CPU, zero Python/CUDA dependency. VoxCPM2 — the best *voice-cloning* model researched — cannot meet that bar; it hard-requires CUDA.
+**Goal (Phase 1):** a local, CPU-only, generic-Hebrew-voice narration feature inside hebrew-dictation. After a one-time in-app download, it works fully offline on any Windows machine, no GPU.
 
-**Goal (this spec, Phase 1):** a local, CPU-only, generic-Hebrew-voice narration feature inside hebrew-dictation, matching whisper-rs's zero-friction local UX: download a model, no GPU required, works on any Windows machine.
+**Success scenario:** Henry types or pastes a paragraph of Hebrew text into a new "הקראה" screen, clicks a button, and within a few seconds hears it read aloud in a natural Hebrew voice — entirely offline, no cloud call, no GPU.
 
-**Success scenario:** Henry types or pastes a paragraph of Hebrew text into a new "הקראה" screen, clicks a button, and within a few seconds hears it read aloud in a generic Hebrew voice — entirely offline, no cloud call, no GPU.
+### The guiding principle, stated precisely
+
+The app's established rule is **"the user never installs or configures anything technical"** — not "no Python may exist anywhere on disk." `whisper-rs` satisfied it by being pure Rust; Phase 1 satisfies it with an **app-managed, isolated, on-demand-downloaded runtime** (§3) that the user experiences exactly like downloading a whisper model. The NSIS installer stays small; the user's system Python (or lack of one) is irrelevant; nothing touches PATH or the registry.
 
 ### Non-goals (out of scope for Phase 1 — deferred to a separate future Phase 2 spec)
 
-- **Voice cloning** (narrating in Henry's own cloned voice). This needs VoxCPM2, which needs CUDA. Phase 2 will decide standalone-vs-embedded backend questions (RunPod self-hosted GPU pod vs. an interim public-demo API) — **blocked today on Henry's own RunPod account/billing setup**, not something to do on his behalf. Do not conflate Phase 1's generic voice with Phase 2's cloning; they are different models with different infrastructure needs.
-- Voice selection UI beyond a single default Hebrew voice (Piper may ship more than one; picking/exposing multiple is a later nice-to-have, not required for v1).
-- Long-text chunking/streaming playback. No LLM-style token quota applies here (Piper is a local synchronous process, not a rate-limited API) — a long input is just slower, not blocked. Chunking is deferred until real usage shows it's needed (YAGNI).
-- Any cloud/remote backend for Phase 1. Phase 1 is 100% local by design.
+- **Voice cloning** (narrating in Henry's own cloned voice). Needs VoxCPM2 → CUDA → RunPod/GPU decisions that are **blocked on Henry's own RunPod account/billing setup**. Different model, different infrastructure; do not conflate.
+- **Voice selection UI.** Factually moot in v1: exactly **one** Hebrew Piper voice exists today (§2.2) — there is nothing to select between.
+- **Long-text chunking / streaming playback.** Piper is a local synchronous engine, not a rate-limited API — long input is slower, not blocked. Deferred until real usage demands it (YAGNI).
+- Any cloud/remote backend. Phase 1 is 100% local after the one-time download.
 
 ---
 
-## 2. Decision: Piper TTS as a sidecar process
+## 2. Model & runtime decision (rev 2 — corrected)
 
-**Chosen:** [Piper](https://github.com/rhasspy/piper) (rhasspy), invoked as a compiled sidecar binary — Rust spawns `piper.exe`, feeds Hebrew text on stdin, reads WAV bytes back on stdout.
+### 2.1 What rev 1 got wrong, and how we know
 
-**Why:**
-- Piper ships as a small compiled binary with no Python/PyTorch runtime dependency — the closest architectural match to `whisper-rs`'s "download a model file, run on CPU" UX that already exists in this app.
-- VITS architecture, ONNX Runtime bundled internally; voices are separate downloadable `.onnx` files — fits the existing model-download flow (`model.rs`) almost exactly.
-- Hebrew voice models were added to the official `piper-voices` repo (HuggingFace/GitHub) within days of this spec being written (July 2026) — Hebrew support exists today, not hypothetically.
-- This repo already has a proven precedent for the "spawn a compiled sidecar binary" pattern: the earlier on-device Hebrew-cleanup research (see `HANDOFF.md`) chose to run llama.cpp as a sidecar specifically to avoid a `ggml` static-link collision with whisper.cpp in the same binary. Piper-as-sidecar follows the same shape, for the same category of reason (keep unrelated native dependencies out of the main binary).
+Rev 1 planned to spawn the **archived** `rhasspy/piper` compiled Windows binary (`piper.exe`, 2023, MIT) as a sidecar. Primary-source verification killed that plan:
 
-### Alternatives considered and rejected
+- The only Hebrew Piper voice — `he_IL-saspeech-medium`, added to `rhasspy/piper-voices` days before this spec ("Add ko, he, mr voices", by the Piper author) — declares **`"phoneme_type": "hebrew"`** in its config (verified by fetching the raw `.onnx.json`).
+- That phoneme type does not exist in the archived 2023 binary (which knows only `espeak`/`text`). It was introduced in **piper1-gpl v1.6.0 (2026-07-23): "Add Hebrew phonemizer using Nakdimon"** — a neural Hebrew diacritizer that adds nikud before phonemization. Unvocalized Hebrew is exactly why Piper had no Hebrew voice for years (rhasspy/piper issue #538, open since 2024): plain espeak-ng phonemization of nikud-less text is unusable.
+- `piper1-gpl` (the active successor, Open Home Foundation) is **GPL-3.0 and ships as a Python package only** (`pip install piper-tts`) — no standalone `.exe` releases.
+
+**Conclusion:** for Hebrew, "compiled-binary Piper sidecar" is not an option. The Hebrew capability *is* the Python package. The architecture must embrace that without violating the guiding principle above.
+
+### 2.2 The voice
+
+`he_IL-saspeech-medium` — 63MB ONNX, 22.05kHz, single male speaker, `medium` quality only. Trained on the **SASPEECH corpus** (the Roboshaul project: Shaul Amsterdamski's voice, from Kan's "חיות כיס" podcast recordings). Hosted in `rhasspy/piper-voices` (repo license MIT). ⚠️ The spike (§6) must check the voice's own MODEL_CARD for license/attribution terms — a corpus built from one real person's broadcast voice may carry attribution or non-commercial conditions that belong in the app's credits screen.
+
+### 2.3 The runtime: piper1-gpl as a managed HTTP sidecar
+
+`piper1-gpl` includes a built-in HTTP server:
+
+```
+python -m piper.http_server -m he_IL-saspeech-medium --host 127.0.0.1 --port <port>
+POST /synthesize  {"text": "..."}  →  WAV bytes
+GET  /info                          →  voice metadata (doubles as health check)
+```
+
+The app spawns this once as a warm child process and calls it over localhost HTTP. This beats per-request CLI spawning decisively: the voice model + Nakdimon load **once** at server start (cold-start cost paid once), every subsequent request is fast; WAV arrives as an HTTP body, eliminating rev 1's Windows stdin/stdout binary-piping risk entirely; and concurrent requests are the server's problem, not ours.
+
+### 2.4 Provisioning: `uv` does everything
+
+One-time in-app "download narration engine" flow, driven by Rust:
+
+1. Download **`uv`** (astral-sh — a single static ~20MB binary, MIT/Apache) into app-data, **hash-verified** like every existing model download in `model.rs`.
+2. `uv` provisions an isolated Python + venv inside app-data and installs `piper-tts` (≥1.6.0; the spike pins whether the HTTP server needs an extra like `piper-tts[http]`).
+3. Download the voice (63MB) via the existing model-download UI patterns; confirm where the Nakdimon model comes from (bundled in the wheel vs. fetched on first use — spike question; if fetched, it must be part of this provisioning step so the feature is truly offline afterwards).
+
+Everything lives under app-data, fully removable, invisible to the system. Disk estimate ~200-300MB total (onnxruntime wheel + venv + voice + Nakdimon) — spike confirms the real number, and the download UI must show it honestly like the whisper model sizes.
+
+### 2.5 Licensing
+
+- **GPL-3.0 (piper1-gpl):** fine. It runs as a **separate process** — mere aggregation, nothing GPL links into the app binary. Moreover the app doesn't redistribute it at all: components download from upstream (PyPI/GitHub/HuggingFace) at the user's request.
+- **uv:** MIT/Apache. **Voice repo:** MIT (individual voice card checked in spike, §2.2).
+
+### 2.6 Alternatives considered and rejected
 
 | Alternative | Why rejected |
 |---|---|
-| **MMS-TTS Hebrew** (`facebook/mms-tts-heb`) via embedded ONNX Runtime (`ort` Rust crate), in-process | Also VITS-based, so no clear quality edge over Piper — but it's a raw HuggingFace research checkpoint, not a purpose-built app-ready engine. Would need hand-rolled tokenizer/preprocessing in Rust or a separate export step. More integration work for no clear benefit. |
-| **Embedded Python runtime** (coqui-tts, or Piper's own Python package) | Rejected on principle — avoiding embedded Python for local inference is the established pattern in this codebase (`whisper-rs` was chosen specifically to avoid it for STT). Would balloon installer size and packaging complexity, undermining the entire "friendly for non-technical users" premise. |
-
-### Open risk, explicitly not resolved by this spec
-
-Piper's Hebrew voices are brand new (added days before this spec). Quality is **unverified** — nobody has listened to or objectively measured Piper's Hebrew output yet. Piper depends on `espeak-ng` for phonemization, and `espeak-ng`'s historical Hebrew support maturity is unknown to us. **It is also not yet confirmed whether `espeak-ng` ships statically bundled inside the Piper binary or is a separate runtime dependency** — if the latter, `ensure_piper_model_available()` (§3) needs to check for it too, or a user could pass the pre-flight guard and still fail at spawn. **§6 (rollout order) makes resolving both of these the first build step, before any UI work** — see there.
-
-(A second-opinion consult with Codex was attempted during this brainstorm to sanity-check the architecture and probe these specific risk questions; the Codex workspace was out of credits and returned no answer. This spec proceeds on Claude's own analysis; the Codex consult can be retried later once credits are refilled, but is not a blocker for starting the quality spike in §6.)
+| **Archived `piper.exe` (rev 1's plan)** | Cannot run `phoneme_type: "hebrew"` — predates the Hebrew phonemizer entirely (§2.1). Feeding it unvocalized Hebrew through old espeak-ng is the exact failure mode that kept Hebrew out of Piper for years. |
+| **MMS-TTS Hebrew** (`facebook/mms-tts-heb`) via `ort` crate in-process | Community verdict in rhasspy/piper issue #538: quality "not good." Raw research checkpoint, hand-rolled tokenization in Rust, no diacritization story at all. More work for worse output. |
+| **Re-implement Hebrew phonemization in Rust** (Nakdimon via `ort` + phoneme mapping) | Research-grade effort duplicating what piper1-gpl just shipped; unjustifiable for v1. |
+| **Bundling Python/runtime in the NSIS installer** | Balloons the installer for a feature not every user wants. On-demand provisioning (§2.4) gives the same end state, paid only by users who opt in. |
+| **Cloud TTS for Phase 1** | Violates the local/offline premise; cloud belongs to Phase 2's cloning discussion. |
 
 ---
 
 ## 3. Architecture
 
 ```
-┌────────────────────────────────────────────┐
-│ hebrew-dictation app (Rust, Tauri)          │
-│                                              │
-│  narration.rs (NEW)                         │
-│   - build_piper_command(text, model_path)   │  pure, unit-testable
-│   - run_piper(text) -> Result<Vec<u8>,Err>  │  spawns piper.exe, stdin/stdout
-│                                              │
-│  model.rs (EXTENDED)                        │
-│   - piper binary + voice .onnx download,    │  mirrors existing whisper
-│     mirrors existing model download flow    │  model download UX
-│                                              │
-│  lib.rs (NEW commands)                      │
-│   - generate_narration(text) -> Vec<u8>     │
-│   - ensure_piper_model_available()          │  pre-flight guard
-└──────────────────┬───────────────────────────┘
-                    │ Tauri IPC
-┌──────────────────▼───────────────────────────┐
-│ Frontend (React) — NEW "הקראה" AppView        │
-│  textarea -> "צור קול" button -> <audio>      │
-│  -> "שמור כ-WAV" (reuses export save-dialog)  │
-└────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ hebrew-dictation app (Rust, Tauri)                            │
+│                                                                │
+│  narration.rs (NEW)                                           │
+│   - NarrationServer: spawn/health-check/kill the sidecar      │
+│   - synthesize(text) -> Result<Vec<u8>, Err>   POST /synthesize│
+│   - pure fns: server args builder, WAV sanity check           │
+│                                                                │
+│  provisioning (model.rs EXTENDED or narration_setup.rs)       │
+│   - uv download (hash-verified) → venv → piper-tts → voice    │
+│   - progress events reusing the whisper-model download UI     │
+│                                                                │
+│  lib.rs (NEW commands)                                        │
+│   - generate_narration(text) -> Vec<u8> (WAV)                 │
+│   - ensure_narration_ready() – pre-flight guard               │
+│   - narration_setup() – runs provisioning with progress       │
+└──────────────────┬─────────────────────────────────────────────┘
+                    │ spawns & owns (kill_on_drop / on app exit)
+┌──────────────────▼─────────────────────────────────────────────┐
+│ python -m piper.http_server (127.0.0.1:<port>, warm sidecar)   │
+│  loads he_IL-saspeech-medium + Nakdimon once                    │
+└────────────────────────────────────────────────────────────────┘
+                    ▲ Tauri IPC (frontend)
+┌──────────────────┴─────────────────────────────────────────────┐
+│ React — NEW "הקראה" AppView                                     │
+│  textarea → "צור קול" → <audio> playback → "שמור כ-WAV"          │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-- **`narration.rs`** (new module, alongside `local_api.rs`, `enhance.rs`): owns the Piper process invocation. `build_piper_command` is a pure function (text + model paths → `Command` args) so the "did we build the right invocation" logic is unit-testable without actually spawning a process — same seam pattern as `enhance.rs`'s `parse_completion`.
-- **`model.rs`** extension: the `piper.exe` binary and the Hebrew voice `.onnx` file are downloaded on demand, **not bundled in the NSIS installer** — same reasoning as the existing whisper models (keeps installer size down, matches the "download a model" UX users already know from this app). This inherits `model.rs`'s existing expected-size + SHA-256 verification on every download — **not optional for `piper.exe` specifically**, since (unlike an inert model weights file) it is an executable that gets spawned as a subprocess, making an unverified download a higher-severity risk than for the whisper models.
-- **New Tauri commands:**
-  - `generate_narration(text: String) -> Result<Vec<u8>, String>` — returns raw WAV bytes.
-  - `ensure_piper_model_available() -> Result<(), String>` — pre-flight guard, mirrors the existing `ensure_local_meeting_model_available` pattern (checked *before* spawning Piper, not discovered via a failed spawn).
-- **Frontend:** a new `AppView` ("הקראה"), reachable from the home screen the same way the existing batch/settings screens are. Textarea for input Hebrew text, a generate button, inline `<audio>` playback, and a "שמור כ-WAV" export button reusing the existing `tauri-plugin-dialog` save pattern already used by `export_history`/`export_srt`.
+- **`narration.rs`** owns the sidecar lifecycle: spawn on first use (or on entering the הקראה screen — plan decides), `GET /info` as readiness probe, restart-once-on-crash, and **guaranteed teardown** (`tokio::process` `kill_on_drop` + explicit kill on app exit — no orphaned `python.exe` after the app closes; this is the one genuinely new lifecycle obligation vs. rev 1 and it must be tested).
+- **Port:** default `5758` (sibling of the local API's `5757`), configurable in settings (`narration_port`); bind failure → clear Hebrew error, and it's internal-only (`127.0.0.1`).
+- **Pure seams for TDD** (pattern of `enhance.rs::parse_completion`): the server-args builder and a WAV header sanity check are pure functions; HTTP-client logic is testable against a mock localhost server exactly like `local_api.rs`'s tests.
+- **Frontend:** new `AppView` "הקראה" reachable from the home screen like batch/settings; textarea, generate button, inline `<audio>`, and "שמור כ-WAV" reusing the `export_history`/`export_srt` save-dialog pattern. If the engine isn't provisioned, the screen shows the download flow (reusing the model-download UI), not an error.
 
 ---
 
 ## 4. Data flow
 
-1. User opens the "הקראה" screen from the home view.
-2. Types or pastes Hebrew text into a textarea.
-3. Clicks "צור קול" → frontend invokes `generate_narration(text)`.
-4. Backend: `ensure_piper_model_available()` checks the binary + voice model are present. If not, returns an actionable Hebrew error (mirrors the whisper-model-missing guard) — **checked before spawning**, not surfaced as a cryptic process-spawn failure.
-5. Rust spawns `piper.exe` via `tokio::process::Command`, writes the Hebrew text to stdin as UTF-8, reads WAV bytes from stdout to completion.
-6. Bytes return to the frontend over Tauri IPC; the UI plays them inline (`<audio>`) and shows a "שמור כ-WAV" button.
+1. User opens "הקראה". If the engine isn't provisioned → in-place download flow (§2.4). If provisioned but the sidecar isn't running → spawn it, show a brief "מכין את מנוע ההקראה…" state until `/info` responds.
+2. User types/pastes Hebrew text, clicks "צור קול" → `generate_narration(text)`.
+3. Rust `POST /synthesize {"text": ...}` → receives WAV bytes → sanity-checks the header → returns them over IPC.
+4. Frontend plays inline and offers "שמור כ-WAV".
 
 ---
 
 ## 5. Error handling
 
-- **Model/binary not installed:** pre-flight guard (§3) returns a clear Hebrew error pointing at Settings to download, before any process is spawned.
-- **Piper process fails to spawn, crashes, or exits non-zero:** surfaced as a Hebrew error; no partial/corrupt audio is ever returned to the frontend (all-or-nothing: either a full valid WAV or an error, never a truncated buffer).
-- **Empty or whitespace-only input:** the "צור קול" button is disabled client-side — no backend round-trip for a no-op request (matches the empty-guard pattern already used elsewhere in this app, e.g. `record_utterance`'s blank-text guard).
-- **Very long input text:** no artificial length limit in Phase 1. This is not an LLM API with a token quota — Piper is a local synchronous process, so a long input just takes longer, it isn't blocked or billed. If real usage later shows a need for chunking or a progress indicator, that's a follow-up, not a Phase-1 requirement. Known tradeoff, accepted deliberately: WAV is uncompressed and returned as a single `Vec<u8>` over Tauri IPC, so a genuinely long paste means a larger in-memory buffer and a multi-second UI hitch — acceptable for the "a paragraph" success scenario in §1, revisit only if real usage pushes past that.
-- **Concurrent generation requests** (e.g. double-clicking "צור קול"): each `piper.exe` spawn is stateless and independent, unlike the mic recorder's hardware-contention lock — two overlapping generations are a deliberate non-issue, not a gap.
+- **Engine not provisioned:** pre-flight guard (`ensure_narration_ready`) returns an actionable Hebrew state the UI renders as the download flow — never a raw spawn failure.
+- **Sidecar dead / port conflict / `/synthesize` non-200:** restart once; if still failing, a clear Hebrew error. Never return partial/corrupt audio — all-or-nothing per request (valid WAV or error).
+- **Empty/whitespace input:** button disabled client-side (matches `record_utterance`'s blank-guard philosophy).
+- **Very long input:** no artificial limit. Known accepted tradeoff: WAV is uncompressed and crosses IPC as one `Vec<u8>`; a huge paste = larger buffer + longer wait. Fine for the §1 "paragraph" scenario; revisit only on real demand.
+- **Concurrent clicks:** requests serialize naturally at the single warm server; no app-side lock needed (unlike the mic's hardware-contention locks). Deliberate non-issue.
+- **App exit during synthesis:** sidecar is killed with the app; in-flight request dies with it — acceptable, nothing persistent is corrupted.
 
 ---
 
-## 6. Rollout order — quality spike BEFORE UI work
+## 6. Rollout order — spike FIRST, before any app code
 
-Because Piper's Hebrew voice is unverified and brand-new (§2), building the full UI/backend integration before confirming the voice is usable risks throwing away work. Build order:
+The Hebrew voice is days old and its quality is **unverified**. Also several provisioning facts are unpinned. So:
 
-1. **Quality spike (do this first, no UI, no Tauri integration):** download the Piper binary + a Hebrew `.onnx` voice manually, run one test sentence, and judge the output **objectively** — an ASR round-trip check (transcribe the generated audio back with Whisper, compare to the input text), exactly the methodology `HANDOFF-TTS-VOICE-GENERATION.md` already established and validated for VoxCPM2 ("don't trust a model's own self-report on Hebrew audio quality — verify objectively"). Do not proceed past this step on the strength of a human just listening and going "sounds fine." **This spike also settles the open §2 question:** does the Windows Piper release bundle `espeak-ng` statically, or is it a separate dependency that `ensure_piper_model_available()` needs to check for too? Confirm and write the answer into the plan before implementation starts.
-2. **If the spike passes:** build the full chain — `narration.rs`, the `model.rs` extension, the two Tauri commands, the "הקראה" screen.
-3. **If the spike fails (quality too poor to ship):** stop and report back before writing any app code. Do not silently fall back to MMS-TTS or another model without a fresh decision — a Piper-shaped failure doesn't automatically make MMS-TTS's tokenizer/ONNX integration effort worth it; that trade-off needs to be re-evaluated with the actual failure in hand.
-4. **Manual verify with Henry** (can't be automated): generate a real paragraph of Hebrew text on his machine, listen, confirm it's usable for the intended use case, before considering Phase 1 done.
+1. **Quality + facts spike (throwaway dev venv, zero app code):**
+   - `pip install piper-tts` (pin ≥1.6.0; note whether the HTTP server needs an extra), download `he_IL-saspeech-medium`, synthesize test sentences — including a multi-clause sentence and the known Hebrew-TTS trap word **"מתגים"** (documented in `HANDOFF-TTS-VOICE-GENERATION.md` as failing on *every* model tested; expected to fail here too — record it, don't chase it).
+   - Judge **objectively**: Whisper ASR round-trip (transcribe the output, compare to input) — the established methodology; never "sounds fine to me," and never an LLM's self-report.
+   - Pin the facts: where Nakdimon's model comes from (wheel vs. first-use download); real total disk size; server cold-start seconds; per-request latency for a paragraph; the voice MODEL_CARD's license/attribution terms; exact `/synthesize` behavior for long text.
+2. **If the spike passes:** build the full chain — provisioning, `narration.rs`, commands, the הקראה screen — via the normal plan/TDD flow.
+3. **If quality fails:** stop and report back with the recordings + ASR transcripts. Do **not** silently fall back to MMS-TTS or anything else — every alternative was rejected for cause (§2.6), so a Piper failure means a fresh decision with Henry, possibly "wait for the ecosystem" or "jump straight to Phase 2 cloud."
+4. **Manual verify with Henry** before Phase 1 is called done: a real paragraph, on his machine, his ears. (An ASR round-trip proves intelligibility, not pleasantness — the human check is for naturalness/pace, and it's the same gate every feature in this app ships through.)
 
 ---
 
 ## 7. Testing
 
-- **Rust unit tests:** `build_piper_command` (pure — args are correct for a given text/model-path combination, no process spawned), and a WAV-header sanity check on returned bytes (structurally valid WAV, not garbage/empty).
-- **Integration test (real process spawn):** gated/skipped when the Piper binary isn't present on the test machine — same `#[ignore]`-style pattern already used for the loopback-audio test in this repo, not a hard CI dependency on a downloaded binary.
-- **No automated Hebrew-quality test** — that's inherently the ASR-round-trip spike in §6, done once as a build-order gate, not a repeatable test suite (Hebrew TTS quality isn't a thing to regression-test the way "does the WAV parse" is).
+- **Rust unit tests (pure):** server-args builder; WAV header sanity check; provisioning state machine decisions (not-provisioned / provisioned-not-running / ready).
+- **Rust tests (mock HTTP):** `synthesize()` against a mock localhost server — success, non-200, connection-refused, garbage-body cases. Same technique as `local_api.rs`'s existing tests.
+- **Integration test (real sidecar), `#[ignore]`-gated** like the loopback-audio test: runs only where the engine is provisioned; spawns, probes `/info`, synthesizes one word, checks WAV validity, kills, **verifies the process is actually gone** (the orphan-prevention obligation from §3).
+- **No automated Hebrew-quality regression test** — quality is the §6 spike gate + Henry's manual verify, not a unit test.
 
 ---
 
 ## 8. Acceptance criteria
 
-- Quality spike (§6.1) passes an objective ASR round-trip check on a real Hebrew test sentence before any app code is written.
-- `generate_narration` returns valid, complete WAV bytes for non-trivial Hebrew input; `cargo test` green; `cargo build`/`cargo clippy` clean.
-- Missing-model case surfaced as a clear pre-flight Hebrew error, never a raw process-spawn failure.
-- Henry manually verifies real output on his own machine before this is considered shippable (no automated substitute for this step).
+- Spike (§6.1) passes the ASR round-trip on real Hebrew sentences, and all spike facts (disk size, Nakdimon source, cold-start, license terms) are written into the implementation plan before coding starts.
+- `generate_narration` returns valid complete WAV for non-trivial Hebrew input; `cargo test` green; `cargo build`/`clippy` clean.
+- Provisioning is fully in-app (no user-visible Python/pip/terminal anywhere), hash-verifies the `uv` binary, and shows honest download sizes.
+- No orphaned sidecar process after app exit (integration-tested, not assumed).
+- Missing-engine states surface as the in-app download flow, never as raw errors.
+- Henry manually verifies real output on his machine before this ships.
 
 ---
 
 ## 9. Explicitly out of scope / backlog for later
 
-- Phase 2 (separate spec, not started): voice cloning via VoxCPM2, backend architecture (self-hosted RunPod GPU pod vs. an interim public-demo API), blocked on Henry's own RunPod account/billing.
-- Voice selection among multiple Piper Hebrew voices, if more than one exists.
-- Any packaging of Piper/models into the installer itself (stays download-on-demand, matching whisper).
-- A retried Codex second-opinion consult (attempted during this brainstorm, failed on out-of-credits — not a blocker, just unfinished).
+- **Phase 2 (separate spec):** voice cloning via VoxCPM2 — backend architecture (self-hosted RunPod GPU pod vs. interim public-demo API), blocked on Henry's RunPod account/billing. All VoxCPM2 tuning knowledge is preserved in `HANDOFF-TTS-VOICE-GENERATION.md`.
+- Voice selection (moot until a second Hebrew voice exists) · chunking/streaming · bundling anything into the installer.
+- A Codex second-opinion consult was attempted during rev 1 (workspace out of credits, no answer). Rev 2's primary-source verification pass answered the questions it was meant to probe (espeak-ng bundling, licensing, Hebrew phonemization maturity) with better evidence than an opinion; retrying Codex is optional, not a blocker.
