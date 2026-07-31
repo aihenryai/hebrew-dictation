@@ -66,6 +66,10 @@ One-time in-app "download narration engine" flow, driven by Rust:
 
 Everything lives under app-data, fully removable, invisible to the system. Disk estimate ~200-300MB total (onnxruntime wheel + venv + voice + Nakdimon) — spike confirms the real number, and the download UI must show it honestly like the whisper model sizes.
 
+**Provisioned-state detection & partial failure (normative):** "provisioned" is defined by an **atomic completion marker** (a small versioned JSON, e.g. `narration-engine.json` recording piper-tts version + voice + paths) written **last**, only after every step above succeeded. Any failure or interruption mid-provisioning (install died halfway, app closed during a download) leaves the marker absent → the state machine stays at *not-provisioned* and the UI simply offers "download" again. Every step is **idempotent and safe to re-run**: `uv` recreates/repairs the venv, the voice download resumes/overwrites per the existing `model.rs` semantics, and stale partial directories are overwritten rather than trusted. No separate "repair" flow — retry *is* the repair.
+
+**Version pinning:** the implementation plan pins an **exact** `piper-tts` version (e.g. `==1.6.x` as verified by the spike), not open-ended `>=` — the HTTP API verified today shouldn't silently drift under a future release. Where practical, the pip install uses `uv`'s hash-pinned requirements for parity with the hash-verified `uv` binary itself.
+
 ### 2.5 Licensing
 
 - **GPL-3.0 (piper1-gpl):** fine. It runs as a **separate process** — mere aggregation, nothing GPL links into the app binary. Moreover the app doesn't redistribute it at all: components download from upstream (PyPI/GitHub/HuggingFace) at the user's request.
@@ -115,8 +119,9 @@ Everything lives under app-data, fully removable, invisible to the system. Disk 
 └────────────────────────────────────────────────────────────────┘
 ```
 
-- **`narration.rs`** owns the sidecar lifecycle: spawn on first use (or on entering the הקראה screen — plan decides), `GET /info` as readiness probe, restart-once-on-crash, and **guaranteed teardown** (`tokio::process` `kill_on_drop` + explicit kill on app exit — no orphaned `python.exe` after the app closes; this is the one genuinely new lifecycle obligation vs. rev 1 and it must be tested).
-- **Port:** default `5758` (sibling of the local API's `5757`), configurable in settings (`narration_port`); bind failure → clear Hebrew error, and it's internal-only (`127.0.0.1`).
+- **`narration.rs`** owns the sidecar lifecycle: spawn on first use (or on entering the הקראה screen — plan decides), `GET /info` as readiness probe, restart-once-on-crash, and **guaranteed teardown**, layered because `kill_on_drop` alone only covers clean exit: (a) `tokio::process` `kill_on_drop` + explicit kill on app exit for the normal path; (b) the child is assigned to a **Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`**, so a hard app crash / `taskkill` takes the sidecar down too; (c) a **startup stale-sidecar sweep** — on launch, probe the configured port and kill/reclaim any leftover sidecar from a previous unclean death. This is the one genuinely new lifecycle obligation vs. rev 1 and it must be integration-tested. Spawn timing is decided (§4): entering the narration screen spawns the sidecar — no open "plan decides" question.
+- **Port:** default `5758` (sibling of the local API's `5757`), configurable in settings (`narration_port`); bind failure → clear Hebrew error, and it's internal-only (`127.0.0.1`). ⚠️ **`--host 127.0.0.1` is security-mandatory, not stylistic** — verified: piper1-gpl's HTTP server defaults to `0.0.0.0` (all interfaces); omitting the flag would expose a synthesis endpoint to the local network. The args-builder unit test (§7) asserts its presence.
+- **Idle policy — known accepted tradeoff:** the sidecar stays warm from screen-entry until app exit, inside an app that itself runs in the background all day. A Python + onnxruntime + Nakdimon process plausibly holds a few hundred MB of RAM while warm; keeping it resident is the deliberate v1 choice (cold-start per request would be far worse UX). The spike (§6) measures the real RSS; an idle-timeout shutdown is a possible follow-up only if the measured number is offensive.
 - **Pure seams for TDD** (pattern of `enhance.rs::parse_completion`): the server-args builder and a WAV header sanity check are pure functions; HTTP-client logic is testable against a mock localhost server exactly like `local_api.rs`'s tests.
 - **Frontend:** new `AppView` "הקראה" reachable from the home screen like batch/settings; textarea, generate button, inline `<audio>`, and "שמור כ-WAV" reusing the `export_history`/`export_srt` save-dialog pattern. If the engine isn't provisioned, the screen shows the download flow (reusing the model-download UI), not an error.
 
@@ -148,8 +153,9 @@ The Hebrew voice is days old and its quality is **unverified**. Also several pro
 
 1. **Quality + facts spike (throwaway dev venv, zero app code):**
    - `pip install piper-tts` (pin ≥1.6.0; note whether the HTTP server needs an extra), download `he_IL-saspeech-medium`, synthesize test sentences — including a multi-clause sentence and the known Hebrew-TTS trap word **"מתגים"** (documented in `HANDOFF-TTS-VOICE-GENERATION.md` as failing on *every* model tested; expected to fail here too — record it, don't chase it).
+   - Include one **mixed-content sentence** (Hebrew + English brand name + digits, e.g. "הורדתי את ChatGPT 5 אתמול") — real narration text contains these, and the Nakdimon/espeak path's behavior on non-Hebrew tokens is unknown.
    - Judge **objectively**: Whisper ASR round-trip (transcribe the output, compare to input) — the established methodology; never "sounds fine to me," and never an LLM's self-report.
-   - Pin the facts: where Nakdimon's model comes from (wheel vs. first-use download); real total disk size; server cold-start seconds; per-request latency for a paragraph; the voice MODEL_CARD's license/attribution terms; exact `/synthesize` behavior for long text.
+   - Pin the facts: where Nakdimon's model comes from (wheel vs. first-use download); real total disk size; server cold-start seconds; per-request latency for a paragraph; **warm-idle RAM (RSS) of the sidecar** (§3's idle-policy tradeoff); the voice MODEL_CARD's license/attribution terms; exact `/synthesize` behavior for long text; the exact `piper-tts` version to pin (§2.4).
 2. **If the spike passes:** build the full chain — provisioning, `narration.rs`, commands, the הקראה screen — via the normal plan/TDD flow.
 3. **If quality fails:** stop and report back with the recordings + ASR transcripts. Do **not** silently fall back to MMS-TTS or anything else — every alternative was rejected for cause (§2.6), so a Piper failure means a fresh decision with Henry, possibly "wait for the ecosystem" or "jump straight to Phase 2 cloud."
 4. **Manual verify with Henry** before Phase 1 is called done: a real paragraph, on his machine, his ears. (An ASR round-trip proves intelligibility, not pleasantness — the human check is for naturalness/pace, and it's the same gate every feature in this app ships through.)
@@ -170,7 +176,7 @@ The Hebrew voice is days old and its quality is **unverified**. Also several pro
 - Spike (§6.1) passes the ASR round-trip on real Hebrew sentences, and all spike facts (disk size, Nakdimon source, cold-start, license terms) are written into the implementation plan before coding starts.
 - `generate_narration` returns valid complete WAV for non-trivial Hebrew input; `cargo test` green; `cargo build`/`clippy` clean.
 - Provisioning is fully in-app (no user-visible Python/pip/terminal anywhere), hash-verifies the `uv` binary, and shows honest download sizes.
-- No orphaned sidecar process after app exit (integration-tested, not assumed).
+- No orphaned sidecar: clean exit kills it (`kill_on_drop` path, integration-tested); hard crash kills it via the Job Object; and the startup sweep reclaims any survivor from an unclean death — all three layers of §3, not assumed.
 - Missing-engine states surface as the in-app download flow, never as raw errors.
 - Henry manually verifies real output on his machine before this ships.
 
