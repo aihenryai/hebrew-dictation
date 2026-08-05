@@ -452,3 +452,812 @@ git commit -m "feat(narration): async HTTP client for the piper sidecar (synthes
 ```
 
 ---
+
+## Chunk 3: Provisioning — `uv`, the venv, `piper-tts`, and the voice
+
+**Platform scope:** this whole feature is `#[cfg(target_os = "windows")]`-gated, matching the existing precedent of `system_audio.rs`'s Windows-only `System`/`Call` recording modes (spec's macOS non-goal, added during planning). Every new file in this chunk assumes Windows.
+
+**Verified facts used below** (checked live during planning, not guessed):
+- `uv` 0.12.1 Windows x64 release asset: `uv-x86_64-pc-windows-msvc.zip`, exactly **19,073,343 bytes**, SHA-256 `8fcb0cb46e1229065e344758980924e569bef5882ef45f46fada8fb24e06b74a` (from `https://github.com/astral-sh/uv/releases/download/0.12.1/uv-x86_64-pc-windows-msvc.zip` + its `.sha256` sibling).
+- `uv venv <path> --python 3.11` downloads and installs a fully self-contained Python 3.11 build if none is found — **no system Python required** (confirmed against astral.sh's own docs). This is what makes the spec's "nothing for the user to install" claim actually true.
+- `UV_PYTHON_INSTALL_DIR`, `UV_PYTHON_INSTALL_BIN=0`, `UV_PYTHON_NO_REGISTRY=1`, and `UV_CACHE_DIR` (all real `uv` environment variables, confirmed against astral.sh's reference docs) are what keep this fully contained under app-data — no PATH modification, no Windows registry entries. This directly satisfies the spec's guiding principle ("nothing touches PATH or the registry").
+- `uv pip install --python <venv-path> piper-tts==<pinned>` installs into a venv by path, no activation needed.
+
+⚠️ **The exact `piper-tts` version to pin, and whether a `[http]` extra is needed, come from Chunk 1's spike findings doc — do not guess them here.** Task 3 below uses a placeholder `<PIPER_TTS_VERSION>` that must be replaced with the spike's actual finding before this task is implemented.
+
+### Task 1: Extract a generic hash-verified download helper from `model.rs`
+
+**Files:**
+- Modify: `src-tauri/src/model.rs`
+- Test: `src-tauri/src/model.rs` (new `#[cfg(test)] mod tests`, this file has none today)
+
+`model.rs`'s existing `download_model` (lines 136-235) has download+hash-verify+progress-emit logic hardcoded to whisper models. This task extracts that logic into a reusable function so Task 2 (the `uv` binary) and Task 3 (the voice file) can reuse it instead of duplicating it — the spec (§2.4, §2.6) explicitly calls for this reuse, since an unverified download that's about to be *executed* (`uv.exe`) is a higher-severity risk than an inert model file.
+
+- [ ] **Step 1: Write the failing tests for the extracted core function**
+
+Add to the bottom of `src-tauri/src/model.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn spawn_fake_download_server(body: Vec<u8>) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let response = tiny_http::Response::from_data(body.clone());
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_writes_file_on_hash_match() {
+        let body = b"pretend this is a downloaded file".to_vec();
+        let expected_hash = format!("{:x}", Sha256::digest(&body));
+        let port = spawn_fake_download_server(body.clone());
+
+        let tmp_dir = std::env::temp_dir().join(format!("narration-test-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let mut progress_calls: Vec<(u64, u64)> = Vec::new();
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            body.len() as u64,
+            &expected_hash,
+            "קובץ בדיקה",
+            |downloaded, total| progress_calls.push((downloaded, total)),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!progress_calls.is_empty(), "progress callback should fire at least once");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_rejects_hash_mismatch_and_cleans_up() {
+        let body = b"some bytes".to_vec();
+        let port = spawn_fake_download_server(body.clone());
+
+        let tmp_dir = std::env::temp_dir().join(format!("narration-test-mismatch-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            body.len() as u64,
+            "0000000000000000000000000000000000000000000000000000000000000000", // deliberately wrong
+            "קובץ בדיקה",
+            |_, _| {},
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!dest.exists(), "final file must not exist after a hash mismatch");
+        let tmp_path = dest.with_file_name("downloaded.bin.tmp");
+        assert!(!tmp_path.exists(), "temp file must be cleaned up after a hash mismatch");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_aborts_when_response_exceeds_expected_size() {
+        // Server sends far more than expected_size — the 10%-tolerance guard must abort early.
+        let body = vec![0u8; 1000];
+        let port = spawn_fake_download_server(body);
+
+        let tmp_dir = std::env::temp_dir().join(format!("narration-test-oversize-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            10, // expected only 10 bytes — server sends 1000
+            "irrelevant",
+            "קובץ בדיקה",
+            |_, _| {},
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml model::tests`
+Expected: FAIL — compile error, `download_and_verify_core` doesn't exist yet.
+
+- [ ] **Step 3: Write the extracted functions**
+
+Add near the top of `src-tauri/src/model.rs` (after the existing `use` lines), and add `use std::path::Path;` to the existing imports:
+
+```rust
+/// Core download+verify: no Tauri dependency, so it's directly unit-testable.
+/// Downloads `url` to `dest_path` via an atomic temp-file-then-rename, verifying
+/// the result matches `expected_size`/`expected_sha256` before the rename.
+/// `component_label` is the Hebrew noun used in error messages (e.g. "המודל",
+/// "מנוע ההקראה") so one function serves whisper models, the `uv` binary, and
+/// Piper voice files with wording that fits each. `on_progress(downloaded, total)`
+/// fires as bytes arrive — callers decide what to do with that (Tauri event, or
+/// nothing, in tests).
+async fn download_and_verify_core(
+    url: &str,
+    dest_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    component_label: &str,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<(), String> {
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!("יצירת התיקייה עבור {component_label} נכשלה. בדוק שיש מקום פנוי בדיסק והרשאות כתיבה. (פרטים טכניים: {e})")
+        })?;
+    }
+
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await.map_err(|e| {
+        format!("הורדת {component_label} נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
+    })?;
+
+    let total_size = response.content_length().unwrap_or(expected_size);
+
+    // Append ".tmp" to the whole filename rather than replacing the extension
+    // (the original whisper-only code did `.with_extension("bin.tmp")`, which
+    // silently assumed a `.bin` destination — this version works for `.bin`,
+    // `.zip`, `.onnx`, or anything else).
+    let mut tmp_name = dest_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+
+    let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+        format!("יצירת קובץ זמני עבור {component_label} נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})")
+    })?;
+
+    let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
+    let mut stream = response.bytes_stream();
+    let max_size = expected_size + (expected_size / 10); // 10% tolerance, same as the original
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            format!("ההורדה של {component_label} נקטעה — בדוק את החיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
+        })?;
+
+        downloaded += chunk.len() as u64;
+
+        if downloaded > max_size {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(format!(
+                "ההורדה של {component_label} חרגה מהגודל הצפוי — בוטלה לצורך אבטחה. נסה שוב."
+            ));
+        }
+
+        hasher.update(&chunk);
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| format!("כתיבה לדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
+
+        on_progress(downloaded, total_size);
+    }
+
+    let hash_result = format!("{:x}", hasher.finalize());
+    if hash_result != expected_sha256 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(format!(
+            "{component_label} שהורד לא תואם לחתימה הצפויה (ייתכן שההורדה נפגמה). הקובץ נמחק. נסה להוריד שוב. (צפוי: {}…, התקבל: {}…)",
+            &expected_sha256[..expected_sha256.len().min(16)],
+            &hash_result[..16]
+        ));
+    }
+
+    std::fs::rename(&tmp_path, dest_path).map_err(|e| {
+        format!("שמירת {component_label} הסופית נכשלה. נסה למחוק ולהוריד מחדש. (פרטים טכניים: {e})")
+    })?;
+
+    Ok(())
+}
+
+/// Tauri-aware wrapper around `download_and_verify_core`: same behavior, but
+/// emits `progress_event` (`{downloaded, total, progress}`) via `app.emit` as
+/// bytes arrive, for the settings UI's progress bar.
+pub async fn download_and_verify(
+    app: &AppHandle,
+    url: &str,
+    dest_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    progress_event: &str,
+    component_label: &str,
+) -> Result<(), String> {
+    let app = app.clone();
+    let event = progress_event.to_string();
+    download_and_verify_core(
+        url,
+        dest_path,
+        expected_size,
+        expected_sha256,
+        component_label,
+        move |downloaded, total| {
+            let progress = (downloaded as f64 / total as f64 * 100.0) as u32;
+            let _ = app.emit(
+                &event,
+                serde_json::json!({ "downloaded": downloaded, "total": total, "progress": progress }),
+            );
+        },
+    )
+    .await
+}
+```
+
+- [ ] **Step 4: Rewrite `download_model` to call the new helper**
+
+Replace the body of `download_model` (the existing manual download loop, roughly lines 161-222 of the current file) with a call to the new helper, keeping everything else (the "already downloaded" short-circuit, the OS notification on success) unchanged:
+
+```rust
+pub async fn download_model(app: AppHandle, model_name: String) -> Result<String, String> {
+    validate_model_name(&model_name)?;
+
+    let (_, url, expected_size, expected_hash) = MODELS
+        .iter()
+        .find(|(name, _, _, _)| *name == model_name)
+        .ok_or_else(|| format!("Unknown model: {}", model_name))?;
+
+    let model_path = get_model_path(&model_name);
+
+    // Check if already downloaded and valid — no notification, the user already has it.
+    if model_path.exists() {
+        let metadata = std::fs::metadata(&model_path).map_err(|e| e.to_string())?;
+        if metadata.len() == *expected_size {
+            return Ok(model_path.to_string_lossy().to_string());
+        }
+    }
+
+    let label_for_notification = friendly_model_label(&model_name);
+
+    download_and_verify(
+        &app,
+        url,
+        &model_path,
+        *expected_size,
+        expected_hash,
+        "model-download-progress",
+        "המודל",
+    )
+    .await?;
+
+    // OS-level notification — most users start a download and switch to other work
+    // while it runs in the background. Surfacing completion via the system tray
+    // means they don't need to keep the settings panel open.
+    let _ = app
+        .notification()
+        .builder()
+        .title("הכתבה בעברית — מודל מוכן")
+        .body(format!("המודל \"{}\" הורד בהצלחה והוא מוכן לשימוש.", label_for_notification))
+        .show();
+
+    Ok(model_path.to_string_lossy().to_string())
+}
+```
+
+⚠️ **Behavior note for the reviewer/implementer:** error message wording changes slightly (e.g. "יצירת תיקיית המודלים נכשלה" becomes the generalized "יצירת התיקייה עבור המודל נכשלה") since the helper is now shared across whisper models, `uv`, and voice files. This is a deliberate, expected diff, not a regression — the *behavior* (create dir, download, verify size+hash, atomic rename, clean up temp files on any failure) is identical to before.
+
+- [ ] **Step 5: Run the model tests**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml model::tests`
+Expected: `test result: ok. 3 passed`
+
+- [ ] **Step 6: Manually smoke-test that whisper downloads still work**
+
+There is no pre-existing automated coverage for `download_model` to regress against (this file had zero tests before this task), so this is a manual check: run the app in dev mode (`npm run tauri dev`), open Settings, download the smallest whisper model (`tiny`), and confirm it completes and the model becomes usable — exactly as before this refactor.
+
+- [ ] **Step 7: Run clippy and commit**
+
+```bash
+cargo clippy --manifest-path src-tauri/Cargo.toml
+git add src-tauri/src/model.rs
+git commit -m "refactor(model): extract download_and_verify_core for reuse by narration provisioning"
+```
+
+### Task 2: Download and extract `uv`
+
+**Files:**
+- Create: `src-tauri/src/narration_provision.rs`
+- Modify: `src-tauri/src/lib.rs` (add `mod narration_provision;`)
+- Test: `src-tauri/src/narration_provision.rs` (inline)
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src-tauri/src/narration_provision.rs`:
+
+```rust
+//! Provisions the Hebrew narration engine: an isolated `uv`-managed Python
+//! venv running `piper-tts`, plus the Hebrew voice model. Everything lives
+//! under app-data — no system Python, no PATH/registry changes (spec §2.4).
+//! Windows-only (spec's macOS non-goal).
+
+use std::path::{Path, PathBuf};
+use tauri::AppHandle;
+
+/// Pinned `uv` release facts (verified 2026-07-31 against
+/// github.com/astral-sh/uv/releases — see Chunk 3 plan header for the exact
+/// verification). Bump deliberately, not casually — a new `uv` version changes
+/// the exact bytes this hash-checks.
+const UV_VERSION: &str = "0.12.1";
+const UV_DOWNLOAD_URL: &str =
+    "https://github.com/astral-sh/uv/releases/download/0.12.1/uv-x86_64-pc-windows-msvc.zip";
+const UV_ZIP_SIZE: u64 = 19_073_343;
+const UV_ZIP_SHA256: &str = "8fcb0cb46e1229065e344758980924e569bef5882ef45f46fada8fb24e06b74a";
+
+pub fn get_narration_dir() -> PathBuf {
+    let app_data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    app_data.join("hebrew-dictation").join("narration")
+}
+
+fn get_uv_zip_path() -> PathBuf {
+    get_narration_dir().join(format!("uv-{UV_VERSION}.zip"))
+}
+
+pub fn get_uv_exe_path() -> PathBuf {
+    get_narration_dir().join("uv").join("uv.exe")
+}
+
+pub fn is_uv_ready() -> bool {
+    get_uv_exe_path().exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narration_dir_is_under_app_data_narration_subfolder() {
+        let dir = get_narration_dir();
+        assert!(dir.ends_with(Path::new("hebrew-dictation").join("narration")));
+    }
+
+    #[test]
+    fn uv_exe_path_is_under_narration_dir_uv_subfolder() {
+        let path = get_uv_exe_path();
+        assert!(path.ends_with(Path::new("uv").join("uv.exe")));
+        assert!(path.starts_with(get_narration_dir()));
+    }
+
+    #[test]
+    fn is_uv_ready_false_when_not_downloaded() {
+        // get_uv_exe_path() points at a real app-data location that won't
+        // exist on a fresh test-running machine/CI runner.
+        if !get_uv_exe_path().exists() {
+            assert!(!is_uv_ready());
+        }
+    }
+}
+```
+
+- [ ] **Step 2: Run tests to verify they pass**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_provision::tests`
+Expected: `test result: ok. 3 passed`
+
+- [ ] **Step 3: Declare the module**
+
+In `src-tauri/src/lib.rs`, add `mod narration_provision;` alongside the other `mod` declarations.
+
+- [ ] **Step 4: Write the failing test for download+extract**
+
+Add to `narration_provision.rs`, above the `#[cfg(test)]` block:
+
+```rust
+/// Download `uv` (hash-verified via `model::download_and_verify`) and extract
+/// `uv.exe` from the zip via Windows' built-in `Expand-Archive` — no new Rust
+/// zip-handling dependency for a one-time provisioning step.
+pub async fn ensure_uv_available(app: &AppHandle) -> Result<PathBuf, String> {
+    let uv_exe = get_uv_exe_path();
+    if uv_exe.exists() {
+        return Ok(uv_exe);
+    }
+
+    let zip_path = get_uv_zip_path();
+    crate::model::download_and_verify(
+        app,
+        UV_DOWNLOAD_URL,
+        &zip_path,
+        UV_ZIP_SIZE,
+        UV_ZIP_SHA256,
+        "narration-engine-download-progress",
+        "מנוע ההקראה",
+    )
+    .await?;
+
+    let extract_dir = get_narration_dir().join("uv");
+    std::fs::create_dir_all(&extract_dir)
+        .map_err(|e| format!("יצירת תיקיית החילוץ נכשלה. (פרטים טכניים: {e})"))?;
+
+    // Blocking Command::status() runs via spawn_blocking rather than directly
+    // in this async fn, so it doesn't occupy a tokio worker thread for the
+    // duration of Expand-Archive (a few seconds for a ~19MB zip).
+    let zip_path_for_blocking = zip_path.clone();
+    let extract_dir_for_blocking = extract_dir.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+                    zip_path_for_blocking.display(),
+                    extract_dir_for_blocking.display()
+                ),
+            ])
+            .status()
+    })
+    .await
+    .map_err(|e| format!("חילוץ מנוע ההקראה נכשל להתחיל (task panic). (פרטים טכניים: {e})"))?
+    .map_err(|e| format!("חילוץ מנוע ההקראה נכשל להתחיל. (פרטים טכניים: {e})"))?;
+
+    let _ = std::fs::remove_file(&zip_path);
+
+    if !status.success() {
+        return Err("חילוץ מנוע ההקראה נכשל.".to_string());
+    }
+
+    if !uv_exe.exists() {
+        return Err(format!(
+            "חילוץ מנוע ההקראה הושלם אך uv.exe לא נמצא בנתיב הצפוי ({}).",
+            uv_exe.display()
+        ));
+    }
+
+    Ok(uv_exe)
+}
+```
+
+Add this test inside `mod tests`:
+
+```rust
+    #[tokio::test]
+    #[ignore = "hits the real network (GitHub) and takes ~10s — run explicitly with `cargo test -- --ignored`, not part of the default suite"]
+    async fn ensure_uv_available_downloads_and_extracts_a_working_exe() {
+        // This is the one real integration point in this task: confirms the
+        // pinned URL/size/hash in this file are still correct AND that
+        // Expand-Archive actually produces a runnable uv.exe. Needs a real
+        // AppHandle, which a plain #[test] can't construct — this is more
+        // naturally exercised as part of the mock-Tauri-app integration test
+        // in Chunk 6. Left here as a marker with #[ignore] so it's discoverable,
+        // not deleted — implement its body in Chunk 6 alongside the other
+        // #[ignore]-gated real-environment tests.
+    }
+```
+
+- [ ] **Step 5: Run tests**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_provision::tests`
+Expected: `test result: ok. 3 passed; 1 ignored`
+
+- [ ] **Step 6: Manually verify the real download once**
+
+This is the one place in Chunk 3 that's worth actually running by hand before moving on, since it's the load-bearing "does our pinned hash still match reality" check:
+
+```powershell
+# From a scratch Rust test harness, or temporarily call ensure_uv_available
+# from a throwaway #[tokio::main] in src-tauri/src/main.rs and run it once.
+```
+Confirm: the zip downloads, the hash check passes (if it fails, the pinned `UV_ZIP_SHA256`/`UV_ZIP_SIZE` constants are wrong — re-verify against the GitHub release, don't just relax the check), extraction produces a real `uv.exe`, and running `uv.exe --version` from a terminal prints `uv 0.12.1`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src-tauri/src/narration_provision.rs src-tauri/src/lib.rs
+git commit -m "feat(narration): download and extract uv (hash-verified)"
+```
+
+### Task 3: Provisioning state machine — venv, `piper-tts`, voice, atomic marker
+
+**Files:**
+- Modify: `src-tauri/src/narration_provision.rs`
+- Modify: `src-tauri/Cargo.toml` (add the `process` feature to the `tokio` dependency)
+- Test: `src-tauri/src/narration_provision.rs` (inline)
+
+⚠️ **Dependency gap found during review:** `tokio`'s `process` feature is **not** currently enabled anywhere in this crate's dependency graph (verified via `cargo tree -e features -i tokio`: the resolved feature set is `default, fs, io-util, libc, macros, mio, net, rt, rt-multi-thread, socket2, sync, time, tokio-macros, windows-sys` — no `process`). Every existing use of `tokio` in this codebase is `tokio::fs`; `tokio::process::Command` (used below) would be the first use of that feature and **will not compile without it.**
+
+- [ ] **Step 0: Enable the `tokio` `process` feature**
+
+In `src-tauri/Cargo.toml`, change:
+```toml
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros"] }
+```
+to:
+```toml
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros", "process"] }
+```
+
+⚠️ **Before starting this task, open the Chunk 1 spike findings doc and replace every `<PIPER_TTS_VERSION>`, `<VOICE_URL>`, `<VOICE_SIZE>`, `<VOICE_SHA256>`, `<NAKDIMON_...>` placeholder below with the real values it recorded.** The code below is written with clearly-marked placeholders rather than fabricated numbers, precisely so this can't be implemented on guessed values.
+
+- [ ] **Step 1: Write the state-machine tests**
+
+Add to `narration_provision.rs`, above the `#[cfg(test)]` block:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+/// Written LAST, only after every provisioning step below succeeds. Its mere
+/// existence (plus a version match) IS the "provisioned" signal — there is no
+/// separate flag file or partial-state tracking. A provisioning run that dies
+/// halfway leaves this marker absent, so the state machine naturally reports
+/// "not provisioned" and a retry is just running provisioning again — every
+/// step (uv download, venv creation, pip install, voice download) is already
+/// idempotent/overwrite-safe on its own (spec §2.4).
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct NarrationEngineMarker {
+    marker_version: u32,
+    piper_tts_version: String,
+    voice_name: String,
+}
+
+const MARKER_VERSION: u32 = 1;
+const PIPER_TTS_VERSION: &str = "<PIPER_TTS_VERSION>"; // from spike findings, e.g. "1.6.0"
+const VOICE_NAME: &str = "he_IL-saspeech-medium";
+const VOICE_URL: &str = "<VOICE_URL>"; // from spike findings
+const VOICE_SIZE: u64 = 0; // <VOICE_SIZE> from spike findings
+const VOICE_SHA256: &str = "<VOICE_SHA256>"; // from spike findings
+
+fn get_venv_dir() -> PathBuf {
+    get_narration_dir().join("venv")
+}
+
+fn get_voice_path() -> PathBuf {
+    get_narration_dir().join(format!("{VOICE_NAME}.onnx"))
+}
+
+fn get_marker_path() -> PathBuf {
+    get_narration_dir().join("engine.json")
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NarrationEngineState {
+    NotProvisioned,
+    Ready,
+}
+
+/// Pure given the marker file's contents — reads it if present, returns
+/// `NotProvisioned` on any absence/parse-failure/version-mismatch rather than
+/// panicking or treating a corrupt marker as ready.
+pub fn narration_engine_state() -> NarrationEngineState {
+    let marker_path = get_marker_path();
+    let Ok(contents) = std::fs::read_to_string(&marker_path) else {
+        return NarrationEngineState::NotProvisioned;
+    };
+    match serde_json::from_str::<NarrationEngineMarker>(&contents) {
+        Ok(marker) if marker.marker_version == MARKER_VERSION => NarrationEngineState::Ready,
+        _ => NarrationEngineState::NotProvisioned,
+    }
+}
+```
+
+Add these tests inside `mod tests`:
+
+```rust
+    /// ⚠️ Safety-critical test helper — read this comment before touching it.
+    /// `narration_engine_state()`/`get_marker_path()` read the REAL, non-sandboxed
+    /// app-data path (via `dirs::data_dir()`), which isn't overridable per-call
+    /// without threading a base-dir parameter through every function in this
+    /// file (not done now — would touch every path-returning fn for a test-only
+    /// concern). On a machine where narration has already been provisioned for
+    /// real (including during later manual-verify steps in this same plan),
+    /// a naive "delete marker, run test, delete marker again" helper would
+    /// PERMANENTLY DESTROY the real completion marker, forcing an unwanted
+    /// ~200-300MB re-provision on next app launch. This helper snapshots
+    /// whatever was there first and restores it — including on panic, via a
+    /// `Drop` guard — so it is safe to run against a machine with a real,
+    /// already-provisioned engine.
+    struct MarkerGuard {
+        path: PathBuf,
+        original: Option<String>,
+    }
+
+    impl MarkerGuard {
+        fn new() -> Self {
+            let path = get_marker_path();
+            let original = std::fs::read_to_string(&path).ok();
+            let _ = std::fs::remove_file(&path);
+            Self { path, original }
+        }
+    }
+
+    impl Drop for MarkerGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(contents) => {
+                    let _ = std::fs::write(&self.path, contents);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    fn with_temp_app_data<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = MarkerGuard::new(); // restores the real marker on drop, even on panic
+        f()
+    }
+
+    #[test]
+    fn state_is_not_provisioned_when_marker_absent() {
+        with_temp_app_data(|| {
+            assert_eq!(narration_engine_state(), NarrationEngineState::NotProvisioned);
+        });
+    }
+
+    #[test]
+    fn state_is_ready_when_marker_present_and_version_matches() {
+        with_temp_app_data(|| {
+            std::fs::create_dir_all(get_narration_dir()).unwrap();
+            let marker = NarrationEngineMarker {
+                marker_version: MARKER_VERSION,
+                piper_tts_version: "1.6.0".to_string(),
+                voice_name: VOICE_NAME.to_string(),
+            };
+            std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap()).unwrap();
+
+            assert_eq!(narration_engine_state(), NarrationEngineState::Ready);
+        });
+    }
+
+    #[test]
+    fn state_is_not_provisioned_when_marker_version_is_stale() {
+        with_temp_app_data(|| {
+            std::fs::create_dir_all(get_narration_dir()).unwrap();
+            std::fs::write(get_marker_path(), r#"{"marker_version":0,"piper_tts_version":"old","voice_name":"old"}"#).unwrap();
+
+            assert_eq!(narration_engine_state(), NarrationEngineState::NotProvisioned);
+        });
+    }
+
+    #[test]
+    fn state_is_not_provisioned_when_marker_is_corrupt_json() {
+        with_temp_app_data(|| {
+            std::fs::create_dir_all(get_narration_dir()).unwrap();
+            std::fs::write(get_marker_path(), "not valid json{{{").unwrap();
+
+            assert_eq!(narration_engine_state(), NarrationEngineState::NotProvisioned);
+        });
+    }
+```
+
+- [ ] **Step 2: Run tests to verify they pass**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_provision::tests -- --test-threads=1`
+Expected: `test result: ok. 7 passed; 1 ignored` (4 new + 3 from Task 2, run single-threaded since these tests share one real file path — see the `with_temp_app_data` comment above).
+
+⚠️ Note the `-- --test-threads=1` flag: without it, `state_is_ready_when_marker_present_and_version_matches` and the other marker tests can race on the same real `engine.json` path and flake. Chunk 4/5 do not need this flag (they don't share mutable file state across tests).
+
+- [ ] **Step 3: Write the full provisioning function**
+
+Add to `narration_provision.rs`:
+
+```rust
+/// Run the full provisioning flow if not already done: `uv` → venv →
+/// `piper-tts` → voice → atomic marker. Safe to call every time the user
+/// opens the narration screen — returns immediately if already `Ready`.
+pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
+    if narration_engine_state() == NarrationEngineState::Ready {
+        return Ok(());
+    }
+
+    // Guards against shipping with an un-filled-in placeholder from Task 3's
+    // header warning — fails loudly and immediately instead of a confusing
+    // HTTP/URL error partway through provisioning.
+    if PIPER_TTS_VERSION.starts_with('<') || VOICE_URL.starts_with('<') || VOICE_SHA256.starts_with('<') {
+        return Err(
+            "מנוע ההקראה עדיין לא מוגדר בקוד (קבועים מסוג placeholder לא הוחלפו בערכי ה-spike האמיתיים)."
+                .to_string(),
+        );
+    }
+
+    let uv_exe = ensure_uv_available(app).await?;
+    let narration_dir = get_narration_dir();
+    let venv_dir = get_venv_dir();
+
+    // Every uv invocation below is scoped to app-data via these env vars —
+    // this is what keeps Python fully invisible to the rest of the system
+    // (spec's guiding principle: no PATH changes, no registry entries).
+    // Verified real UV_* variables (astral.sh reference docs, checked while
+    // planning this chunk) — do not add/remove without re-checking there.
+    let uv_env = [
+        ("UV_PYTHON_INSTALL_DIR", narration_dir.join("python").to_string_lossy().to_string()),
+        ("UV_PYTHON_INSTALL_BIN", "0".to_string()),
+        ("UV_PYTHON_NO_REGISTRY", "1".to_string()),
+        ("UV_CACHE_DIR", narration_dir.join("uv-cache").to_string_lossy().to_string()),
+    ];
+
+    let venv_status = tokio::process::Command::new(&uv_exe)
+        .args(["venv", &venv_dir.to_string_lossy(), "--python", "3.11"])
+        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
+        .status()
+        .await
+        .map_err(|e| format!("יצירת סביבת ההרצה למנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))?;
+    if !venv_status.success() {
+        return Err("יצירת סביבת ההרצה למנוע ההקראה נכשלה.".to_string());
+    }
+
+    let pip_status = tokio::process::Command::new(&uv_exe)
+        .args([
+            "pip",
+            "install",
+            "--python",
+            &venv_dir.to_string_lossy(),
+            &format!("piper-tts=={PIPER_TTS_VERSION}"),
+        ])
+        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
+        .status()
+        .await
+        .map_err(|e| format!("התקנת מנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))?;
+    if !pip_status.success() {
+        return Err("התקנת מנוע ההקראה נכשלה.".to_string());
+    }
+
+    // Same "already downloaded and valid" short-circuit `download_model` has
+    // for whisper models (spec §2.4: "resume/overwrite per the existing
+    // model.rs semantics") — without it, a retry after a late failure (e.g.
+    // the marker-write below failing right after a successful ~63MB voice
+    // download) would re-download the voice for no reason.
+    let voice_path = get_voice_path();
+    let voice_already_valid = voice_path.exists()
+        && std::fs::metadata(&voice_path).map(|m| m.len() == VOICE_SIZE).unwrap_or(false);
+    if !voice_already_valid {
+        crate::model::download_and_verify(
+            app,
+            VOICE_URL,
+            &voice_path,
+            VOICE_SIZE,
+            VOICE_SHA256,
+            "narration-voice-download-progress",
+            "קול ההקראה",
+        )
+        .await?;
+    }
+
+    // Written LAST and only here — this is the atomic completion marker.
+    let marker = NarrationEngineMarker {
+        marker_version: MARKER_VERSION,
+        piper_tts_version: PIPER_TTS_VERSION.to_string(),
+        voice_name: VOICE_NAME.to_string(),
+    };
+    std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap())
+        .map_err(|e| format!("סימון סיום ההתקנה נכשל. (פרטים טכניים: {e})"))?;
+
+    Ok(())
+}
+```
+
+- [ ] **Step 4: Run clippy**
+
+Run: `cargo clippy --manifest-path src-tauri/Cargo.toml`
+Expected: no new warnings from `narration_provision.rs` or `model.rs`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src-tauri/src/narration_provision.rs src-tauri/Cargo.toml src-tauri/Cargo.lock
+git commit -m "feat(narration): provisioning state machine (uv, venv, piper-tts, voice, atomic marker)"
+```
+
+**Note for whoever implements Chunk 5 (Tauri commands):** `provision_narration_engine` has no progress-stage granularity beyond the three download-progress events it already emits (`narration-engine-download-progress` for `uv`, `narration-voice-download-progress` for the voice) — venv creation and `pip install` are opaque waits from the frontend's perspective. If that turns out to be a bad UX in practice (uv+Python+piper-tts install can take real wall-clock time), add stage-change events then; don't build it speculatively now (YAGNI).
+
+---
