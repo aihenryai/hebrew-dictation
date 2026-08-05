@@ -856,7 +856,7 @@ Expected: `test result: ok. 3 passed`
 
 - [ ] **Step 3: Declare the module**
 
-In `src-tauri/src/lib.rs`, add `mod narration_provision;` alongside the other `mod` declarations.
+In `src-tauri/src/lib.rs`, add `#[cfg(target_os = "windows")] mod narration_provision;` alongside the other `mod` declarations — matching the exact precedent of `#[cfg(target_os = "windows")] mod system_audio;` already in this file, since this whole feature is Windows-only for Phase 1 (spec's macOS non-goal). Gating the module (not just individual items inside it) means a hypothetical non-Windows build never compiles-and-silently-ships PowerShell/`uv`-provisioning code it can't use.
 
 - [ ] **Step 4: Write the failing test for download+extract**
 
@@ -1011,12 +1011,12 @@ struct NarrationEngineMarker {
 
 const MARKER_VERSION: u32 = 1;
 const PIPER_TTS_VERSION: &str = "<PIPER_TTS_VERSION>"; // from spike findings, e.g. "1.6.0"
-const VOICE_NAME: &str = "he_IL-saspeech-medium";
+pub const VOICE_NAME: &str = "he_IL-saspeech-medium"; // pub: Chunk 4's narration_process.rs needs this too
 const VOICE_URL: &str = "<VOICE_URL>"; // from spike findings
 const VOICE_SIZE: u64 = 0; // <VOICE_SIZE> from spike findings
 const VOICE_SHA256: &str = "<VOICE_SHA256>"; // from spike findings
 
-fn get_venv_dir() -> PathBuf {
+pub fn get_venv_dir() -> PathBuf { // pub: Chunk 4's narration_process.rs needs the venv's python.exe path
     get_narration_dir().join("venv")
 }
 
@@ -1259,5 +1259,293 @@ git commit -m "feat(narration): provisioning state machine (uv, venv, piper-tts,
 ```
 
 **Note for whoever implements Chunk 5 (Tauri commands):** `provision_narration_engine` has no progress-stage granularity beyond the three download-progress events it already emits (`narration-engine-download-progress` for `uv`, `narration-voice-download-progress` for the voice) — venv creation and `pip install` are opaque waits from the frontend's perspective. If that turns out to be a bad UX in practice (uv+Python+piper-tts install can take real wall-clock time), add stage-change events then; don't build it speculatively now (YAGNI).
+
+---
+
+## Chunk 4: Sidecar lifecycle — spawn, adopt, restart, teardown
+
+**Files:**
+- Create: `src-tauri/src/narration_process.rs`
+- Modify: `src-tauri/src/lib.rs` (add `mod narration_process;`)
+- Modify: `src-tauri/Cargo.toml` (add `win32job` under the existing `[target.'cfg(windows)'.dependencies]` section)
+- Test: `src-tauri/src/narration_process.rs` (inline)
+
+**Design decision worth stating explicitly (not hand-waved):** the spec's §3 teardown design lists three layers — (a) `kill_on_drop` for clean exit, (b) a Windows Job Object for crash cases, (c) "a startup stale-sidecar sweep... probe the configured port and reclaim/kill any leftover sidecar." Layer (c) as literally worded ("kill") would require finding a process by the port it's bound to on Windows, which means either parsing `netstat`/`GetExtendedTcpTable` output or calling undocumented multi-step Win32 APIs — fragile, and disproportionate given layers (a) and (b) already cover the overwhelming majority of real cases (a true orphan only survives if the app died in the narrow window before the Job Object assignment completed). **This chunk folds layer (c) into `spawn_or_adopt`** instead of a separate kill-focused function: before spawning anything, it health-checks the configured port first. If something is already answering there and looks like a healthy piper sidecar, it's **reused as-is** (an `Unmanaged` variant — no wasted duplicate process, no confusing bind-conflict error) rather than killed and replaced. If nothing answers, a fresh `Owned` sidecar is spawned normally. This satisfies the spec's actual goal (no orphan pile-up, no wasted resources, no confusing errors) without the fragile kill-by-port-lookup implementation.
+
+⚠️ **Self-corrected while planning Chunk 5 — `spawn_or_adopt` is called LAZILY ONLY, never from `setup()`.** An earlier draft of this note said it should also run "once at app startup," but that's wrong: `spawn_or_adopt` spawns a fresh sidecar whenever health-check finds nothing — calling it unconditionally at app launch would eagerly start the Python process on every app start even if the user never opens the narration screen that session, directly contradicting spec §3's idle-policy tradeoff ("the sidecar stays warm from screen-entry until app exit," i.e. lazy spawn, not eager). The fix costs nothing: an orphan from a previous session is still sitting there listening whenever the user *eventually* does open the narration screen — `spawn_or_adopt`'s health-check-first logic adopts it exactly the same way whether it's checked at app launch or at first real use. So Chunk 5 calls `spawn_or_adopt` **only** from the narration-screen entry point / `generate_narration`, never from `setup()`.
+
+**Verified facts used below:**
+- `win32job` crate 2.0.3 (MIT/Apache-2.0, targets `x86_64-pc-windows-msvc` — matches this feature's Windows-only scope): `Job::create_with_limit_info(&ExtendedLimitInfo) -> Result<Job, JobError>`, `Job::assign_process(&self, proc_handle: isize) -> Result<(), JobError>`, `ExtendedLimitInfo::new()`, `ExtendedLimitInfo::limit_kill_on_job_close(&mut self) -> &mut Self` — confirmed against the crate's docs.rs pages for `Job` and `ExtendedLimitInfo` while planning this chunk.
+- `tokio::process::Child::raw_handle(&self) -> Option<RawHandle>` exists on Windows (confirmed against tokio's docs) — `RawHandle` casts to `isize` for `win32job`'s `assign_process`.
+- `tokio`'s `net` feature (used for a TCP-level check, though ultimately not needed — see below) is already enabled per Chunk 3's `cargo tree` finding; no new tokio feature needed for this chunk beyond Chunk 3's `process` addition.
+
+### Task 1: `NarrationServer` — spawn, adopt, restart, teardown
+
+- [ ] **Step 1: Find where modules are declared and add the dependency**
+
+Run: `grep -n "^mod " src-tauri/src/lib.rs` to find the insertion point for `mod narration_process;` (alphabetical, after `mod narration_provision;`).
+
+In `src-tauri/Cargo.toml`, add `win32job` to the existing Windows-only section:
+```toml
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
+win32job = "2.0"
+```
+
+- [ ] **Step 2: Write the failing test**
+
+Create `src-tauri/src/narration_process.rs`:
+
+```rust
+//! Sidecar process lifecycle for the narration engine: spawn, health-check,
+//! Windows Job Object crash-protection, and guaranteed teardown. Talks to
+//! `narration.rs` for the HTTP protocol itself (build_server_args, health_check,
+//! synthesize) — this module only owns "is there a running process and is it
+//! healthy," never the HTTP details. Windows-only (spec's macOS non-goal);
+//! Chunk 5's Tauri commands provide the non-Windows stub.
+
+use crate::narration::{build_server_args, health_check, synthesize, NarrationError};
+use crate::narration_provision::{get_venv_dir, VOICE_NAME};
+use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+use win32job::{ExtendedLimitInfo, Job};
+
+/// A running (or adopted) narration sidecar. `Owned` means this process spawned
+/// it and holds the handles needed to kill it; `Unmanaged` means it was already
+/// healthily running when we checked (our own earlier orphan, or a startup
+/// race) — usable, but this instance has no way to kill it. See this file's
+/// module-level design note in the plan for why "adopt, don't kill-by-port" is
+/// the deliberate v1 choice.
+pub enum NarrationServer {
+    Owned {
+        child: tokio::process::Child,
+        #[cfg(target_os = "windows")]
+        _job: Job,
+        port: u16,
+        client: reqwest::Client,
+    },
+    Unmanaged {
+        port: u16,
+        client: reqwest::Client,
+    },
+}
+
+impl NarrationServer {
+    fn port(&self) -> u16 {
+        match self {
+            NarrationServer::Owned { port, .. } => *port,
+            NarrationServer::Unmanaged { port, .. } => *port,
+        }
+    }
+
+    fn client(&self) -> &reqwest::Client {
+        match self {
+            NarrationServer::Owned { client, .. } => client,
+            NarrationServer::Unmanaged { client, .. } => client,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn_fake_healthy_sidecar() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let response = tiny_http::Response::from_data(b"{}".to_vec());
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+}
+```
+
+- [ ] **Step 3: Run to confirm it compiles (no behavior yet)**
+
+Run: `cargo build --manifest-path src-tauri/Cargo.toml`
+Expected: builds clean (this step has no logic yet, just the enum/struct shape — confirming the types and imports are right before adding behavior).
+
+- [ ] **Step 4: Write the failing test for `spawn_or_adopt`'s adoption path**
+
+Add to the `tests` module:
+
+```rust
+    #[tokio::test]
+    async fn spawn_or_adopt_returns_unmanaged_when_port_already_healthy() {
+        let port = spawn_fake_healthy_sidecar();
+
+        let result = NarrationServer::spawn_or_adopt(port).await;
+
+        assert!(
+            matches!(result, Ok(NarrationServer::Unmanaged { .. })),
+            "expected Unmanaged (adopted) when something already answers /info, got {:?}",
+            result.is_ok()
+        );
+    }
+```
+
+(This is the one meaningfully unit-testable path in this task — the `Owned` spawn path needs a real, provisioned `python.exe` + `piper-tts`, which doesn't exist on a bare checkout. That path is `#[ignore]`-gated and implemented in Chunk 6 alongside the other real-environment integration tests, per spec §7.)
+
+- [ ] **Step 5: Run to verify it fails**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_process::tests::spawn_or_adopt_returns_unmanaged_when_port_already_healthy`
+Expected: FAIL — `spawn_or_adopt` doesn't exist yet.
+
+- [ ] **Step 6: Implement `spawn_or_adopt`, `synthesize_with_restart`, `shutdown`**
+
+Add to `narration_process.rs`, above the `#[cfg(test)]` block:
+
+```rust
+impl NarrationServer {
+    /// Get a running sidecar on `port`: adopt an already-healthy one if
+    /// present, otherwise spawn a fresh one and wait for it to become ready.
+    /// This is both the normal "start the engine" path AND the spec's
+    /// startup stale-sweep (see this chunk's module design note) — there is
+    /// deliberately no separate sweep function.
+    pub async fn spawn_or_adopt(port: u16) -> Result<Self, String> {
+        let client = reqwest::Client::new();
+        if health_check(&client, port).await {
+            return Ok(NarrationServer::Unmanaged { port, client });
+        }
+        Self::spawn_owned(port, client).await
+    }
+
+    async fn spawn_owned(port: u16, client: reqwest::Client) -> Result<Self, String> {
+        let venv_dir = get_venv_dir();
+        let python_exe = venv_dir.join("Scripts").join("python.exe");
+        if !python_exe.exists() {
+            return Err(format!(
+                "מנוע ההקראה לא מותקן כראוי — python.exe לא נמצא בנתיב הצפוי ({}).",
+                python_exe.display()
+            ));
+        }
+
+        let args = build_server_args(VOICE_NAME, "127.0.0.1", port);
+
+        let mut child = tokio::process::Command::new(&python_exe)
+            .args(&args)
+            .kill_on_drop(true) // layer (a): clean-exit teardown
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("הפעלת מנוע ההקראה נכשלה. (פרטים טכניים: {e})"))?;
+
+        // Layer (b): Windows Job Object with KILL_ON_JOB_CLOSE — the sidecar
+        // dies with this app even on a hard crash/taskkill, not just clean exit.
+        #[cfg(target_os = "windows")]
+        let job = {
+            let mut info = ExtendedLimitInfo::new();
+            info.limit_kill_on_job_close();
+            let job = Job::create_with_limit_info(&info)
+                .map_err(|e| format!("יצירת הגנת תהליך למנוע ההקראה נכשלה. (פרטים טכניים: {e})"))?;
+            let handle = child
+                .raw_handle()
+                .ok_or_else(|| "מנוע ההקראה יצא מיד לאחר ההפעלה.".to_string())?
+                as isize;
+            job.assign_process(handle)
+                .map_err(|e| format!("שיוך מנוע ההקראה להגנת התהליך נכשל. (פרטים טכניים: {e})"))?;
+            job
+        };
+
+        // Poll /info until healthy or a 30s ceiling — piper1-gpl's cold start
+        // (loading the ONNX voice + Nakdimon) is real wall-clock time, measured
+        // in Chunk 1's spike findings, not instant.
+        let mut attempts = 0;
+        loop {
+            if health_check(&client, port).await {
+                break;
+            }
+            attempts += 1;
+            if attempts > 60 {
+                let _ = child.kill().await;
+                return Err("מנוע ההקראה לא הגיב בזמן סביר. נסה שוב.".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        Ok(NarrationServer::Owned {
+            child,
+            #[cfg(target_os = "windows")]
+            _job: job,
+            port,
+            client,
+        })
+    }
+
+    /// Generate audio for `text`. On failure, restart once (spec §5: "restart
+    /// once; if still failing, clear error") — but **only when `self` is
+    /// `Owned`**. This is a deliberate, reviewer-caught correction: an earlier
+    /// draft of this function tried to respawn on `Unmanaged` failure too, but
+    /// that's unsafe — we don't know whether the adopted process is actually
+    /// dead or just returned one flaky response, `shutdown()` is a no-op for
+    /// `Unmanaged` (nothing to kill), and `spawn_owned`'s readiness poll can't
+    /// tell "my new process answered" from "the still-alive adopted process
+    /// answered" on the same port. Concretely: if the adopted process is
+    /// actually still alive, this would silently create a second process
+    /// bound to the same port, orphan the tracked (new, likely dead-on-bind)
+    /// one, and leave the real orphan permanently untracked — the exact
+    /// failure mode `spawn_or_adopt`'s adopt-instead-of-kill design was
+    /// trying to avoid. So an `Unmanaged` failure just surfaces the error;
+    /// the caller (Chunk 5) can re-run `spawn_or_adopt` from scratch, which
+    /// correctly re-probes health before deciding anything.
+    pub async fn synthesize_with_restart(&mut self, text: &str) -> Result<Vec<u8>, NarrationError> {
+        if let Ok(bytes) = synthesize(self.client(), self.port(), text).await {
+            return Ok(bytes);
+        }
+
+        let port = match self {
+            NarrationServer::Owned { port, .. } => *port,
+            NarrationServer::Unmanaged { .. } => {
+                return Err(NarrationError::Unreachable(
+                    "מנוע ההקראה (שאומץ מריצה קודמת) לא הגיב. נסה שוב.".to_string(),
+                ));
+            }
+        };
+
+        self.shutdown().await;
+
+        match Self::spawn_owned(port, reqwest::Client::new()).await {
+            Ok(restarted) => {
+                let result = synthesize(restarted.client(), restarted.port(), text).await;
+                *self = restarted;
+                result
+            }
+            Err(e) => Err(NarrationError::Unreachable(e)),
+        }
+    }
+
+    /// Kill the process if we own it. A no-op for `Unmanaged` — there is
+    /// nothing to kill (see this chunk's module design note).
+    pub async fn shutdown(&mut self) {
+        if let NarrationServer::Owned { child, .. } = self {
+            let _ = child.kill().await;
+        }
+    }
+}
+```
+
+- [ ] **Step 7: Run tests**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_process::tests`
+Expected: `test result: ok. 1 passed`
+
+- [ ] **Step 8: Declare the module and run clippy**
+
+In `src-tauri/src/lib.rs`, add `#[cfg(target_os = "windows")] mod narration_process;` — same reasoning and precedent as `narration_provision`'s gate (Chunk 3). ⚠️ **This means Chunk 5's `AppState` field holding `NarrationServer` must also be `#[cfg(target_os = "windows")]`-gated**, exactly like the existing `#[cfg(target_os = "windows")] system_recorder: Mutex<system_audio::SystemAudioRecorder>` field — and Chunk 5's Tauri commands need the same `#[cfg(not(target_os = "windows"))]` stub pattern already used elsewhere in `lib.rs` (the "Non-Windows stub so the command is always registrable in `generate_handler!`" comment near line 863) so the commands still compile and register on non-Windows, just returning a clear "not available on this platform" error instead of touching `NarrationServer` at all.
+
+Run: `cargo clippy --manifest-path src-tauri/Cargo.toml`
+Expected: no new warnings from `narration_process.rs`.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src-tauri/src/narration_process.rs src-tauri/src/lib.rs src-tauri/Cargo.toml src-tauri/Cargo.lock
+git commit -m "feat(narration): sidecar lifecycle — spawn/adopt, restart-once, layered teardown"
+```
 
 ---
