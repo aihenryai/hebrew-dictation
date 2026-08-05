@@ -25,6 +25,7 @@ The app's established rule is **"the user never installs or configures anything 
 - **Voice selection UI.** Factually moot in v1: exactly **one** Hebrew Piper voice exists today (§2.2) — there is nothing to select between.
 - **Long-text chunking / streaming playback.** Piper is a local synchronous engine, not a rate-limited API — long input is slower, not blocked. Deferred until real usage demands it (YAGNI).
 - Any cloud/remote backend. Phase 1 is 100% local after the one-time download.
+- **macOS.** Gap identified during planning, not addressed above: the guaranteed-teardown mechanism (§3) uses a Windows Job Object, which has no macOS equivalent. Phase 1 is **Windows-only**, gated with `#[cfg(target_os = "windows")]` the same way `system_audio.rs`'s `System`/`Call` recording modes already are (see `HANDOFF.md` v2.12.0: "System/Call Windows-only") — this repo already has an accepted precedent for a Windows-only feature tier, so this isn't a new category of limitation. A macOS narration story (different teardown primitive, e.g. a process group + SIGKILL) is future work, not scoped here.
 
 ---
 
