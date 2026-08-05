@@ -1783,3 +1783,413 @@ git commit -m "feat(narration): AppState wiring + 3 Tauri commands (ensure_narra
 ```
 
 ---
+
+## Chunk 6: `save_narration_wav` command + the "הקראה" screen
+
+**Files:**
+- Modify: `src-tauri/src/lib.rs` (one more small command, `save_narration_wav`)
+- Modify: `src/App.tsx` (new `"narration"` `AppView`, the screen itself, a home-screen entry point)
+
+**Note on testing in this chunk:** this codebase's frontend has **zero automated test infrastructure** (confirmed: no `vitest`/`jest`, no `"test"` script in `package.json` — verification is `tsc && vite build` type-checking plus manual `npm run tauri dev` runs, per every existing release in `HANDOFF.md`). This chunk follows that same convention rather than introducing a new testing pattern unilaterally.
+
+### Task 1: `save_narration_wav` command
+
+Discovered while planning this chunk: the app's existing export pattern (`export_history`, `export_srt`) does the save-dialog + file-write entirely on the **Rust side** — the frontend never handles a save dialog itself, it just calls a command that returns the saved path. `generate_narration` (Chunk 5) returns raw `Vec<u8>` for **playback only**; saving needs its own command following the same established pattern, not a browser-side download hack.
+
+**Files:**
+- Modify: `src-tauri/src/lib.rs`
+
+- [ ] **Step 1: Write the command**
+
+Add near `export_history`/`export_srt` in `lib.rs`:
+
+```rust
+/// Save previously-generated narration WAV bytes to a user-chosen path.
+/// Mirrors `export_history`/`export_srt`'s save-dialog pattern exactly — the
+/// frontend already has the bytes (from `generate_narration`) and passes them
+/// back here rather than the backend re-generating or caching them.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn save_narration_wav(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bytes: Vec<u8>,
+    suggested_name: Option<String>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    if bytes.is_empty() {
+        return Err("אין הקלטה לשמירה — צור הקראה קודם.".to_string());
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M");
+    let default_name = match suggested_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(name) => format!("{}.wav", sanitize_filename(name)),
+        None => format!("hebrew-dictation-narration_{}.wav", timestamp),
+    };
+
+    let restore_on_top = state.settings.lock().map(|s| s.always_on_top).unwrap_or(true);
+    set_main_on_top(&app, false);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+    app.dialog()
+        .file()
+        .set_title("שמור את ההקראה כ-WAV")
+        .set_file_name(&default_name)
+        .add_filter("קובץ WAV", &["wav"])
+        .save_file(move |result| {
+            let path = result.and_then(|fp| fp.into_path().ok());
+            let _ = tx.send(path);
+        });
+
+    let path = rx.await.map_err(|_| "דיאלוג השמירה נסגר ללא תגובה".to_string());
+    set_main_on_top(&app, restore_on_top);
+    let path = path?;
+    let path = match path {
+        Some(p) => p,
+        None => return Err("השמירה בוטלה".to_string()),
+    };
+
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("שמירת קובץ ה-WAV נכשלה. (פרטים טכניים: {e})"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn save_narration_wav(
+    _app: AppHandle,
+    _state: State<'_, AppState>,
+    _bytes: Vec<u8>,
+    _suggested_name: Option<String>,
+) -> Result<String, String> {
+    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+}
+```
+
+- [ ] **Step 2: Register the command**
+
+Add `save_narration_wav,` to the `generate_handler!` list, right after `generate_narration,`.
+
+- [ ] **Step 3: Build and run existing tests**
+
+Run: `cargo build --manifest-path src-tauri/Cargo.toml`
+Expected: clean build.
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Expected: all pass (no new tests in this task — it's a thin, established-pattern wrapper; the existing `export_history`/`export_srt` have no dedicated unit tests either, for the same reason — the interesting logic is the save-dialog interaction, which isn't unit-testable without a real window).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src-tauri/src/lib.rs
+git commit -m "feat(narration): save_narration_wav command (mirrors export_history/export_srt)"
+```
+
+### Task 2: the "הקראה" screen
+
+**Files:**
+- Modify: `src/App.tsx`
+- Modify: `src/App.css` (new rules for the screen; none of the classes this task uses exist yet — verified by grep while planning)
+
+- [ ] **Step 1: Extend the `AppView` type and add state**
+
+Change (line ~50):
+```typescript
+type AppView = "main" | "settings" | "onboarding" | "batch";
+```
+to:
+```typescript
+type AppView = "main" | "settings" | "onboarding" | "batch" | "narration";
+```
+
+Near the other `useState` declarations (alongside the batch-view state), add:
+```typescript
+  const [narrationText, setNarrationText] = useState("");
+  const [narrationGenerating, setNarrationGenerating] = useState(false);
+  const [narrationAudioUrl, setNarrationAudioUrl] = useState<string | null>(null);
+  const [narrationBytes, setNarrationBytes] = useState<Uint8Array | null>(null);
+  const [narrationReady, setNarrationReady] = useState(false);
+  const [narrationProvisioning, setNarrationProvisioning] = useState(false);
+  const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
+```
+
+- [ ] **Step 2: Add the progress-event listener**
+
+In the existing `useEffect` that sets up `listen("model-download-progress", ...)` (~line 749), add two more listeners for the events `narration_provision.rs` (Chunk 3) already emits — `narration-engine-download-progress` (for the `uv` download) and `narration-voice-download-progress` (for the voice download). Both drive the same progress bar; the screen doesn't need to distinguish which sub-step is running, just show forward motion:
+
+```typescript
+    const unlistenNarrationEngineProgress = listen("narration-engine-download-progress", (event) => {
+      const data = event.payload as { progress: number };
+      setNarrationProvisionProgress(data.progress);
+    });
+    const unlistenNarrationVoiceProgress = listen("narration-voice-download-progress", (event) => {
+      const data = event.payload as { progress: number };
+      setNarrationProvisionProgress(data.progress);
+    });
+```
+
+Add both to the cleanup return alongside the existing `unlistenProgress()` etc.
+
+- [ ] **Step 3: Write the provisioning-check and generate/save handlers**
+
+Add near the other `useCallback` handlers (alongside `exportHistory`):
+
+```typescript
+  const checkNarrationReady = useCallback(async () => {
+    try {
+      const ready = await invoke<boolean>("ensure_narration_ready");
+      setNarrationReady(ready);
+    } catch {
+      setNarrationReady(false);
+    }
+  }, []);
+
+  const runNarrationSetup = useCallback(async () => {
+    setNarrationProvisioning(true);
+    setNarrationProvisionProgress(0);
+    setError("");
+    try {
+      await invoke("narration_setup");
+      await checkNarrationReady();
+    } catch (e) {
+      setError(`התקנת מנוע ההקראה נכשלה: ${e}`);
+    } finally {
+      setNarrationProvisioning(false);
+    }
+  }, [checkNarrationReady]);
+
+  const generateNarration = useCallback(async () => {
+    if (!narrationText.trim()) return;
+    setNarrationGenerating(true);
+    setError("");
+    try {
+      const bytes = await invoke<number[]>("generate_narration", { text: narrationText });
+      const arr = new Uint8Array(bytes);
+      const blob = new Blob([arr], { type: "audio/wav" });
+      const newUrl = URL.createObjectURL(blob);
+      // Only release the PREVIOUS clip once the new one is confirmed created —
+      // revoking eagerly at function entry (an earlier draft of this plan did
+      // that) meant a failed second generate left `narrationAudioUrl` state
+      // pointing at an already-revoked URL, silently breaking playback of the
+      // still-valid first clip. Revoke-after-success avoids that entirely.
+      if (narrationAudioUrl) {
+        URL.revokeObjectURL(narrationAudioUrl);
+      }
+      setNarrationBytes(arr);
+      setNarrationAudioUrl(newUrl);
+    } catch (e) {
+      setError(`יצירת ההקראה נכשלה: ${e}`);
+    } finally {
+      setNarrationGenerating(false);
+    }
+  }, [narrationText, narrationAudioUrl]);
+
+  const saveNarrationWav = useCallback(async () => {
+    if (!narrationBytes) return;
+    try {
+      const suggested = narrationText.trim().slice(0, 40) || undefined;
+      await invoke<string>("save_narration_wav", {
+        bytes: Array.from(narrationBytes),
+        suggested_name: suggested,
+      });
+    } catch (e) {
+      setError(`שמירת הקובץ נכשלה: ${e}`);
+    }
+  }, [narrationBytes, narrationText]);
+```
+
+⚠️ `Array.from(narrationBytes)` re-expands the `Uint8Array` back into a plain JS number array to cross Tauri IPC as `Vec<u8>` — the same "plain JSON array, not base64" overhead already flagged and deliberately accepted in Chunk 5 (spec §5's known tradeoff). Consistent, not a new cost.
+
+✅ **Reuses the app's existing global `error`/`setError` state** (the same one rendered at `App.tsx:2418`/`2894` as `{error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}`) rather than a separate `narrationError` state — matches this codebase's one established error-display convention instead of inventing a second, non-dismissible one.
+
+- [ ] **Step 4: Call `checkNarrationReady` when the screen opens**
+
+Add a `useEffect` that runs it when `view` becomes `"narration"`:
+
+```typescript
+  useEffect(() => {
+    if (view === "narration") {
+      checkNarrationReady();
+    }
+  }, [view, checkNarrationReady]);
+```
+
+- [ ] **Step 5: Add the home-screen entry point**
+
+✅ **Insertion point corrected while planning** (an earlier draft of this step pointed at a "📁 + ⚙ button row" that doesn't actually exist — verified against the real layout). The real home screen has a `.main-header-modes` container (`App.tsx` ~line 2805) holding one full-width mode button (`btn-batch-nav btn-mode-combined`, "הקלט ותמלל / תמלול קבצי שמע"); `⚙` settings lives in a separate `.controls` row next to the record button. `.main-header-modes` is a flex row with `gap: 0.4rem`, and its child `.btn-batch-nav` has `flex: 1` — designed to hold more than one mode entry side by side. Add a second button there:
+
+```typescript
+        <div className="main-header-modes">
+          <button
+            className="btn-batch-nav btn-mode-combined"
+            onClick={() => setView("batch")}
+            aria-label="הקלט ותמלל או תמלול קבצי שמע"
+          >הקלט ותמלל / תמלול קבצי שמע</button>
+          <button
+            className="btn-batch-nav btn-mode-narration"
+            onClick={() => setView("narration")}
+            aria-label="הקראה"
+          >🔊 הקראה</button>
+        </div>
+```
+
+(The existing `btn-mode-combined` button's JSX is shown above **for placement context only** — do not duplicate it; just add the new `btn-mode-narration` button as its sibling inside the existing `.main-header-modes` div.)
+
+- [ ] **Step 6: Add the screen's render block**
+
+Add a new `if (view === "narration") { ... }` block, reusing the batch view's real header structure/classes (`container batch-view`, `.batch-view-header`, `.btn-back`, `.batch-view-title`, `.btn-settings-labeled` — all confirmed to exist in `App.css` and to be layout-generic, not batch-specific, while planning this chunk):
+
+```typescript
+  if (view === "narration") {
+    return (
+      <main className="container batch-view" dir="rtl">
+        <div className="batch-view-header">
+          <button className="btn-back" onClick={() => setView("main")} aria-label="חזור">חזור</button>
+          <h2 className="batch-view-title">הקראה</h2>
+          <button
+            className="btn-settings-labeled"
+            style={{ marginInlineStart: "auto" }}
+            onClick={() => { setSettingsReturn("narration"); setView("settings"); }}
+            title="הגדרות"
+            aria-label="הגדרות"
+          >
+            <span className="gear" aria-hidden="true">⚙</span> הגדרות
+          </button>
+        </div>
+
+        {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
+
+        {!narrationReady && !narrationProvisioning && (
+          <div className="narration-setup-prompt">
+            <p>מנוע ההקראה עדיין לא הותקן. ההתקנה חד-פעמית, פועלת ברקע, ולא דורשת ידע טכני.</p>
+            <button className="btn-primary" onClick={runNarrationSetup}>התקן מנוע הקראה</button>
+          </div>
+        )}
+
+        {narrationProvisioning && (
+          <div className="narration-setup-progress">
+            <p>מתקין מנוע הקראה… ({narrationProvisionProgress}%)</p>
+            <progress value={narrationProvisionProgress} max={100} />
+          </div>
+        )}
+
+        {narrationReady && (
+          <>
+            <textarea
+              className="narration-textarea"
+              value={narrationText}
+              onChange={(e) => setNarrationText(e.target.value)}
+              placeholder="הדביקו או הקלידו טקסט בעברית להקראה…"
+              dir="rtl"
+              rows={8}
+            />
+            <button
+              className="btn-primary"
+              onClick={generateNarration}
+              disabled={!narrationText.trim() || narrationGenerating}
+            >
+              {narrationGenerating ? "יוצר…" : "צור קול"}
+            </button>
+
+            {narrationAudioUrl && (
+              <div className="narration-result">
+                <audio controls src={narrationAudioUrl} />
+                <button className="btn-secondary" onClick={saveNarrationWav}>שמור כ-WAV</button>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    );
+  }
+```
+
+✅ Verified while planning: `settingsReturn` is declared `useState<AppView>("main")` (line 357) — the same `AppView` type Step 1 extends, so `setSettingsReturn("narration")` above is correct as written, no cast needed.
+
+- [ ] **Step 7: Add the CSS rules**
+
+None of `.narration-setup-prompt`, `.narration-setup-progress`, `.narration-textarea`, `.narration-result`, `.btn-mode-narration` exist yet (verified by grep while planning — Step 6/5's markup above is otherwise unstyled). Add to `src/App.css`, near the existing `.batch-view`/`.btn-mode-combined` rules:
+
+```css
+/* Home-screen mode entry, sibling of .btn-mode-combined — distinct accent so
+   the two entries read as separate actions (same pattern as the teal/gold
+   split already used for other mode pairs in this file). */
+.btn-mode-narration {
+  color: #f0abfc;
+  border-color: #f0abfc55;
+  white-space: normal;
+  line-height: 1.25;
+}
+.btn-mode-narration:hover { background: #3b1332; border-color: #f0abfc; }
+
+.narration-setup-prompt {
+  text-align: center;
+  padding: 2rem 1rem;
+}
+.narration-setup-prompt p {
+  color: #a0a8c0;
+  margin-bottom: 1rem;
+}
+
+.narration-setup-progress {
+  text-align: center;
+  padding: 1.5rem 1rem;
+}
+.narration-setup-progress progress {
+  width: 100%;
+  height: 8px;
+}
+
+.narration-textarea {
+  width: 100%;
+  min-height: 160px;
+  background: #0f1729;
+  border: 1px solid #2a3a5e;
+  border-radius: 8px;
+  color: #e5e9f5;
+  font-family: inherit;
+  font-size: 0.95rem;
+  padding: 0.75rem;
+  resize: vertical;
+  margin-bottom: 0.75rem;
+}
+
+.narration-result {
+  margin-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.narration-result audio {
+  width: 100%;
+}
+```
+
+Exact colors/spacing are a starting point, not pixel-locked — Step 9's manual verify is where real visual review happens; adjust there if something looks off against the rest of the app's dark theme, but don't skip adding *some* real rules (the point of this step is "not literally unstyled," not "final design").
+
+- [ ] **Step 8: Type-check and build**
+
+Run: `npx tsc --noEmit` (from the repo root, or via `npm run build`'s first step)
+Expected: no type errors.
+
+Run: `npm run build`
+Expected: clean `vite build`.
+
+- [ ] **Step 9: Manual verify in dev mode**
+
+Run: `npm run tauri dev`
+
+Happy path: home → 🔊 הקראה (new button, next to the existing mode button) → (if not provisioned) התקן מנוע הקראה → watch the progress bar move → once ready, type a Hebrew sentence → צור קול → confirm audio plays inline → שמור כ-WAV → confirm a real file lands on disk and plays in another player.
+
+**Failure-path check (regression test for the revoke-order bug fixed in Task 2 Step 3):** generate once successfully and confirm the clip plays → without reloading, force a second `generate_narration` call to fail (e.g. temporarily stop the sidecar process externally, or set an invalid `narration_port` in settings.json to break the connection) → confirm the error banner shows AND the first clip is still present and still plays. If the first clip silently stops working after the second call fails, the bug is back.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/App.tsx src/App.css
+git commit -m "feat(narration): הקראה screen — provisioning flow, generate, play, save"
+```
+
+---
