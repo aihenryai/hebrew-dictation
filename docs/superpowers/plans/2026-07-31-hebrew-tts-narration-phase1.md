@@ -455,6 +455,8 @@ git commit -m "feat(narration): async HTTP client for the piper sidecar (synthes
 
 ## Chunk 3: Provisioning — `uv`, the venv, `piper-tts`, and the voice
 
+⚠️ **Amended by Chunk 7 (read there before implementing):** `download_and_verify`'s and `ensure_uv_available`'s signatures below were retroactively made generic over `R: tauri::Runtime` (instead of the concrete `AppHandle`) so Chunk 7 could write a real integration test against `tauri::test::mock_app()`. The code shown in this chunk already reflects that — if you're implementing chunks in order this is transparent and needs no extra action, this note exists only so someone reading Chunk 3 in isolation isn't confused about why a plain `AppHandle` param looks generic.
+
 **Platform scope:** this whole feature is `#[cfg(target_os = "windows")]`-gated, matching the existing precedent of `system_audio.rs`'s Windows-only `System`/`Call` recording modes (spec's macOS non-goal, added during planning). Every new file in this chunk assumes Windows.
 
 **Verified facts used below** (checked live during planning, not guessed):
@@ -676,8 +678,17 @@ async fn download_and_verify_core(
 /// Tauri-aware wrapper around `download_and_verify_core`: same behavior, but
 /// emits `progress_event` (`{downloaded, total, progress}`) via `app.emit` as
 /// bytes arrive, for the settings UI's progress bar.
-pub async fn download_and_verify(
-    app: &AppHandle,
+///
+/// Generic over `R: tauri::Runtime` (not the concrete `AppHandle` = `AppHandle<Wry>`)
+/// **specifically so this is testable against `tauri::test::mock_app()`'s
+/// `AppHandle<MockRuntime>`** — see Chunk 7, which needs this to write a real
+/// integration test without a live window. Every existing call site
+/// (`download_model`, and `narration_provision::ensure_uv_available` below)
+/// keeps calling this with a plain `&AppHandle` unchanged — `R` is inferred as
+/// `Wry` automatically there, so this is not a breaking change to any
+/// `#[tauri::command]` entry point.
+pub async fn download_and_verify<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     url: &str,
     dest_path: &Path,
     expected_size: u64,
@@ -866,7 +877,12 @@ Add to `narration_provision.rs`, above the `#[cfg(test)]` block:
 /// Download `uv` (hash-verified via `model::download_and_verify`) and extract
 /// `uv.exe` from the zip via Windows' built-in `Expand-Archive` — no new Rust
 /// zip-handling dependency for a one-time provisioning step.
-pub async fn ensure_uv_available(app: &AppHandle) -> Result<PathBuf, String> {
+///
+/// Generic over `R: tauri::Runtime` for the same reason as `download_and_verify`
+/// above (testability against `tauri::test::mock_app()` — see Chunk 7). Its own
+/// caller, `provision_narration_engine`, keeps taking a plain `&AppHandle`
+/// unchanged; `R` is inferred as `Wry` there automatically.
+pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
     let uv_exe = get_uv_exe_path();
     if uv_exe.exists() {
         return Ok(uv_exe);
@@ -938,8 +954,8 @@ Add this test inside `mod tests`:
         // Expand-Archive actually produces a runnable uv.exe. Needs a real
         // AppHandle, which a plain #[test] can't construct — this is more
         // naturally exercised as part of the mock-Tauri-app integration test
-        // in Chunk 6. Left here as a marker with #[ignore] so it's discoverable,
-        // not deleted — implement its body in Chunk 6 alongside the other
+        // in Chunk 7. Left here as a marker with #[ignore] so it's discoverable,
+        // not deleted — implement its body in Chunk 7 alongside the other
         // #[ignore]-gated real-environment tests.
     }
 ```
@@ -1389,7 +1405,7 @@ Add to the `tests` module:
     }
 ```
 
-(This is the one meaningfully unit-testable path in this task — the `Owned` spawn path needs a real, provisioned `python.exe` + `piper-tts`, which doesn't exist on a bare checkout. That path is `#[ignore]`-gated and implemented in Chunk 6 alongside the other real-environment integration tests, per spec §7.)
+(This is the one meaningfully unit-testable path in this task — the `Owned` spawn path needs a real, provisioned `python.exe` + `piper-tts`, which doesn't exist on a bare checkout. That path is `#[ignore]`-gated and implemented in Chunk 7 alongside the other real-environment integration tests, per spec §7.)
 
 - [ ] **Step 5: Run to verify it fails**
 
@@ -2193,3 +2209,190 @@ git commit -m "feat(narration): הקראה screen — provisioning flow, generat
 ```
 
 ---
+
+## Chunk 7: Real-environment integration test, manual verify, and handoff
+
+Everything through Chunk 6 is provable with mocks or type-checking alone. This chunk is where the plan touches reality: a real `uv`+`piper-tts` install, a real Hebrew voice, and a real human.
+
+**Files:**
+- Modify: `src-tauri/src/narration_provision.rs` (implement the `#[ignore]`-gated `ensure_uv_available_downloads_and_extracts_a_working_exe` marker left in Chunk 3, Task 2)
+- Modify: `src-tauri/src/narration_process.rs` (new `#[ignore]`-gated integration test covering the real `Owned` spawn path Chunk 4 deferred)
+- Modify: `HANDOFF.md` (repo root — mark Phase 1 shipped, once it actually is — see Task 3's framing)
+
+### Task 1: Implement the deferred `#[ignore]`-gated integration tests
+
+**Files:**
+- Modify: `src-tauri/src/narration_provision.rs`
+- Modify: `src-tauri/src/narration_process.rs`
+- Modify: `src-tauri/Cargo.toml` (add Tauri's `test` feature, dev-dependency only)
+
+⚠️ **Prerequisite: Chunk 1's spike must have already produced a GO verdict, and Chunk 3 Task 3's placeholder constants (`PIPER_TTS_VERSION`, `VOICE_URL`, `VOICE_SIZE`, `VOICE_SHA256`) must already be filled in with real values** — these tests hit the real network and a real (provisioned, in this test run) engine; they cannot pass against placeholders.
+
+⚠️ **Dependency gap found during review (same category as Chunk 3's `tokio` `process` feature):** `tauri::test::mock_app()` — needed by Step 1 below to get a usable `AppHandle` without a live window — is gated behind Tauri's `test` cargo feature, which isn't enabled anywhere in this crate. Without it, `tauri::test` doesn't resolve at all.
+
+- [ ] **Step 0: Enable Tauri's `test` feature (dev-only)**
+
+In `src-tauri/Cargo.toml`, add a **dev-dependency** entry for `tauri` alongside the existing regular dependency (Cargo unions the features for `cargo test` builds only — the real app binary, built via plain `cargo build`, never sees the `test` feature or pays for it):
+
+```toml
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+```
+
+- [ ] **Step 1: Implement `ensure_uv_available_downloads_and_extracts_a_working_exe`**
+
+In `src-tauri/src/narration_provision.rs`, replace the empty marker body from Chunk 3 Task 2 Step 4:
+
+```rust
+    #[tokio::test]
+    #[ignore = "hits the real network (GitHub) and takes ~10s — run explicitly with `cargo test -- --ignored`, not part of the default suite"]
+    async fn ensure_uv_available_downloads_and_extracts_a_working_exe() {
+        // Real Tauri AppHandle needed for the download-progress `app.emit` calls
+        // inside `download_and_verify` — `tauri::test::mock_app()` gives us one
+        // without a real window, which is exactly what a plain #[test] couldn't do.
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+
+        // Clean slate: if a previous run left uv.exe in place, this test would
+        // trivially "pass" via the early-return in ensure_uv_available without
+        // exercising the download+extract path at all.
+        let uv_exe = get_uv_exe_path();
+        let _ = std::fs::remove_file(&uv_exe);
+
+        let result = ensure_uv_available(handle).await;
+        assert!(result.is_ok(), "expected uv to download and extract, got {result:?}");
+
+        let returned_path = result.unwrap();
+        assert!(returned_path.exists());
+
+        // The real proof: is this actually a working uv.exe, not just a file
+        // that happens to exist at the right path?
+        let version_output = std::process::Command::new(&returned_path)
+            .arg("--version")
+            .output()
+            .expect("uv.exe should be directly executable");
+        let version_text = String::from_utf8_lossy(&version_output.stdout);
+        assert!(
+            version_text.contains(UV_VERSION),
+            "expected `uv --version` to report {UV_VERSION}, got: {version_text}"
+        );
+    }
+```
+
+- [ ] **Step 2: Run it**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_provision::tests::ensure_uv_available_downloads_and_extracts_a_working_exe -- --ignored`
+Expected: PASS (takes real wall-clock time — a real ~19MB download + extraction).
+
+If this fails on the hash check specifically: the pinned `UV_ZIP_SIZE`/`UV_ZIP_SHA256` constants in `narration_provision.rs` no longer match what's actually at the pinned URL (astral-sh published a same-numbered re-release, which shouldn't happen for a tagged GitHub release, but verify at `https://github.com/astral-sh/uv/releases/tag/0.12.1` before assuming the test is wrong rather than the pin).
+
+- [ ] **Step 3: Write the real sidecar integration test**
+
+In `src-tauri/src/narration_process.rs`, first extend the existing top-of-file import (Chunk 4) — `looks_like_valid_wav` is used below but wasn't imported:
+
+```rust
+use crate::narration::{build_server_args, health_check, looks_like_valid_wav, synthesize, NarrationError};
+```
+
+Then add this test (this is new — there was no marker left for it, unlike Step 1):
+
+```rust
+    #[tokio::test]
+    #[ignore = "needs a fully provisioned narration engine (real uv+venv+piper-tts+voice) — run explicitly after Chunk 3's provisioning has completed for real, e.g. via the app's own settings UI once built, or by calling provision_narration_engine directly in a throwaway harness"]
+    async fn spawn_owned_produces_a_working_sidecar_and_shutdown_kills_it() {
+        let port = 15758; // a port unlikely to collide with anything else in the test run
+
+        let mut server = NarrationServer::spawn_owned(port, reqwest::Client::new())
+            .await
+            .expect("spawn_owned should succeed against a real provisioned engine");
+
+        // Real proof #1: it actually generates audio, not just "the process started."
+        let audio = synthesize(server.client(), server.port(), "בדיקה")
+            .await
+            .expect("a live, healthy sidecar should synthesize real audio");
+        assert!(looks_like_valid_wav(&audio));
+
+        // Real proof #2: shutdown() (layer (a), the clean-exit path) actually
+        // kills the process — this is the orphan-prevention claim from spec
+        // §3/§8, verified behaviorally rather than assumed from reading the
+        // win32job/tokio API docs. Re-probing the port after shutdown should
+        // find nothing there.
+        server.shutdown().await;
+
+        // Give the OS a moment to actually tear down the listening socket —
+        // kill() returning doesn't guarantee the port is instantly free.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let client = reqwest::Client::new();
+        assert!(
+            !health_check(&client, port).await,
+            "the sidecar should be unreachable after shutdown() — if this fails, \
+             either kill_on_drop or the explicit kill() call isn't actually \
+             terminating the process, which is the exact orphan bug this whole \
+             chunk exists to catch"
+        );
+    }
+```
+
+- [ ] **Step 4: Run it**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml narration_process::tests::spawn_owned_produces_a_working_sidecar_and_shutdown_kills_it -- --ignored`
+Expected: PASS.
+
+- [ ] **Step 5: Run clippy and commit**
+
+```bash
+cargo clippy --manifest-path src-tauri/Cargo.toml
+git add src-tauri/src/narration_provision.rs src-tauri/src/narration_process.rs src-tauri/Cargo.toml src-tauri/Cargo.lock
+git commit -m "test(narration): implement deferred #[ignore]-gated real-environment integration tests"
+```
+
+### Task 2: Manual verify with Henry (cannot be automated)
+
+This is the acceptance gate spec §8 describes ("Henry manually verifies real output on his machine before this ships") plus the crash-orphan check that genuinely can't be written as a clean automated test (it requires force-killing the app's own process from outside itself and observing system state afterward).
+
+- [ ] **Step 1: Fresh-install walkthrough**
+
+On a clean checkout (or after deleting the `narration` folder under app-data to simulate a fresh user): run the app, open הקראה, click "התקן מנוע הקראה," confirm the progress bar moves and eventually completes without the app hanging or crashing.
+
+- [ ] **Step 2: Generate + quality spot-check**
+
+Type a real paragraph of Hebrew text (not just Chunk 1's test sentences — something Henry would actually want narrated), generate, listen. This is the final human judgment call the spike's ASR round-trip (Chunk 1) was a proxy for — confirm it actually sounds acceptable for real use, not just "words are recognizable."
+
+- [ ] **Step 3: Save + verify the file**
+
+Click "שמור כ-WAV," confirm a real, playable WAV lands wherever the save dialog was pointed, and that it plays correctly in an external player (not just the app's own `<audio>` element).
+
+- [ ] **Step 4: The crash-orphan check (layer (b), Job Object)**
+
+With the sidecar running (after at least one generate), open Task Manager, confirm a `python.exe` process is present, then **force-kill the main "הכתבה בעברית" app process directly from Task Manager** (not a graceful close — this is specifically testing the crash case `kill_on_drop` does NOT cover). After a few seconds, confirm the `python.exe` process is **also gone** from Task Manager. If it's still there, the Job Object assignment isn't actually working as intended (Chunk 4's `assign_process` call, or the timing of when it runs relative to when the sidecar becomes reachable) and needs debugging before this ships — this is the single most safety-critical behavioral claim in the whole feature (spec §3/§8's orphan-prevention guarantee) and the automated test in Task 1 only proves the *clean*-exit path, not this one.
+
+- [ ] **Step 5: Report back**
+
+Report pass/fail on all four steps. Any failure here blocks calling Phase 1 done, regardless of how clean the automated test suite is — per this plan's own repeated framing (spec §6.4: "An ASR round-trip proves intelligibility, not pleasantness").
+
+### Task 3: Update `HANDOFF.md` (only once Tasks 1-2 actually pass)
+
+**Files:**
+- Modify: `HANDOFF.md` (the top-level one, `docs/superpowers/HANDOFF.md` if it lives there, or wherever this repo's existing HANDOFF.md is — same file referenced throughout the spec's backlog item #4)
+
+- [ ] **Step 1: Add a shipped entry**
+
+Following this repo's own established HANDOFF convention (see the existing "✅ v2.12.1 — FULLY RELEASED" and "✅ RESOLVED" entries for the exact tone/format), add a new dated section: what shipped (local Hebrew narration via `he_IL-saspeech-medium`, one-time in-app provisioning via `uv`, no cloud, no voice cloning), what's explicitly still Phase 2 (VoxCPM2 cloning, still blocked on Henry's RunPod setup — unchanged from before this plan started), and a pointer back to this plan file + the spec for implementation detail.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add HANDOFF.md
+git commit -m "docs(handoff): Hebrew narration Phase 1 shipped — local generic-voice TTS via piper1-gpl"
+```
+
+---
+
+## Execution handoff
+
+Plan complete: 7 chunks, all reviewed and approved (Chunk 1 spike-gated; Chunks 2-6 each caught and fixed at least one real issue during review — a missing Cargo feature, a data-loss-risking test helper, a same-port double-spawn/orphan bug, incorrect non-Windows cfg gating, a wrong UI insertion point, missing CSS, and a blob-URL revoke-ordering bug). Saved to `docs/superpowers/plans/2026-07-31-hebrew-tts-narration-phase1.md`.
+
+**Per the spec's own §6 rollout order, Chunk 1 is a hard gate: do not start Chunk 2 until Chunk 1's Step 5 verdict is GO.**
+
+Ready to execute? This harness has subagent support, so per the writing-plans skill, execution should use **superpowers:subagent-driven-development** (fresh subagent per task, two-stage review) rather than running everything in this session.
