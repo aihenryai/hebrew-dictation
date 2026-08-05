@@ -1549,3 +1549,237 @@ git commit -m "feat(narration): sidecar lifecycle — spawn/adopt, restart-once,
 ```
 
 ---
+
+## Chunk 5: Tauri commands, `AppState`, and settings wiring
+
+This is where the previous chunks' pieces (HTTP client, provisioning, sidecar lifecycle) become something the frontend can actually call.
+
+**Files:**
+- Modify: `src-tauri/src/settings.rs` (new `narration_port` field, 6 touch points)
+- Modify: `src-tauri/src/lib.rs` (`AppState` field, 3 new commands + non-Windows stubs, `invoke_handler!` registration)
+
+### Task 1: `narration_port` setting
+
+**Files:**
+- Modify: `src-tauri/src/settings.rs`
+- Test: `src-tauri/src/settings.rs` (extends the existing `#[cfg(test)] mod merge_tests`)
+
+Mirrors `local_api_port` exactly (same shape: opt-in, no dedicated frontend UI yet, default via a named function, preserved across saves in `merge_frontend_update`).
+
+- [ ] **Step 1: Write the failing test**
+
+Find the existing `#[cfg(test)] mod merge_tests` block in `src-tauri/src/settings.rs` (starts ~line 481) and add:
+
+```rust
+    #[test]
+    fn merge_frontend_update_preserves_narration_port_not_exposed_to_frontend_yet() {
+        let current = AppSettings { narration_port: 9999, ..AppSettings::default() };
+        let incoming = AppSettings::default(); // simulates a frontend payload that never carries this field
+        let merged = current.merge_frontend_update(incoming);
+        assert_eq!(merged.narration_port, 9999, "a settings-json-only field must survive a frontend save");
+    }
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml settings::merge_tests::merge_frontend_update_preserves_narration_port_not_exposed_to_frontend_yet`
+Expected: FAIL — compile error, `narration_port` isn't a field on `AppSettings` yet.
+
+- [ ] **Step 3: Add the field at all 6 touch points**
+
+In `src-tauri/src/settings.rs`:
+
+1. `AppSettings` struct, right after `local_api_port` (~line 138):
+```rust
+    /// Port for the narration engine's local HTTP sidecar. Default 5758
+    /// (sibling of the local API's 5757). No dedicated frontend UI in Phase 1.
+    #[serde(default = "default_narration_port")]
+    pub narration_port: u16,
+```
+
+2. `RedactedSettings` struct, right after `local_api_port` (~line 171):
+```rust
+    pub narration_port: u16,
+```
+
+3. `AppSettings::redacted()`, right after the `local_api_port` line (~line 204):
+```rust
+            narration_port: self.narration_port,
+```
+
+4. New default function, right after `default_local_api_port` (~line 247):
+```rust
+fn default_narration_port() -> u16 {
+    5758
+}
+```
+
+5. `impl Default for AppSettings`, right after `local_api_port` (~line 279):
+```rust
+            narration_port: default_narration_port(),
+```
+
+6. `merge_frontend_update`, right after the `local_api_port` line (~line 476) — same "not exposed to the frontend yet" preservation as its sibling:
+```rust
+        incoming.narration_port = self.narration_port;
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml settings::`
+Expected: all pass, including the new test and every pre-existing `settings.rs` test (this field addition must not change behavior for anyone not touching it — `#[serde(default = ...)]` means old `settings.json` files without this key keep loading fine).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src-tauri/src/settings.rs
+git commit -m "feat(settings): add narration_port (default 5758), mirrors local_api_port"
+```
+
+### Task 2: `AppState` field, the 3 commands, and registration
+
+**Files:**
+- Modify: `src-tauri/src/lib.rs`
+
+- [ ] **Step 1: Add the `AppState` field**
+
+In the `AppState` struct (~line 32), right after the existing `#[cfg(target_os = "windows")] system_recorder` field, add:
+
+```rust
+    /// The narration engine's sidecar, once spawned/adopted. `tokio::sync::Mutex`
+    /// (not `std::sync::Mutex`) because it's held across `.await` points inside
+    /// `synthesize_with_restart` and `spawn_or_adopt` — same reasoning as the
+    /// existing `streaming` field. `None` until first use (lazy spawn — see
+    /// Chunk 4's self-corrected design note: never spawned from `setup()`).
+    /// Windows-only (spec's macOS non-goal).
+    #[cfg(target_os = "windows")]
+    narration_server: tokio::sync::Mutex<Option<narration_process::NarrationServer>>,
+```
+
+Also add the corresponding initializer wherever `AppState { ... }` is constructed in `setup()` (search for the existing `streaming: tokio::sync::Mutex::new(None),` line and add immediately after it):
+
+```rust
+            #[cfg(target_os = "windows")]
+            narration_server: tokio::sync::Mutex::new(None),
+```
+
+- [ ] **Step 2: Write `ensure_narration_ready`**
+
+Add near the other model/settings-adjacent commands in `lib.rs`:
+
+```rust
+/// Cheap readiness check for the frontend: is the narration engine fully
+/// provisioned (uv + venv + piper-tts + voice + marker)? Does NOT spawn or
+/// touch the sidecar process — purely a provisioning-state read (spec §4
+/// data flow step 1: "If the engine isn't provisioned → show the download flow").
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn ensure_narration_ready() -> bool {
+    narration_provision::narration_engine_state() == narration_provision::NarrationEngineState::Ready
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn ensure_narration_ready() -> bool {
+    false
+}
+```
+
+⚠️ Note the non-Windows stub returns `false` (a plain "not ready," matching what a non-Windows user's UI should show — go to the same "unavailable" messaging as a not-yet-provisioned state) rather than an `Err`, since the frontend's job here is only "show the download flow or not," and "not available on this platform" is a variant of "not ready" the UI can word appropriately (Chunk 6 decides that copy).
+
+- [ ] **Step 3: Write `narration_setup`**
+
+```rust
+/// Run the full provisioning flow (uv → venv → piper-tts → voice → marker),
+/// emitting the download-progress events `narration_provision.rs` already
+/// defines. Safe to call repeatedly — returns immediately if already `Ready`.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn narration_setup(app: AppHandle) -> Result<(), String> {
+    narration_provision::provision_narration_engine(&app).await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn narration_setup(_app: AppHandle) -> Result<(), String> {
+    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+}
+```
+
+- [ ] **Step 4: Write `generate_narration`**
+
+```rust
+/// Generate Hebrew narration audio for `text`, returning raw WAV bytes.
+/// Lazily spawns/adopts the sidecar on first call in a session (spec §4 data
+/// flow steps 2-3) — never from `setup()`. Guards: empty text (client should
+/// already disable the button per spec §5, this is defense in depth) and
+/// not-yet-provisioned (a clear pre-flight error, not a confusing spawn failure).
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<Vec<u8>, String> {
+    if text.trim().is_empty() {
+        return Err("אין טקסט להקראה".to_string());
+    }
+    if narration_provision::narration_engine_state() != narration_provision::NarrationEngineState::Ready {
+        return Err("מנוע ההקראה עדיין לא הותקן. לך להגדרות והתקן אותו קודם.".to_string());
+    }
+
+    let port = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.narration_port
+    };
+
+    let mut guard = state.narration_server.lock().await;
+    if guard.is_none() {
+        let server = narration_process::NarrationServer::spawn_or_adopt(port).await?;
+        *guard = Some(server);
+    }
+    // guard.is_none() was just checked/filled above, so this unwrap is safe.
+    let server = guard.as_mut().unwrap();
+    server.synthesize_with_restart(&text).await.map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn generate_narration(
+    _state: State<'_, AppState>,
+    _text: String,
+) -> Result<Vec<u8>, String> {
+    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+}
+```
+
+⚠️ **`Vec<u8>` crosses Tauri IPC as a plain JSON number array by default (no `serde_bytes`), which has real overhead for a WAV-sized payload** — this is the exact tradeoff spec §5 already names explicitly ("known accepted tradeoff... acceptable for the paragraph scenario, revisit only if needed"). Not fixed here on purpose (YAGNI) — if Chunk 6's manual verify finds it sluggish for realistic paragraph lengths, that's the trigger to revisit (e.g. `serde_bytes`, or writing to a temp file and returning a path instead), not before.
+
+- [ ] **Step 5: Register the 3 commands**
+
+In the `.invoke_handler(tauri::generate_handler![...])` list (~line 2071), add after `cancel_batch_recording`:
+
+```rust
+            ensure_narration_ready,
+            narration_setup,
+            generate_narration,
+```
+
+- [ ] **Step 6: Build and run the full test suite**
+
+Run: `cargo build --manifest-path src-tauri/Cargo.toml`
+Expected: clean build.
+
+Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Expected: every test from Chunks 2-5 plus every pre-existing test in this crate passes — this is the first point where all the new modules are wired together into the same binary as everything else, so it's the real "did any of this break existing behavior" checkpoint.
+
+- [ ] **Step 7: Run clippy**
+
+Run: `cargo clippy --manifest-path src-tauri/Cargo.toml`
+Expected: no new warnings.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src-tauri/src/lib.rs
+git commit -m "feat(narration): AppState wiring + 3 Tauri commands (ensure_narration_ready, narration_setup, generate_narration)"
+```
+
+---
