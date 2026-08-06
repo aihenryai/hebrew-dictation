@@ -292,7 +292,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a fully provisioned narration engine (real uv+venv+piper-tts+voice) — run explicitly after provisioning has completed for real"]
     async fn spawn_owned_produces_a_working_sidecar_and_shutdown_kills_it() {
-        let port = 15758; // a port unlikely to collide with anything else in the test run
+        // OS-assigned free port, not a hardcoded number — a hardcoded port
+        // could collide with a still-bound leftover from a previous crashed
+        // test run, in which case spawn_owned would "succeed" by talking to
+        // that stale process instead of the one it just spawned.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // free the port so piper's own bind() can claim it
 
         let mut server = NarrationServer::spawn_owned(port, reqwest::Client::new())
             .await

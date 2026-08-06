@@ -374,8 +374,28 @@ mod tests {
 
         // Clean slate: if a previous run left uv.exe in place, this test would
         // trivially "pass" via the early-return in ensure_uv_available without
-        // exercising the download+extract path at all.
+        // exercising the download+extract path at all. Mirrors MarkerGuard
+        // below — restores the real uv.exe on drop (even on panic/assertion
+        // failure mid-test) so a real, already-provisioned machine never ends
+        // up with the engine broken just because this test ran.
+        struct UvExeGuard {
+            path: PathBuf,
+            original: Option<Vec<u8>>,
+        }
+        impl Drop for UvExeGuard {
+            fn drop(&mut self) {
+                match &self.original {
+                    Some(bytes) => {
+                        let _ = std::fs::write(&self.path, bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
         let uv_exe = get_uv_exe_path();
+        let _guard = UvExeGuard { path: uv_exe.clone(), original: std::fs::read(&uv_exe).ok() };
         let _ = std::fs::remove_file(&uv_exe);
 
         let result = ensure_uv_available(handle).await;

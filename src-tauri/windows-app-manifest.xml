@@ -1,3 +1,14 @@
+<!--
+  Byte-identical to tauri-build 2.5.6's own default windows-app-manifest.xml
+  (verified via `diff` against the vendored copy in the tauri-build crate).
+  See src-tauri/build.rs for why this is embedded manually instead of via
+  tauri-build's default mechanism.
+
+  MAINTENANCE: this file's content is no longer auto-updated by tauri-build
+  version bumps. If tauri-build ever extends its own default manifest (it has
+  before — DPI awareness, supportedOS entries, etc.), re-diff this file
+  against the new version's `windows-app-manifest.xml` and update by hand.
+-->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <dependency>
     <dependentAssembly>
