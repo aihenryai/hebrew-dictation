@@ -990,6 +990,69 @@ async fn generate_narration(
     Err("הקראה זמינה רק ב-Windows כרגע".to_string())
 }
 
+/// Save previously-generated narration WAV bytes to a user-chosen path.
+/// Mirrors `export_history`/`export_srt`'s save-dialog pattern exactly — the
+/// frontend already has the bytes (from `generate_narration`) and passes them
+/// back here rather than the backend re-generating or caching them.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn save_narration_wav(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bytes: Vec<u8>,
+    suggested_name: Option<String>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    if bytes.is_empty() {
+        return Err("אין הקלטה לשמירה — צור הקראה קודם.".to_string());
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M");
+    let default_name = match suggested_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(name) => format!("{}.wav", sanitize_filename(name)),
+        None => format!("hebrew-dictation-narration_{}.wav", timestamp),
+    };
+
+    let restore_on_top = state.settings.lock().map(|s| s.always_on_top).unwrap_or(true);
+    set_main_on_top(&app, false);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
+    app.dialog()
+        .file()
+        .set_title("שמור את ההקראה כ-WAV")
+        .set_file_name(&default_name)
+        .add_filter("קובץ WAV", &["wav"])
+        .save_file(move |result| {
+            let path = result.and_then(|fp| fp.into_path().ok());
+            let _ = tx.send(path);
+        });
+
+    let path = rx.await.map_err(|_| "דיאלוג השמירה נסגר ללא תגובה".to_string());
+    set_main_on_top(&app, restore_on_top);
+    let path = path?;
+    let path = match path {
+        Some(p) => p,
+        None => return Err("השמירה בוטלה".to_string()),
+    };
+
+    std::fs::write(&path, &bytes)
+        .map_err(|e| format!("שמירת קובץ ה-WAV נכשלה. (פרטים טכניים: {e})"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn save_narration_wav(
+    _app: AppHandle,
+    _state: State<'_, AppState>,
+    _bytes: Vec<u8>,
+    _suggested_name: Option<String>,
+) -> Result<String, String> {
+    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+}
+
 /// Delete a temporary recording WAV produced by `stop_batch_recording_to_file`
 /// (≈110 MB/hour). Hardened: only removes files inside the system temp dir whose
 /// name matches our `hd-recording-*.wav` pattern, so a bad/forged path can never
@@ -2209,6 +2272,7 @@ pub fn run() {
             ensure_narration_ready,
             narration_setup,
             generate_narration,
+            save_narration_wav,
             delete_temp_recording,
             pick_audio_file,
             pick_audio_files,
