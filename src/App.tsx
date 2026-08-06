@@ -447,6 +447,7 @@ function App() {
   const [narrationReady, setNarrationReady] = useState(false);
   const [narrationProvisioning, setNarrationProvisioning] = useState(false);
   const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
+  const [narrationSaveNotice, setNarrationSaveNotice] = useState<string | null>(null);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
@@ -1019,14 +1020,20 @@ function App() {
 
   const saveNarrationWav = useCallback(async () => {
     if (!narrationBytes) return;
+    setNarrationSaveNotice(null);
     try {
       const suggested = narrationText.trim().slice(0, 40) || undefined;
-      await invoke<string>("save_narration_wav", {
+      const path = await invoke<string>("save_narration_wav", {
         bytes: Array.from(narrationBytes),
         suggested_name: suggested,
       });
+      setNarrationSaveNotice(`✅ נשמר: ${path}`);
+      window.setTimeout(() => setNarrationSaveNotice(null), 6000);
     } catch (e) {
-      setError(`שמירת הקובץ נכשלה: ${e}`);
+      const msg = String(e);
+      if (!msg.includes("השמירה בוטלה")) {
+        setError(`שמירת הקובץ נכשלה: ${msg}`);
+      }
     }
   }, [narrationBytes, narrationText]);
 
@@ -2897,6 +2904,7 @@ function App() {
               value={narrationText}
               onChange={(e) => setNarrationText(e.target.value)}
               placeholder="הדביקו או הקלידו טקסט בעברית להקראה…"
+              aria-label="טקסט להקראה"
               dir="rtl"
               rows={8}
             />
@@ -2912,6 +2920,9 @@ function App() {
               <div className="narration-result">
                 <audio controls src={narrationAudioUrl} />
                 <button className="btn-secondary" onClick={saveNarrationWav}>שמור כ-WAV</button>
+                {narrationSaveNotice && (
+                  <p className="success-note" style={{ wordBreak: "break-all" }}>{narrationSaveNotice}</p>
+                )}
               </div>
             )}
           </>
