@@ -41,6 +41,14 @@ struct AppState {
     /// the "already recording" guard is per-recorder, so both can run at once.
     #[cfg(target_os = "windows")]
     system_recorder: Mutex<system_audio::SystemAudioRecorder>,
+    /// The narration engine's sidecar, once spawned/adopted. `tokio::sync::Mutex`
+    /// (not `std::sync::Mutex`) because it's held across `.await` points inside
+    /// `synthesize_with_restart` and `spawn_or_adopt` — same reasoning as the
+    /// existing `streaming` field. `None` until first use (lazy spawn — never
+    /// spawned from `setup()`).
+    /// Windows-only (macOS out of scope for Phase 1).
+    #[cfg(target_os = "windows")]
+    narration_server: tokio::sync::Mutex<Option<narration_process::NarrationServer>>,
     whisper_engine: Mutex<Option<whisper::WhisperEngine>>,
     settings: Mutex<settings::AppSettings>,
     streaming: tokio::sync::Mutex<Option<ActiveStreaming>>,
@@ -897,6 +905,76 @@ fn cancel_batch_recording(state: State<AppState>) -> Result<(), String> {
     drop(recorder);
     restore_recorder_settings(&state);
     Ok(())
+}
+
+/// Cheap readiness check for the frontend: is the narration engine fully
+/// provisioned (uv + venv + piper-tts + voice + marker)? Does NOT spawn or
+/// touch the sidecar process — purely a provisioning-state read.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn ensure_narration_ready() -> bool {
+    narration_provision::narration_engine_state() == narration_provision::NarrationEngineState::Ready
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn ensure_narration_ready() -> bool {
+    false
+}
+
+/// Run the full provisioning flow (uv → venv → piper-tts → voice → marker),
+/// emitting the download-progress events `narration_provision.rs` already
+/// defines. Safe to call repeatedly — returns immediately if already `Ready`.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn narration_setup(app: AppHandle) -> Result<(), String> {
+    narration_provision::provision_narration_engine(&app).await
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn narration_setup(_app: AppHandle) -> Result<(), String> {
+    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+}
+
+/// Generate Hebrew narration audio for `text`, returning raw WAV bytes.
+/// Lazily spawns/adopts the sidecar on first call in a session — never from
+/// `setup()`. Guards: empty text (client should already disable the button,
+/// this is defense in depth) and not-yet-provisioned (a clear pre-flight
+/// error, not a confusing spawn failure).
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<Vec<u8>, String> {
+    if text.trim().is_empty() {
+        return Err("אין טקסט להקראה".to_string());
+    }
+    if narration_provision::narration_engine_state() != narration_provision::NarrationEngineState::Ready {
+        return Err("מנוע ההקראה עדיין לא הותקן. לך להגדרות והתקן אותו קודם.".to_string());
+    }
+
+    let port = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.narration_port
+    };
+
+    let mut guard = state.narration_server.lock().await;
+    if guard.is_none() {
+        let server = narration_process::NarrationServer::spawn_or_adopt(port).await?;
+        *guard = Some(server);
+    }
+    // guard.is_none() was just checked/filled above, so this unwrap is safe.
+    let server = guard.as_mut().unwrap();
+    server.synthesize_with_restart(&text).await.map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn generate_narration(
+    _state: State<'_, AppState>,
+    _text: String,
+) -> Result<Vec<u8>, String> {
+    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
 }
 
 /// Delete a temporary recording WAV produced by `stop_batch_recording_to_file`
@@ -1919,6 +1997,8 @@ pub fn run() {
                 whisper_engine: Mutex::new(None),
                 settings: Mutex::new(load_result.settings),
                 streaming: tokio::sync::Mutex::new(None),
+                #[cfg(target_os = "windows")]
+                narration_server: tokio::sync::Mutex::new(None),
                 main_was_visible_before_toolbar: AtomicBool::new(false),
                 migration_outcome: Mutex::new(Some(load_result.migration)),
                 batch_cancel: Arc::new(AtomicBool::new(false)),
@@ -2113,6 +2193,9 @@ pub fn run() {
             stop_batch_recording_to_file,
             stop_call_recording,
             cancel_batch_recording,
+            ensure_narration_ready,
+            narration_setup,
+            generate_narration,
             delete_temp_recording,
             pick_audio_file,
             pick_audio_files,
