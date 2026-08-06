@@ -18,6 +18,7 @@ use win32job::{ExtendedLimitInfo, Job};
 /// race) — usable, but this instance has no way to kill it. This asymmetry is
 /// deliberate: see `synthesize_with_restart`'s doc comment for why an
 /// `Unmanaged` failure is never retried by respawning on the same port.
+#[allow(clippy::large_enum_variant)] // singleton held in Mutex<Option<…>> in AppState — boxing Owned would add indirection for zero benefit
 pub enum NarrationServer {
     Owned {
         child: tokio::process::Child,
@@ -134,6 +135,9 @@ impl NarrationServer {
     /// `spawn_or_adopt`'s adopt-instead-of-kill design was trying to avoid.
     /// So an `Unmanaged` failure just surfaces the error; the caller can
     /// re-run `spawn_or_adopt` from scratch, which correctly re-probes health.
+    /// On `Err` from a failed respawn attempt, `self` retains the `Owned`
+    /// variant with a dead child; the next call will retry the respawn
+    /// attempt (shutdown on a dead child is a safe no-op).
     pub async fn synthesize_with_restart(&mut self, text: &str) -> Result<Vec<u8>, NarrationError> {
         if let Ok(bytes) = synthesize(self.client(), self.port(), text).await {
             return Ok(bytes);
@@ -162,9 +166,16 @@ impl NarrationServer {
 
     /// Kill the process if we own it. A no-op for `Unmanaged` — there is
     /// nothing to kill (see the module design note and `synthesize_with_restart`).
+    /// Waits for the OS to actually reap the process after `kill()` — `kill()`
+    /// alone only sends `TerminateProcess` and returns once that syscall
+    /// completes, not once the process (and the port it held) is released.
+    /// Without the wait, a caller that immediately tries to bind the same
+    /// port (as `synthesize_with_restart`'s respawn does) races the OS
+    /// teardown.
     pub async fn shutdown(&mut self) {
         if let NarrationServer::Owned { child, .. } = self {
             let _ = child.kill().await;
+            let _ = child.wait().await;
         }
     }
 }
@@ -196,5 +207,67 @@ mod tests {
             "expected Unmanaged (adopted) when something already answers /info, got {:?}",
             result.is_ok()
         );
+    }
+
+    /// `Unmanaged` failures must never trigger a respawn attempt (see the
+    /// module design note and `synthesize_with_restart`'s doc comment) — this
+    /// constructs an `Unmanaged` pointing at an unreachable port directly
+    /// (no need to go through `spawn_or_adopt`) and confirms the error comes
+    /// back immediately as `Unreachable`, with `self` still `Unmanaged`
+    /// afterwards (proof no respawn/state-swap happened).
+    #[tokio::test]
+    async fn synthesize_with_restart_on_unmanaged_failure_returns_unreachable_without_respawn() {
+        // Port 1 is reserved/unassignable — nothing will ever listen there,
+        // so this reliably reproduces "connection refused" (same convention
+        // as narration.rs's own unreachable-port test).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let mut server = NarrationServer::Unmanaged { port: 1, client };
+
+        let result = server.synthesize_with_restart("שלום עולם").await;
+
+        assert!(matches!(result, Err(NarrationError::Unreachable(_))));
+        assert!(
+            matches!(server, NarrationServer::Unmanaged { .. }),
+            "an Unmanaged failure must never respawn/swap self into Owned"
+        );
+    }
+
+    /// A fake sidecar that answers `/info` healthily (so `spawn_or_adopt`
+    /// adopts it as `Unmanaged`) but fails `/synthesize` specifically —
+    /// exercises the "adopted process is alive but flaky" case.
+    fn spawn_fake_healthy_info_failing_synthesize() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                if request.url() == "/synthesize" {
+                    let response = tiny_http::Response::from_data(b"error".to_vec())
+                        .with_status_code(tiny_http::StatusCode(500));
+                    let _ = request.respond(response);
+                } else {
+                    let response = tiny_http::Response::from_data(b"{}".to_vec());
+                    let _ = request.respond(response);
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn synthesize_with_restart_on_adopted_process_surfaces_synthesize_failure() {
+        let port = spawn_fake_healthy_info_failing_synthesize();
+
+        // Adopts (Unmanaged) because /info answers healthily.
+        let mut server = NarrationServer::spawn_or_adopt(port).await.unwrap();
+        assert!(matches!(server, NarrationServer::Unmanaged { .. }));
+
+        // /synthesize fails on the adopted process — must surface as an
+        // error, never attempt a respawn on the same port.
+        let result = server.synthesize_with_restart("שלום עולם").await;
+
+        assert!(matches!(result, Err(NarrationError::Unreachable(_))));
     }
 }
