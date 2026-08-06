@@ -5,6 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+
 /// Pinned `uv` release facts (verified against github.com/astral-sh/uv/releases).
 /// Bump deliberately, not casually — a new `uv` version changes the exact
 /// bytes this hash-checks.
@@ -100,6 +103,156 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
     Ok(uv_exe)
 }
 
+/// Written LAST, only after every provisioning step below succeeds. Its mere
+/// existence (plus a version match) IS the "provisioned" signal — there is no
+/// separate flag file or partial-state tracking. A provisioning run that dies
+/// halfway leaves this marker absent, so the state machine naturally reports
+/// "not provisioned" and a retry is just running provisioning again — every
+/// step (uv download, venv creation, pip install, voice download) is already
+/// idempotent/overwrite-safe on its own.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct NarrationEngineMarker {
+    marker_version: u32,
+    piper_tts_version: String,
+    voice_name: String,
+}
+
+const MARKER_VERSION: u32 = 1;
+// Pinned from a spike that ran the real HTTP server end-to-end and verified
+// these values against the actual downloaded artifacts.
+const PIPER_TTS_VERSION: &str = "1.6.0";
+pub const VOICE_NAME: &str = "he_IL-saspeech-medium"; // pub: a later sidecar-lifecycle module needs this too
+const VOICE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/he/he_IL/saspeech/medium/he_IL-saspeech-medium.onnx";
+const VOICE_SIZE: u64 = 63_221_984;
+const VOICE_SHA256: &str = "3dc067debc9e782a8a0d095dbb58786648743d406366dcc2aa81009660873b4d";
+
+pub fn get_venv_dir() -> PathBuf { // pub: a later sidecar-lifecycle module needs the venv's python.exe path
+    get_narration_dir().join("venv")
+}
+
+fn get_voice_path() -> PathBuf {
+    get_narration_dir().join(format!("{VOICE_NAME}.onnx"))
+}
+
+fn get_marker_path() -> PathBuf {
+    get_narration_dir().join("engine.json")
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NarrationEngineState {
+    NotProvisioned,
+    Ready,
+}
+
+/// Pure given the marker file's contents — reads it if present, returns
+/// `NotProvisioned` on any absence/parse-failure/version-mismatch rather than
+/// panicking or treating a corrupt marker as ready.
+pub fn narration_engine_state() -> NarrationEngineState {
+    let marker_path = get_marker_path();
+    let Ok(contents) = std::fs::read_to_string(&marker_path) else {
+        return NarrationEngineState::NotProvisioned;
+    };
+    match serde_json::from_str::<NarrationEngineMarker>(&contents) {
+        Ok(marker) if marker.marker_version == MARKER_VERSION => NarrationEngineState::Ready,
+        _ => NarrationEngineState::NotProvisioned,
+    }
+}
+
+/// Run the full provisioning flow if not already done: `uv` → venv →
+/// `piper-tts` → voice → atomic marker. Safe to call every time the user
+/// opens the narration screen — returns immediately if already `Ready`.
+pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
+    if narration_engine_state() == NarrationEngineState::Ready {
+        return Ok(());
+    }
+
+    // Guards against shipping with an un-filled-in placeholder — fails loudly
+    // and immediately instead of a confusing HTTP/URL error partway through
+    // provisioning. (All constants above are real, pinned values — this is
+    // defense in depth, not expected to ever fire.)
+    if PIPER_TTS_VERSION.starts_with('<') || VOICE_URL.starts_with('<') || VOICE_SHA256.starts_with('<') {
+        return Err(
+            "מנוע ההקראה עדיין לא מוגדר בקוד (קבועים מסוג placeholder לא הוחלפו בערכי ה-spike האמיתיים)."
+                .to_string(),
+        );
+    }
+
+    let uv_exe = ensure_uv_available(app).await?;
+    let narration_dir = get_narration_dir();
+    let venv_dir = get_venv_dir();
+
+    // Every uv invocation below is scoped to app-data via these env vars —
+    // this is what keeps Python fully invisible to the rest of the system
+    // (no PATH changes, no registry entries). Real uv environment variables,
+    // verified against astral.sh's reference docs.
+    let uv_env = [
+        ("UV_PYTHON_INSTALL_DIR", narration_dir.join("python").to_string_lossy().to_string()),
+        ("UV_PYTHON_INSTALL_BIN", "0".to_string()),
+        ("UV_PYTHON_NO_REGISTRY", "1".to_string()),
+        ("UV_CACHE_DIR", narration_dir.join("uv-cache").to_string_lossy().to_string()),
+    ];
+
+    let venv_status = tokio::process::Command::new(&uv_exe)
+        .args(["venv", &venv_dir.to_string_lossy(), "--python", "3.11"])
+        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
+        .status()
+        .await
+        .map_err(|e| format!("יצירת סביבת ההרצה למנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))?;
+    if !venv_status.success() {
+        return Err("יצירת סביבת ההרצה למנוע ההקראה נכשלה.".to_string());
+    }
+
+    let pip_status = tokio::process::Command::new(&uv_exe)
+        .args([
+            "pip",
+            "install",
+            "--python",
+            &venv_dir.to_string_lossy(),
+            // [http] is required — plain piper-tts has no Flask dependency, so
+            // `python -m piper.http_server` fails with
+            // `ModuleNotFoundError: No module named 'flask'`.
+            &format!("piper-tts[http]=={PIPER_TTS_VERSION}"),
+        ])
+        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
+        .status()
+        .await
+        .map_err(|e| format!("התקנת מנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))?;
+    if !pip_status.success() {
+        return Err("התקנת מנוע ההקראה נכשלה.".to_string());
+    }
+
+    // Same "already downloaded and valid" short-circuit download_model has
+    // for whisper models — without it, a retry after a late failure (e.g. the
+    // marker-write below failing right after a successful ~63MB voice
+    // download) would re-download the voice for no reason.
+    let voice_path = get_voice_path();
+    let voice_already_valid = voice_path.exists()
+        && std::fs::metadata(&voice_path).map(|m| m.len() == VOICE_SIZE).unwrap_or(false);
+    if !voice_already_valid {
+        crate::model::download_and_verify(
+            app,
+            VOICE_URL,
+            &voice_path,
+            VOICE_SIZE,
+            VOICE_SHA256,
+            "narration-voice-download-progress",
+            "קול ההקראה",
+        )
+        .await?;
+    }
+
+    // Written LAST and only here — this is the atomic completion marker.
+    let marker = NarrationEngineMarker {
+        marker_version: MARKER_VERSION,
+        piper_tts_version: PIPER_TTS_VERSION.to_string(),
+        voice_name: VOICE_NAME.to_string(),
+    };
+    std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap())
+        .map_err(|e| format!("סימון סיום ההתקנה נכשל. (פרטים טכניים: {e})"))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +305,91 @@ mod tests {
         // NOTE: this body is currently EMPTY — running it with `--ignored`
         // right now passes trivially and verifies nothing. An empty-body
         // pass here is not real verification; don't mistake it for one.
+    }
+
+    /// ⚠️ Safety-critical test helper — read this comment before touching it.
+    /// `narration_engine_state()`/`get_marker_path()` read the REAL, non-sandboxed
+    /// app-data path (via `dirs::data_dir()`), which isn't overridable per-call
+    /// without threading a base-dir parameter through every function in this
+    /// file (not done now — would touch every path-returning fn for a test-only
+    /// concern). On a machine where narration has already been provisioned for
+    /// real, a naive "delete marker, run test, delete marker again" helper would
+    /// PERMANENTLY DESTROY the real completion marker, forcing an unwanted
+    /// ~200-300MB re-provision on next app launch. This helper snapshots
+    /// whatever was there first and restores it — including on panic, via a
+    /// `Drop` guard — so it is safe to run against a machine with a real,
+    /// already-provisioned engine.
+    struct MarkerGuard {
+        path: PathBuf,
+        original: Option<String>,
+    }
+
+    impl MarkerGuard {
+        fn new() -> Self {
+            let path = get_marker_path();
+            let original = std::fs::read_to_string(&path).ok();
+            let _ = std::fs::remove_file(&path);
+            Self { path, original }
+        }
+    }
+
+    impl Drop for MarkerGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(contents) => {
+                    let _ = std::fs::write(&self.path, contents);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    fn with_temp_app_data<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = MarkerGuard::new(); // restores the real marker on drop, even on panic
+        f()
+    }
+
+    #[test]
+    fn state_is_not_provisioned_when_marker_absent() {
+        with_temp_app_data(|| {
+            assert_eq!(narration_engine_state(), NarrationEngineState::NotProvisioned);
+        });
+    }
+
+    #[test]
+    fn state_is_ready_when_marker_present_and_version_matches() {
+        with_temp_app_data(|| {
+            std::fs::create_dir_all(get_narration_dir()).unwrap();
+            let marker = NarrationEngineMarker {
+                marker_version: MARKER_VERSION,
+                piper_tts_version: "1.6.0".to_string(),
+                voice_name: VOICE_NAME.to_string(),
+            };
+            std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap()).unwrap();
+
+            assert_eq!(narration_engine_state(), NarrationEngineState::Ready);
+        });
+    }
+
+    #[test]
+    fn state_is_not_provisioned_when_marker_version_is_stale() {
+        with_temp_app_data(|| {
+            std::fs::create_dir_all(get_narration_dir()).unwrap();
+            std::fs::write(get_marker_path(), r#"{"marker_version":0,"piper_tts_version":"old","voice_name":"old"}"#).unwrap();
+
+            assert_eq!(narration_engine_state(), NarrationEngineState::NotProvisioned);
+        });
+    }
+
+    #[test]
+    fn state_is_not_provisioned_when_marker_is_corrupt_json() {
+        with_temp_app_data(|| {
+            std::fs::create_dir_all(get_narration_dir()).unwrap();
+            std::fs::write(get_marker_path(), "not valid json{{{").unwrap();
+
+            assert_eq!(narration_engine_state(), NarrationEngineState::NotProvisioned);
+        });
     }
 }
