@@ -2,6 +2,9 @@
 //! Process lifecycle (spawning that sidecar) lives in `narration_process.rs`;
 //! this module only knows how to build its launch args and call its API.
 
+use serde::Serialize;
+use std::time::Duration;
+
 /// Build the argv for `python -m piper.http_server`, given the voice model
 /// name, bind host, and port. Pure. `--host` is security-mandatory (spec §3):
 /// piper1-gpl's HTTP server defaults to `0.0.0.0` (all network interfaces),
@@ -28,9 +31,6 @@ pub fn looks_like_valid_wav(bytes: &[u8]) -> bool {
     bytes.len() > 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
 }
 
-use serde::Serialize;
-use std::time::Duration;
-
 #[derive(Debug)]
 pub enum NarrationError {
     /// Couldn't reach the sidecar at all (connection refused, DNS, timeout).
@@ -51,6 +51,8 @@ impl std::fmt::Display for NarrationError {
     }
 }
 
+impl std::error::Error for NarrationError {}
+
 #[derive(Serialize)]
 struct SynthesizeRequest<'a> {
     text: &'a str,
@@ -68,6 +70,11 @@ pub async fn synthesize(
     let resp = client
         .post(&url)
         .json(&SynthesizeRequest { text })
+        // Synthesis time scales with text length, unlike the fast /info
+        // probe — 120s is a generous ceiling for worst-case long-form text,
+        // just high enough to guarantee the caller never hangs forever on a
+        // wedged sidecar.
+        .timeout(Duration::from_secs(120))
         .send()
         .await
         .map_err(|e| NarrationError::Unreachable(e.to_string()))?;
@@ -79,7 +86,10 @@ pub async fn synthesize(
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| NarrationError::BadResponse(e.to_string()))?
+        // A failure here means the connection dropped mid-transfer after a
+        // 2xx status — a transport-level failure, not a documented error
+        // response, so it belongs with Unreachable rather than BadResponse.
+        .map_err(|e| NarrationError::Unreachable(e.to_string()))?
         .to_vec();
 
     if !looks_like_valid_wav(&bytes) {
@@ -172,7 +182,11 @@ mod tests {
         fake_wav.extend_from_slice(&[0u8; 50]);
         let wav_for_server = fake_wav.clone();
 
-        let port = spawn_fake_sidecar(move |_req| (200, wav_for_server.clone()));
+        let port = spawn_fake_sidecar(move |req| {
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/synthesize");
+            (200, wav_for_server.clone())
+        });
 
         let client = reqwest::Client::new();
         let result = synthesize(&client, port, "שלום עולם").await;
@@ -219,7 +233,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_true_on_reachable_200() {
-        let port = spawn_fake_sidecar(|_req| (200, b"{}".to_vec()));
+        let port = spawn_fake_sidecar(|req| {
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/info");
+            (200, b"{}".to_vec())
+        });
 
         let client = reqwest::Client::new();
         assert!(health_check(&client, port).await);
