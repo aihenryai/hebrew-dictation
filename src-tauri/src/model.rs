@@ -1,8 +1,132 @@
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
+
+/// Core download+verify: no Tauri dependency, so it's directly unit-testable.
+/// Downloads `url` to `dest_path` via an atomic temp-file-then-rename, verifying
+/// the result matches `expected_size`/`expected_sha256` before the rename.
+/// `component_label` is the Hebrew noun used in error messages (e.g. "המודל",
+/// "מנוע ההקראה") so one function serves whisper models, the `uv` binary, and
+/// Piper voice files with wording that fits each. `on_progress(downloaded, total)`
+/// fires as bytes arrive — callers decide what to do with that (Tauri event, or
+/// nothing, in tests).
+async fn download_and_verify_core(
+    url: &str,
+    dest_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    component_label: &str,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<(), String> {
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!("יצירת התיקייה עבור {component_label} נכשלה. בדוק שיש מקום פנוי בדיסק והרשאות כתיבה. (פרטים טכניים: {e})")
+        })?;
+    }
+
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await.map_err(|e| {
+        format!("הורדת {component_label} נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
+    })?;
+
+    let total_size = response.content_length().unwrap_or(expected_size);
+
+    // Append ".tmp" to the whole filename rather than replacing the extension
+    // (the original whisper-only code did `.with_extension("bin.tmp")`, which
+    // silently assumed a `.bin` destination — this version works for `.bin`,
+    // `.zip`, `.onnx`, or anything else).
+    let mut tmp_name = dest_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+
+    let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+        format!("יצירת קובץ זמני עבור {component_label} נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})")
+    })?;
+
+    let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
+    let mut stream = response.bytes_stream();
+    let max_size = expected_size + (expected_size / 10); // 10% tolerance, same as the original
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            format!("ההורדה של {component_label} נקטעה — בדוק את החיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
+        })?;
+
+        downloaded += chunk.len() as u64;
+
+        if downloaded > max_size {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(format!(
+                "ההורדה של {component_label} חרגה מהגודל הצפוי — בוטלה לצורך אבטחה. נסה שוב."
+            ));
+        }
+
+        hasher.update(&chunk);
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| format!("כתיבה לדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
+
+        on_progress(downloaded, total_size);
+    }
+
+    let hash_result = format!("{:x}", hasher.finalize());
+    if hash_result != expected_sha256 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(format!(
+            "{component_label} שהורד לא תואם לחתימה הצפויה (ייתכן שההורדה נפגמה). הקובץ נמחק. נסה להוריד שוב. (צפוי: {}…, התקבל: {}…)",
+            &expected_sha256[..expected_sha256.len().min(16)],
+            &hash_result[..16]
+        ));
+    }
+
+    std::fs::rename(&tmp_path, dest_path).map_err(|e| {
+        format!("שמירת {component_label} הסופית נכשלה. נסה למחוק ולהוריד מחדש. (פרטים טכניים: {e})")
+    })?;
+
+    Ok(())
+}
+
+/// Tauri-aware wrapper around `download_and_verify_core`: same behavior, but
+/// emits `progress_event` (`{downloaded, total, progress}`) via `app.emit` as
+/// bytes arrive, for the settings UI's progress bar.
+///
+/// Generic over `R: tauri::Runtime` (not the concrete `AppHandle` = `AppHandle<Wry>`)
+/// **specifically so this is testable against `tauri::test::mock_app()`'s
+/// `AppHandle<MockRuntime>`** in a later task that needs to write a real
+/// integration test without a live window. Every existing call site
+/// (`download_model` below) keeps calling this with a plain `&AppHandle`
+/// unchanged — `R` is inferred as `Wry` automatically there, so this is not a
+/// breaking change to any `#[tauri::command]` entry point.
+pub async fn download_and_verify<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+    dest_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    progress_event: &str,
+    component_label: &str,
+) -> Result<(), String> {
+    let app = app.clone();
+    let event = progress_event.to_string();
+    download_and_verify_core(
+        url,
+        dest_path,
+        expected_size,
+        expected_sha256,
+        component_label,
+        move |downloaded, total| {
+            let progress = (downloaded as f64 / total as f64 * 100.0) as u32;
+            let _ = app.emit(
+                &event,
+                serde_json::json!({ "downloaded": downloaded, "total": total, "progress": progress }),
+            );
+        },
+    )
+    .await
+}
 
 /// (name, url, expected_size, sha256_hex)
 const MODELS: &[(&str, &str, u64, &str)] = &[
@@ -153,73 +277,16 @@ pub async fn download_model(app: AppHandle, model_name: String) -> Result<String
 
     let label_for_notification = friendly_model_label(&model_name);
 
-    // Create directory
-    let models_dir = get_models_dir();
-    std::fs::create_dir_all(&models_dir)
-        .map_err(|e| format!("יצירת תיקיית המודלים נכשלה. בדוק שיש מקום פנוי בדיסק והרשאות כתיבה. (פרטים טכניים: {e})"))?;
-
-    // Download with progress
-    let client = reqwest::Client::new();
-    let response = client
-        .get(*url)
-        .send()
-        .await
-        .map_err(|e| format!("הורדת המודל נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})"))?;
-
-    let total_size = response.content_length().unwrap_or(*expected_size);
-
-    let tmp_path = model_path.with_extension("bin.tmp");
-    let mut file = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(|e| format!("יצירת קובץ המודל בדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
-
-    let mut downloaded: u64 = 0;
-    let mut hasher = Sha256::new();
-    let mut stream = response.bytes_stream();
-    let max_size = expected_size + (expected_size / 10); // 10% tolerance
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("ההורדה נקטעה — בדוק את החיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})"))?;
-
-        downloaded += chunk.len() as u64;
-
-        // Abort if download exceeds expected size
-        if downloaded > max_size {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err("ההורדה חרגה מהגודל הצפוי — בוטלה לצורך אבטחה. נסה שוב.".to_string());
-        }
-
-        hasher.update(&chunk);
-
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| format!("כתיבה לדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
-
-        let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
-        let _ = app.emit(
-            "model-download-progress",
-            serde_json::json!({
-                "downloaded": downloaded,
-                "total": total_size,
-                "progress": progress
-            }),
-        );
-    }
-
-    // Verify SHA-256 hash
-    let hash_result = format!("{:x}", hasher.finalize());
-    if hash_result != *expected_hash {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(format!(
-            "המודל שהורד לא תואם לחתימה הצפויה (ייתכן שההורדה נפגמה). הקובץ נמחק. נסה להוריד שוב. (צפוי: {}…, התקבל: {}…)",
-            &expected_hash[..16],
-            &hash_result[..16]
-        ));
-    }
-
-    // Rename tmp to final
-    std::fs::rename(&tmp_path, &model_path)
-        .map_err(|e| format!("שמירת המודל הסופית נכשלה. נסה למחוק את המודל בהגדרות ולהוריד מחדש. (פרטים טכניים: {e})"))?;
+    download_and_verify(
+        &app,
+        url,
+        &model_path,
+        *expected_size,
+        expected_hash,
+        "model-download-progress",
+        "המודל",
+    )
+    .await?;
 
     // OS-level notification — most users start a download and switch to other work
     // while it runs in the background. Surfacing completion via the system tray
@@ -244,5 +311,104 @@ fn friendly_model_label(name: &str) -> String {
         "large-v3-turbo" => "Large v3 Turbo".to_string(),
         "ivrit-large-v3-turbo" => "ivrit.ai (מותאם לעברית)".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn spawn_fake_download_server(body: Vec<u8>) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let response = tiny_http::Response::from_data(body.clone());
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_writes_file_on_hash_match() {
+        let body = b"pretend this is a downloaded file".to_vec();
+        let expected_hash = format!("{:x}", Sha256::digest(&body));
+        let port = spawn_fake_download_server(body.clone());
+
+        let tmp_dir = std::env::temp_dir().join(format!("narration-test-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let mut progress_calls: Vec<(u64, u64)> = Vec::new();
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            body.len() as u64,
+            &expected_hash,
+            "קובץ בדיקה",
+            |downloaded, total| progress_calls.push((downloaded, total)),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert!(!progress_calls.is_empty(), "progress callback should fire at least once");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_rejects_hash_mismatch_and_cleans_up() {
+        let body = b"some bytes".to_vec();
+        let port = spawn_fake_download_server(body.clone());
+
+        let tmp_dir = std::env::temp_dir().join(format!("narration-test-mismatch-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            body.len() as u64,
+            "0000000000000000000000000000000000000000000000000000000000000000", // deliberately wrong
+            "קובץ בדיקה",
+            |_, _| {},
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!dest.exists(), "final file must not exist after a hash mismatch");
+        let tmp_path = dest.with_file_name("downloaded.bin.tmp");
+        assert!(!tmp_path.exists(), "temp file must be cleaned up after a hash mismatch");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_aborts_when_response_exceeds_expected_size() {
+        // Server sends far more than expected_size — the 10%-tolerance guard must abort early.
+        let body = vec![0u8; 1000];
+        let port = spawn_fake_download_server(body);
+
+        let tmp_dir = std::env::temp_dir().join(format!("narration-test-oversize-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            10, // expected only 10 bytes — server sends 1000
+            "irrelevant",
+            "קובץ בדיקה",
+            |_, _| {},
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!dest.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
