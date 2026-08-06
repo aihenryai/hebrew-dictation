@@ -26,10 +26,23 @@ async fn download_and_verify_core(
         })?;
     }
 
-    let client = reqwest::Client::new();
+    // Connect timeout only — body/read is intentionally unbounded, since large
+    // model downloads legitimately take a long time once the connection is up.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let response = client.get(url).send().await.map_err(|e| {
         format!("הורדת {component_label} נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
     })?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "{component_label}: שגיאת שרת {} — בדוק את כתובת ההורדה. (URL: {})",
+            response.status(),
+            url
+        ));
+    }
 
     let total_size = response.content_length().unwrap_or(expected_size);
 
@@ -319,6 +332,10 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    // The listener thread's `incoming_requests()` loop runs for the life of
+    // the test binary (it's never explicitly stopped) — intentional, not a
+    // leak to "fix": each test gets its own OS-assigned port, and the thread
+    // dies with the process. Don't chase this as a phantom hang.
     fn spawn_fake_download_server(body: Vec<u8>) -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
@@ -337,7 +354,7 @@ mod tests {
         let expected_hash = format!("{:x}", Sha256::digest(&body));
         let port = spawn_fake_download_server(body.clone());
 
-        let tmp_dir = std::env::temp_dir().join(format!("narration-test-{}", port));
+        let tmp_dir = std::env::temp_dir().join(format!("model-test-{}", port));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let dest = tmp_dir.join("downloaded.bin");
 
@@ -364,7 +381,7 @@ mod tests {
         let body = b"some bytes".to_vec();
         let port = spawn_fake_download_server(body.clone());
 
-        let tmp_dir = std::env::temp_dir().join(format!("narration-test-mismatch-{}", port));
+        let tmp_dir = std::env::temp_dir().join(format!("model-test-mismatch-{}", port));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let dest = tmp_dir.join("downloaded.bin");
 
@@ -392,7 +409,7 @@ mod tests {
         let body = vec![0u8; 1000];
         let port = spawn_fake_download_server(body);
 
-        let tmp_dir = std::env::temp_dir().join(format!("narration-test-oversize-{}", port));
+        let tmp_dir = std::env::temp_dir().join(format!("model-test-oversize-{}", port));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let dest = tmp_dir.join("downloaded.bin");
 
@@ -408,6 +425,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!dest.exists());
+        let tmp_path = dest.with_file_name("downloaded.bin.tmp");
+        assert!(!tmp_path.exists(), "temp file must be cleaned up after an oversize abort");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
