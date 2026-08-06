@@ -28,6 +28,77 @@ pub fn looks_like_valid_wav(bytes: &[u8]) -> bool {
     bytes.len() > 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE"
 }
 
+use serde::Serialize;
+use std::time::Duration;
+
+#[derive(Debug)]
+pub enum NarrationError {
+    /// Couldn't reach the sidecar at all (connection refused, DNS, timeout).
+    Unreachable(String),
+    /// Sidecar responded, but with a non-2xx status.
+    BadResponse(String),
+    /// Sidecar responded 2xx, but the body doesn't look like a WAV file.
+    InvalidAudio,
+}
+
+impl std::fmt::Display for NarrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NarrationError::Unreachable(e) => write!(f, "מנוע ההקראה לא זמין: {e}"),
+            NarrationError::BadResponse(e) => write!(f, "מנוע ההקראה החזיר שגיאה: {e}"),
+            NarrationError::InvalidAudio => write!(f, "מנוע ההקראה החזיר תשובה לא תקינה"),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SynthesizeRequest<'a> {
+    text: &'a str,
+}
+
+/// POST /synthesize on the sidecar, returning raw WAV bytes.
+/// Validates the response looks like real audio before returning it —
+/// callers never receive a partial/corrupt buffer silently (spec §5).
+pub async fn synthesize(
+    client: &reqwest::Client,
+    port: u16,
+    text: &str,
+) -> Result<Vec<u8>, NarrationError> {
+    let url = format!("http://127.0.0.1:{port}/synthesize");
+    let resp = client
+        .post(&url)
+        .json(&SynthesizeRequest { text })
+        .send()
+        .await
+        .map_err(|e| NarrationError::Unreachable(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(NarrationError::BadResponse(format!("HTTP {}", resp.status())));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| NarrationError::BadResponse(e.to_string()))?
+        .to_vec();
+
+    if !looks_like_valid_wav(&bytes) {
+        return Err(NarrationError::InvalidAudio);
+    }
+
+    Ok(bytes)
+}
+
+/// GET /info on the sidecar. Returns true only on a reachable 2xx response —
+/// used both as a readiness probe (Chunk 3) and for user-facing diagnostics.
+pub async fn health_check(client: &reqwest::Client, port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/info");
+    match client.get(&url).timeout(Duration::from_secs(2)).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +142,92 @@ mod tests {
     #[test]
     fn looks_like_valid_wav_rejects_truncated_header() {
         assert!(!looks_like_valid_wav(b"RIFF\x00\x00\x00\x00"));
+    }
+
+    // The listener thread's `incoming_requests()` loop runs for the life of
+    // the test binary (it's never explicitly stopped) — intentional, not a
+    // leak to "fix": each test gets its own OS-assigned port, and the thread
+    // dies with the process. Don't chase this as a phantom hang.
+    fn spawn_fake_sidecar(
+        respond: impl Fn(&tiny_http::Request) -> (u16, Vec<u8>) + Send + 'static,
+    ) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let (status, body) = respond(&request);
+                let response = tiny_http::Response::from_data(body)
+                    .with_status_code(tiny_http::StatusCode(status));
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn synthesize_returns_wav_bytes_on_success() {
+        let mut fake_wav = b"RIFF".to_vec();
+        fake_wav.extend_from_slice(&[0u8; 4]);
+        fake_wav.extend_from_slice(b"WAVE");
+        fake_wav.extend_from_slice(&[0u8; 50]);
+        let wav_for_server = fake_wav.clone();
+
+        let port = spawn_fake_sidecar(move |_req| (200, wav_for_server.clone()));
+
+        let client = reqwest::Client::new();
+        let result = synthesize(&client, port, "שלום עולם").await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), fake_wav);
+    }
+
+    #[tokio::test]
+    async fn synthesize_rejects_non_200_as_bad_response() {
+        let port = spawn_fake_sidecar(|_req| (500, b"error".to_vec()));
+
+        let client = reqwest::Client::new();
+        let result = synthesize(&client, port, "טקסט").await;
+
+        assert!(matches!(result, Err(NarrationError::BadResponse(_))));
+    }
+
+    #[tokio::test]
+    async fn synthesize_rejects_non_wav_body_as_invalid_audio() {
+        let port = spawn_fake_sidecar(|_req| (200, b"<html>not audio</html>".to_vec()));
+
+        let client = reqwest::Client::new();
+        let result = synthesize(&client, port, "טקסט").await;
+
+        assert!(matches!(result, Err(NarrationError::InvalidAudio)));
+    }
+
+    #[tokio::test]
+    async fn synthesize_reports_unreachable_on_connection_refused() {
+        // Port 1 is a reserved/unassignable port — nothing will ever listen
+        // there, so this reliably reproduces "connection refused" without
+        // racing a real bind/unbind cycle. A short client-side timeout is
+        // cheap insurance against a hang if some local firewall/AV/VPN ever
+        // intercepts loopback traffic instead of refusing the connection.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let result = synthesize(&client, 1, "טקסט").await;
+
+        assert!(matches!(result, Err(NarrationError::Unreachable(_))));
+    }
+
+    #[tokio::test]
+    async fn health_check_true_on_reachable_200() {
+        let port = spawn_fake_sidecar(|_req| (200, b"{}".to_vec()));
+
+        let client = reqwest::Client::new();
+        assert!(health_check(&client, port).await);
+    }
+
+    #[tokio::test]
+    async fn health_check_false_when_unreachable() {
+        let client = reqwest::Client::new();
+        assert!(!health_check(&client, 1).await);
     }
 }
