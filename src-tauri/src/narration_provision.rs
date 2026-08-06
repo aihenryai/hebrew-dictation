@@ -59,6 +59,11 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
     // Blocking Command::status() runs via spawn_blocking rather than directly
     // in this async fn, so it doesn't occupy a tokio worker thread for the
     // duration of Expand-Archive (a few seconds for a ~19MB zip).
+    // Paths are passed via environment variables rather than interpolated
+    // into the -Command string: a single quote inside a Windows username
+    // (e.g. "O'Brien") would otherwise terminate the PowerShell quoted
+    // string early and break the command. Env vars sidestep quoting
+    // entirely, regardless of what characters the path contains.
     let zip_path_for_blocking = zip_path.clone();
     let extract_dir_for_blocking = extract_dir.clone();
     let status = tokio::task::spawn_blocking(move || {
@@ -66,12 +71,10 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
             .args([
                 "-NoProfile",
                 "-Command",
-                &format!(
-                    "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                    zip_path_for_blocking.display(),
-                    extract_dir_for_blocking.display()
-                ),
+                "Expand-Archive -LiteralPath $env:HD_UV_ZIP -DestinationPath $env:HD_UV_DIR -Force",
             ])
+            .env("HD_UV_ZIP", &zip_path_for_blocking)
+            .env("HD_UV_DIR", &extract_dir_for_blocking)
             .status()
     })
     .await
@@ -81,7 +84,10 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
     let _ = std::fs::remove_file(&zip_path);
 
     if !status.success() {
-        return Err("חילוץ מנוע ההקראה נכשל.".to_string());
+        return Err(format!(
+            "חילוץ מנוע ההקראה נכשל (קוד יציאה: {}). נסה להוריד מחדש.",
+            status.code().map_or_else(|| "לא ידוע".to_string(), |c| c.to_string())
+        ));
     }
 
     if !uv_exe.exists() {
@@ -120,6 +126,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn uv_download_url_contains_uv_version() {
+        // UV_DOWNLOAD_URL hardcodes the version again (a const fn can't
+        // format!() into another const), so nothing stops the two from
+        // drifting apart on a future version bump. If they ever mismatch,
+        // ensure_uv_available downloads a real uv.zip whose hash won't
+        // match UV_ZIP_SHA256 (pinned to the version in the URL) — a
+        // confusing hash-mismatch failure instead of a clear "these don't
+        // match" signal. This test makes the drift fail fast and legibly.
+        assert!(UV_DOWNLOAD_URL.contains(UV_VERSION));
+    }
+
     #[tokio::test]
     #[ignore = "hits the real network (GitHub) and takes ~10s — run explicitly with `cargo test -- --ignored`, not part of the default suite"]
     async fn ensure_uv_available_downloads_and_extracts_a_working_exe() {
@@ -131,5 +149,8 @@ mod tests {
         // tauri::test::mock_app(). Left here as a marker with #[ignore] so
         // it's discoverable, not deleted — implement its body in that later
         // task alongside the other #[ignore]-gated real-environment tests.
+        // NOTE: this body is currently EMPTY — running it with `--ignored`
+        // right now passes trivially and verifies nothing. An empty-body
+        // pass here is not real verification; don't mistake it for one.
     }
 }
