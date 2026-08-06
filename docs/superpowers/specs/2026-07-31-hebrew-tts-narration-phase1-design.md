@@ -43,7 +43,13 @@ Rev 1 planned to spawn the **archived** `rhasspy/piper` compiled Windows binary 
 
 ### 2.2 The voice
 
-`he_IL-saspeech-medium` — 63MB ONNX, 22.05kHz, single male speaker, `medium` quality only. Trained on the **SASPEECH corpus** (the Roboshaul project: Shaul Amsterdamski's voice, from Kan's "חיות כיס" podcast recordings). Hosted in `rhasspy/piper-voices` (repo license MIT). ⚠️ The spike (§6) must check the voice's own MODEL_CARD for license/attribution terms — a corpus built from one real person's broadcast voice may carry attribution or non-commercial conditions that belong in the app's credits screen.
+`he_IL-saspeech-medium` — 63MB ONNX, 22.05kHz, single male speaker, `medium` quality only. Trained on the **SASPEECH corpus** (the Roboshaul project: Shaul Amsterdamski's voice, from Kan's "חיות כיס" podcast recordings). Hosted in `rhasspy/piper-voices` (repo license MIT).
+
+⚠️ **License, confirmed by the spike (2026-08-06):** the underlying SASPEECH dataset (via its MODEL_CARD → `openslr.org/134`) is **"Custom non-commercial," copyright IPBC (Israeli Public Broadcast Corporation)** — no commercial/broadcast/political use, no implying IPBC/Shaul Amsterdamski endorsement. Fine for hebrew-dictation today (free, MIT-licensed app) — **but this specific voice cannot be used if the app is ever monetized.** Needs real attribution text in the app's credits screen, not a passing mention.
+
+⚠️ **Quality, confirmed by the spike — CONDITIONAL GO, approved by Henry 2026-08-06:** objective ASR round-trip testing (full results in `docs/superpowers/plans/2026-07-31-hebrew-tts-narration-phase1-spike-findings.md`) showed natural, paragraph-length Hebrew text — the actual target use case (§1) — synthesizes consistently well. Two limitations ship **documented, not fixed**, in Phase 1:
+1. **Short-utterance stochastic instability.** ~4-word sentences show real run-to-run quality variance on a warm/reused voice instance — identical input can synthesize near-perfectly or badly garbled, unpredictably. Not resolved by lowering `noise_scale`/`noise_w_scale` from the voice's defaults. Root cause is the vocoder's unseeded stochastic sampling, not a bug in this app's code — accepted as a known rough edge for v1 (users can retry a bad generation), not investigated further.
+2. **Mixed Hebrew+English+digit text breaks down** (e.g. brand names, numbers inline). Expected — the phonemizer is Hebrew-specific — and confirmed, not just theorized. The UI (Chunk 6) should carry a hint to write in Hebrew only for best results, not a hard block.
 
 ### 2.3 The runtime: piper1-gpl as a managed HTTP sidecar
 

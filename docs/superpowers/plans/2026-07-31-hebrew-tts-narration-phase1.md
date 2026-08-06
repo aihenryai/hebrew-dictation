@@ -1002,7 +1002,7 @@ to:
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros", "process"] }
 ```
 
-⚠️ **Before starting this task, open the Chunk 1 spike findings doc and replace every `<PIPER_TTS_VERSION>`, `<VOICE_URL>`, `<VOICE_SIZE>`, `<VOICE_SHA256>`, `<NAKDIMON_...>` placeholder below with the real values it recorded.** The code below is written with clearly-marked placeholders rather than fabricated numbers, precisely so this can't be implemented on guessed values.
+✅ **Spike completed 2026-08-06 — placeholders below now filled with real, verified values** (was previously a hard gate; `docs/superpowers/plans/2026-07-31-hebrew-tts-narration-phase1-spike-findings.md` has the full evidence). **Verdict: CONDITIONAL GO, approved by Henry** — natural/paragraph-length Hebrew narration (the actual target use case) tests consistently good-to-excellent via objective ASR round-trip; two accepted limitations ship documented, not fixed, in Phase 1: (1) short (~4-word) utterances show real run-to-run stochastic quality variance on a warm/reused voice instance — sometimes near-perfect, sometimes garbled, for identical input, not resolved by lowering `noise_scale`/`noise_w_scale`; (2) mixed Hebrew+English+digit text (e.g. brand names) breaks down badly — Hebrew-only phonemizer, expected. Neither blocks shipping; both should surface as known-limitation UI copy in Chunk 6 (e.g. "לתוצאה הכי טובה, כתבו משפטים מלאים בעברית בלבד").
 
 - [ ] **Step 1: Write the state-machine tests**
 
@@ -1026,11 +1026,12 @@ struct NarrationEngineMarker {
 }
 
 const MARKER_VERSION: u32 = 1;
-const PIPER_TTS_VERSION: &str = "<PIPER_TTS_VERSION>"; // from spike findings, e.g. "1.6.0"
+// Pinned from the spike (2026-08-06) — see spike-findings.md for how each was verified.
+const PIPER_TTS_VERSION: &str = "1.6.0";
 pub const VOICE_NAME: &str = "he_IL-saspeech-medium"; // pub: Chunk 4's narration_process.rs needs this too
-const VOICE_URL: &str = "<VOICE_URL>"; // from spike findings
-const VOICE_SIZE: u64 = 0; // <VOICE_SIZE> from spike findings
-const VOICE_SHA256: &str = "<VOICE_SHA256>"; // from spike findings
+const VOICE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/he/he_IL/saspeech/medium/he_IL-saspeech-medium.onnx";
+const VOICE_SIZE: u64 = 63_221_984;
+const VOICE_SHA256: &str = "3dc067debc9e782a8a0d095dbb58786648743d406366dcc2aa81009660873b4d";
 
 pub fn get_venv_dir() -> PathBuf { // pub: Chunk 4's narration_process.rs needs the venv's python.exe path
     get_narration_dir().join("venv")
@@ -1218,7 +1219,10 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
             "install",
             "--python",
             &venv_dir.to_string_lossy(),
-            &format!("piper-tts=={PIPER_TTS_VERSION}"),
+            // [http] is required — confirmed by the spike: plain `piper-tts`
+            // has no Flask dependency, so `python -m piper.http_server` fails
+            // immediately with `ModuleNotFoundError: No module named 'flask'`.
+            &format!("piper-tts[http]=={PIPER_TTS_VERSION}"),
         ])
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
         .status()
