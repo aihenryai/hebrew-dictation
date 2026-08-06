@@ -57,3 +57,4 @@ tiny_http = "0.12"
 # (three-arg initialize_client; loopback = default Render device + Direction::Capture).
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
+win32job = "2.0"

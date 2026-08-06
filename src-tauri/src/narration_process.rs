@@ -1,0 +1,200 @@
+//! Sidecar process lifecycle for the narration engine: spawn, health-check,
+//! Windows Job Object crash-protection, and guaranteed teardown. Talks to
+//! `narration.rs` for the HTTP protocol itself (build_server_args, health_check,
+//! synthesize) — this module only owns "is there a running process and is it
+//! healthy," never the HTTP details. Windows-only (macOS out of scope for
+//! Phase 1); a later task provides the non-Windows Tauri-command stub.
+
+use crate::narration::{build_server_args, health_check, synthesize, NarrationError};
+use crate::narration_provision::{get_venv_dir, VOICE_NAME};
+use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+use win32job::{ExtendedLimitInfo, Job};
+
+/// A running (or adopted) narration sidecar. `Owned` means this process spawned
+/// it and holds the handles needed to kill it; `Unmanaged` means it was already
+/// healthily running when we checked (our own earlier orphan, or a startup
+/// race) — usable, but this instance has no way to kill it. This asymmetry is
+/// deliberate: see `synthesize_with_restart`'s doc comment for why an
+/// `Unmanaged` failure is never retried by respawning on the same port.
+pub enum NarrationServer {
+    Owned {
+        child: tokio::process::Child,
+        #[cfg(target_os = "windows")]
+        _job: Job,
+        port: u16,
+        client: reqwest::Client,
+    },
+    Unmanaged {
+        port: u16,
+        client: reqwest::Client,
+    },
+}
+
+impl NarrationServer {
+    fn port(&self) -> u16 {
+        match self {
+            NarrationServer::Owned { port, .. } => *port,
+            NarrationServer::Unmanaged { port, .. } => *port,
+        }
+    }
+
+    fn client(&self) -> &reqwest::Client {
+        match self {
+            NarrationServer::Owned { client, .. } => client,
+            NarrationServer::Unmanaged { client, .. } => client,
+        }
+    }
+
+    /// Get a running sidecar on `port`: adopt an already-healthy one if
+    /// present, otherwise spawn a fresh one and wait for it to become ready.
+    /// This is both the normal "start the engine" path AND the stale-sweep
+    /// concept from the design — there is deliberately no separate sweep
+    /// function; see the module-level design note above.
+    pub async fn spawn_or_adopt(port: u16) -> Result<Self, String> {
+        let client = reqwest::Client::new();
+        if health_check(&client, port).await {
+            return Ok(NarrationServer::Unmanaged { port, client });
+        }
+        Self::spawn_owned(port, client).await
+    }
+
+    async fn spawn_owned(port: u16, client: reqwest::Client) -> Result<Self, String> {
+        let venv_dir = get_venv_dir();
+        let python_exe = venv_dir.join("Scripts").join("python.exe");
+        if !python_exe.exists() {
+            return Err(format!(
+                "מנוע ההקראה לא מותקן כראוי — python.exe לא נמצא בנתיב הצפוי ({}).",
+                python_exe.display()
+            ));
+        }
+
+        let args = build_server_args(VOICE_NAME, "127.0.0.1", port);
+
+        let mut child = tokio::process::Command::new(&python_exe)
+            .args(&args)
+            .kill_on_drop(true) // layer (a): clean-exit teardown
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("הפעלת מנוע ההקראה נכשלה. (פרטים טכניים: {e})"))?;
+
+        // Layer (b): Windows Job Object with KILL_ON_JOB_CLOSE — the sidecar
+        // dies with this app even on a hard crash/taskkill, not just clean exit.
+        #[cfg(target_os = "windows")]
+        let job = {
+            let mut info = ExtendedLimitInfo::new();
+            info.limit_kill_on_job_close();
+            let job = Job::create_with_limit_info(&info)
+                .map_err(|e| format!("יצירת הגנת תהליך למנוע ההקראה נכשלה. (פרטים טכניים: {e})"))?;
+            let handle = child
+                .raw_handle()
+                .ok_or_else(|| "מנוע ההקראה יצא מיד לאחר ההפעלה.".to_string())?
+                as isize;
+            job.assign_process(handle)
+                .map_err(|e| format!("שיוך מנוע ההקראה להגנת התהליך נכשל. (פרטים טכניים: {e})"))?;
+            job
+        };
+
+        // Poll /info until healthy or a 30s ceiling — piper1-gpl's cold start
+        // (loading the ONNX voice + Nakdimon) is real wall-clock time, not instant.
+        let mut attempts = 0;
+        loop {
+            if health_check(&client, port).await {
+                break;
+            }
+            attempts += 1;
+            if attempts > 60 {
+                let _ = child.kill().await;
+                return Err("מנוע ההקראה לא הגיב בזמן סביר. נסה שוב.".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        Ok(NarrationServer::Owned {
+            child,
+            #[cfg(target_os = "windows")]
+            _job: job,
+            port,
+            client,
+        })
+    }
+
+    /// Generate audio for `text`. On failure, restart once — but **only when
+    /// `self` is `Owned`**. An `Unmanaged` failure is NOT retried this way:
+    /// we don't know whether the adopted process is actually dead or just
+    /// returned one flaky response, `shutdown()` is a no-op for `Unmanaged`
+    /// (nothing to kill), and `spawn_owned`'s readiness poll can't tell "my
+    /// new process answered" from "the still-alive adopted process answered"
+    /// on the same port. If the adopted process is actually still alive, a
+    /// blind respawn attempt would silently create a second process bound to
+    /// the same port, orphan the tracked (new, likely dead-on-bind) one, and
+    /// leave the real orphan permanently untracked — exactly what
+    /// `spawn_or_adopt`'s adopt-instead-of-kill design was trying to avoid.
+    /// So an `Unmanaged` failure just surfaces the error; the caller can
+    /// re-run `spawn_or_adopt` from scratch, which correctly re-probes health.
+    pub async fn synthesize_with_restart(&mut self, text: &str) -> Result<Vec<u8>, NarrationError> {
+        if let Ok(bytes) = synthesize(self.client(), self.port(), text).await {
+            return Ok(bytes);
+        }
+
+        let port = match self {
+            NarrationServer::Owned { port, .. } => *port,
+            NarrationServer::Unmanaged { .. } => {
+                return Err(NarrationError::Unreachable(
+                    "מנוע ההקראה (שאומץ מריצה קודמת) לא הגיב. נסה שוב.".to_string(),
+                ));
+            }
+        };
+
+        self.shutdown().await;
+
+        match Self::spawn_owned(port, reqwest::Client::new()).await {
+            Ok(restarted) => {
+                let result = synthesize(restarted.client(), restarted.port(), text).await;
+                *self = restarted;
+                result
+            }
+            Err(e) => Err(NarrationError::Unreachable(e)),
+        }
+    }
+
+    /// Kill the process if we own it. A no-op for `Unmanaged` — there is
+    /// nothing to kill (see the module design note and `synthesize_with_restart`).
+    pub async fn shutdown(&mut self) {
+        if let NarrationServer::Owned { child, .. } = self {
+            let _ = child.kill().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spawn_fake_healthy_sidecar() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let response = tiny_http::Response::from_data(b"{}".to_vec());
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn spawn_or_adopt_returns_unmanaged_when_port_already_healthy() {
+        let port = spawn_fake_healthy_sidecar();
+
+        let result = NarrationServer::spawn_or_adopt(port).await;
+
+        assert!(
+            matches!(result, Ok(NarrationServer::Unmanaged { .. })),
+            "expected Unmanaged (adopted) when something already answers /info, got {:?}",
+            result.is_ok()
+        );
+    }
+}
