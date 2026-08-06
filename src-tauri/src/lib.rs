@@ -7,6 +7,7 @@ mod export;
 mod injector;
 mod local_api;
 mod model;
+mod narration;
 mod secure_keys;
 mod settings;
 mod srt;
