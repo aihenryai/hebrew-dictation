@@ -932,6 +932,7 @@ async fn narration_setup(app: AppHandle) -> Result<(), String> {
     narration_provision::provision_narration_engine(&app).await
 }
 
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn narration_setup(_app: AppHandle) -> Result<(), String> {
@@ -942,7 +943,8 @@ async fn narration_setup(_app: AppHandle) -> Result<(), String> {
 /// Lazily spawns/adopts the sidecar on first call in a session — never from
 /// `setup()`. Guards: empty text (client should already disable the button,
 /// this is defense in depth) and not-yet-provisioned (a clear pre-flight
-/// error, not a confusing spawn failure).
+/// error, not a confusing spawn failure). Concurrent calls are serialized by
+/// the mutex — a second call blocks until the first synthesis completes.
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<Vec<u8>, String> {
@@ -964,10 +966,21 @@ async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<
         *guard = Some(server);
     }
     // guard.is_none() was just checked/filled above, so this unwrap is safe.
-    let server = guard.as_mut().unwrap();
-    server.synthesize_with_restart(&text).await.map_err(|e| e.to_string())
+    let result = {
+        let server = guard.as_mut().unwrap();
+        server.synthesize_with_restart(&text).await.map_err(|e| e.to_string())
+    };
+    // If an adopted (Unmanaged) process is now dead, reset so the next call
+    // can re-probe via spawn_or_adopt rather than permanently failing.
+    if result.is_err() {
+        if let Some(narration_process::NarrationServer::Unmanaged { .. }) = &*guard {
+            *guard = None;
+        }
+    }
+    result
 }
 
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn generate_narration(
