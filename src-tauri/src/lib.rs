@@ -8,6 +8,8 @@ mod injector;
 mod local_api;
 mod model;
 mod narration;
+#[cfg(target_os = "windows")]
+mod narration_provision;
 mod secure_keys;
 mod settings;
 mod srt;
