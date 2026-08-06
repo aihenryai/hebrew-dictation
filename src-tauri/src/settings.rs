@@ -136,6 +136,10 @@ pub struct AppSettings {
     /// Port for the local API server. Default 5757.
     #[serde(default = "default_local_api_port")]
     pub local_api_port: u16,
+    /// Port for the narration engine's local HTTP sidecar. Default 5758
+    /// (sibling of the local API's 5757). No dedicated frontend UI in Phase 1.
+    #[serde(default = "default_narration_port")]
+    pub narration_port: u16,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -169,6 +173,7 @@ pub struct RedactedSettings {
     pub enhance_mode: String,
     pub local_api_enabled: bool,
     pub local_api_port: u16,
+    pub narration_port: u16,
 }
 
 impl AppSettings {
@@ -202,6 +207,7 @@ impl AppSettings {
             enhance_mode: self.enhance_mode.clone(),
             local_api_enabled: self.local_api_enabled,
             local_api_port: self.local_api_port,
+            narration_port: self.narration_port,
         }
     }
 }
@@ -246,6 +252,10 @@ fn default_local_api_port() -> u16 {
     5757
 }
 
+fn default_narration_port() -> u16 {
+    5758
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -277,6 +287,7 @@ impl Default for AppSettings {
             enhance_mode: default_enhance_mode(),
             local_api_enabled: false,
             local_api_port: default_local_api_port(),
+            narration_port: default_narration_port(),
         }
     }
 }
@@ -474,6 +485,7 @@ impl AppSettings {
         // them to the serde default.
         incoming.local_api_enabled = self.local_api_enabled;
         incoming.local_api_port = self.local_api_port;
+        incoming.narration_port = self.narration_port;
         incoming
     }
 }
@@ -511,5 +523,13 @@ mod merge_tests {
         assert_eq!(merged.deepgram_api_key.as_deref(), Some("dg_secret"));
         // ...while the genuine user change is kept.
         assert_eq!(merged.audio_volume, 0.9);
+    }
+
+    #[test]
+    fn merge_frontend_update_preserves_narration_port_not_exposed_to_frontend_yet() {
+        let current = AppSettings { narration_port: 9999, ..AppSettings::default() };
+        let incoming = AppSettings::default(); // simulates a frontend payload that never carries this field
+        let merged = current.merge_frontend_update(incoming);
+        assert_eq!(merged.narration_port, 9999, "a settings-json-only field must survive a frontend save");
     }
 }
