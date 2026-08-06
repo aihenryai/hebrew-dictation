@@ -73,8 +73,15 @@ impl NarrationServer {
 
         let args = build_server_args(VOICE_NAME, "127.0.0.1", port);
 
+        // piper's http_server resolves `-m <voice>` against `--data-dir`, which
+        // defaults to the *child process's* CWD — not this app's install dir.
+        // Without pinning it explicitly, the voice lookup depends on whatever
+        // directory happened to launch the app and fails with "Unable to find
+        // voice" in any real deployment. The voice file lives directly in
+        // `get_narration_dir()` (see `narration_provision::get_voice_path`).
         let mut child = tokio::process::Command::new(&python_exe)
             .args(&args)
+            .current_dir(crate::narration_provision::get_narration_dir())
             .kill_on_drop(true) // layer (a): clean-exit teardown
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -100,10 +107,20 @@ impl NarrationServer {
 
         // Poll /info until healthy or a 30s ceiling — piper1-gpl's cold start
         // (loading the ONNX voice + Nakdimon) is real wall-clock time, not instant.
+        // Also check whether the child has already exited on each iteration:
+        // a crash (e.g. a missing/misconfigured voice) fails fast, and without
+        // this check the loop would burn the full 30s ceiling polling a dead
+        // port before reporting a misleading "didn't respond in time" error
+        // instead of the real cause.
         let mut attempts = 0;
         loop {
             if health_check(&client, port).await {
                 break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!(
+                    "מנוע ההקראה קרס מיד לאחר ההפעלה (קוד יציאה: {status}). ודא שהמנוע הותקן כראוי."
+                ));
             }
             attempts += 1;
             if attempts > 60 {
@@ -183,6 +200,7 @@ impl NarrationServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::narration::looks_like_valid_wav;
 
     fn spawn_fake_healthy_sidecar() -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -269,5 +287,40 @@ mod tests {
         let result = server.synthesize_with_restart("שלום עולם").await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a fully provisioned narration engine (real uv+venv+piper-tts+voice) — run explicitly after provisioning has completed for real"]
+    async fn spawn_owned_produces_a_working_sidecar_and_shutdown_kills_it() {
+        let port = 15758; // a port unlikely to collide with anything else in the test run
+
+        let mut server = NarrationServer::spawn_owned(port, reqwest::Client::new())
+            .await
+            .expect("spawn_owned should succeed against a real provisioned engine");
+
+        // Real proof #1: it actually generates audio, not just "the process started."
+        let audio = synthesize(server.client(), server.port(), "בדיקה")
+            .await
+            .expect("a live, healthy sidecar should synthesize real audio");
+        assert!(looks_like_valid_wav(&audio));
+
+        // Real proof #2: shutdown() (the clean-exit path) actually kills the
+        // process — the orphan-prevention claim, verified behaviorally rather
+        // than assumed from reading the win32job/tokio API docs. Re-probing
+        // the port after shutdown should find nothing there.
+        server.shutdown().await;
+
+        // Give the OS a moment to actually tear down the listening socket —
+        // kill() returning doesn't guarantee the port is instantly free.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let client = reqwest::Client::new();
+        assert!(
+            !health_check(&client, port).await,
+            "the sidecar should be unreachable after shutdown() — if this fails, \
+             either kill_on_drop or the explicit kill() call isn't actually \
+             terminating the process, which is the exact orphan bug this whole \
+             chunk exists to catch"
+        );
     }
 }

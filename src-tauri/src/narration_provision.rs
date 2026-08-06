@@ -126,6 +126,12 @@ pub const VOICE_NAME: &str = "he_IL-saspeech-medium"; // pub: a later sidecar-li
 const VOICE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/he/he_IL/saspeech/medium/he_IL-saspeech-medium.onnx";
 const VOICE_SIZE: u64 = 63_221_984;
 const VOICE_SHA256: &str = "3dc067debc9e782a8a0d095dbb58786648743d406366dcc2aa81009660873b4d";
+// piper's `PiperVoice.load()` requires this config sidecar next to the
+// `.onnx` model (speaker count, phoneme map, inference defaults) — without
+// it the sidecar crashes immediately on startup with a FileNotFoundError.
+const VOICE_CONFIG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/he/he_IL/saspeech/medium/he_IL-saspeech-medium.onnx.json";
+const VOICE_CONFIG_SIZE: u64 = 5_269;
+const VOICE_CONFIG_SHA256: &str = "e9800a282a6cf2e44b3ad97f640b38e35ed246dfe070458d13bfcf206befc5bf";
 
 pub fn get_venv_dir() -> PathBuf { // pub: a later sidecar-lifecycle module needs the venv's python.exe path
     get_narration_dir().join("venv")
@@ -133,6 +139,10 @@ pub fn get_venv_dir() -> PathBuf { // pub: a later sidecar-lifecycle module need
 
 fn get_voice_path() -> PathBuf {
     get_narration_dir().join(format!("{VOICE_NAME}.onnx"))
+}
+
+fn get_voice_config_path() -> PathBuf {
+    get_narration_dir().join(format!("{VOICE_NAME}.onnx.json"))
 }
 
 fn get_marker_path() -> PathBuf {
@@ -266,6 +276,25 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
     // for whisper models — without it, a retry after a late failure (e.g. the
     // marker-write below failing right after a successful ~63MB voice
     // download) would re-download the voice for no reason.
+    // Config first — it's a few KB, so any progress-bar flash from it is
+    // over before the much longer model download even shows meaningful
+    // progress.
+    let voice_config_path = get_voice_config_path();
+    let voice_config_already_valid = voice_config_path.exists()
+        && std::fs::metadata(&voice_config_path).map(|m| m.len() == VOICE_CONFIG_SIZE).unwrap_or(false);
+    if !voice_config_already_valid {
+        crate::model::download_and_verify(
+            app,
+            VOICE_CONFIG_URL,
+            &voice_config_path,
+            VOICE_CONFIG_SIZE,
+            VOICE_CONFIG_SHA256,
+            "narration-voice-download-progress",
+            "הגדרות קול ההקראה",
+        )
+        .await?;
+    }
+
     let voice_path = get_voice_path();
     let voice_already_valid = voice_path.exists()
         && std::fs::metadata(&voice_path).map(|m| m.len() == VOICE_SIZE).unwrap_or(false);
@@ -337,17 +366,35 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the real network (GitHub) and takes ~10s — run explicitly with `cargo test -- --ignored`, not part of the default suite"]
     async fn ensure_uv_available_downloads_and_extracts_a_working_exe() {
-        // This is the one real integration point in this task: confirms the
-        // pinned URL/size/hash in this file are still correct AND that
-        // Expand-Archive actually produces a runnable uv.exe. Needs a real
-        // AppHandle, which a plain #[test] can't construct — this is more
-        // naturally exercised as part of a later integration-test task with
-        // tauri::test::mock_app(). Left here as a marker with #[ignore] so
-        // it's discoverable, not deleted — implement its body in that later
-        // task alongside the other #[ignore]-gated real-environment tests.
-        // NOTE: this body is currently EMPTY — running it with `--ignored`
-        // right now passes trivially and verifies nothing. An empty-body
-        // pass here is not real verification; don't mistake it for one.
+        // Real Tauri AppHandle needed for the download-progress `app.emit` calls
+        // inside `download_and_verify` — `tauri::test::mock_app()` gives us one
+        // without a real window.
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+
+        // Clean slate: if a previous run left uv.exe in place, this test would
+        // trivially "pass" via the early-return in ensure_uv_available without
+        // exercising the download+extract path at all.
+        let uv_exe = get_uv_exe_path();
+        let _ = std::fs::remove_file(&uv_exe);
+
+        let result = ensure_uv_available(handle).await;
+        assert!(result.is_ok(), "expected uv to download and extract, got {result:?}");
+
+        let returned_path = result.unwrap();
+        assert!(returned_path.exists());
+
+        // The real proof: is this actually a working uv.exe, not just a file
+        // that happens to exist at the right path?
+        let version_output = std::process::Command::new(&returned_path)
+            .arg("--version")
+            .output()
+            .expect("uv.exe should be directly executable");
+        let version_text = String::from_utf8_lossy(&version_output.stdout);
+        assert!(
+            version_text.contains(UV_VERSION),
+            "expected `uv --version` to report {UV_VERSION}, got: {version_text}"
+        );
     }
 
     /// ⚠️ Safety-critical test helper — read this comment before touching it.
