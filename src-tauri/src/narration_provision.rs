@@ -4,6 +4,7 @@
 //! Windows-only (macOS out of scope for Phase 1).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -158,6 +159,16 @@ pub fn narration_engine_state() -> NarrationEngineState {
     }
 }
 
+/// Last ~5 lines of a subprocess's stderr, for embedding in an error
+/// message. Lossy-converts — `uv`/pip stderr is expected to be UTF-8, but
+/// this must never panic on a stray non-UTF-8 byte.
+fn tail_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(5);
+    lines[start..].join("\n")
+}
+
 /// Run the full provisioning flow if not already done: `uv` → venv →
 /// `piper-tts` → voice → atomic marker. Safe to call every time the user
 /// opens the narration screen — returns immediately if already `Ready`.
@@ -192,17 +203,37 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
         ("UV_CACHE_DIR", narration_dir.join("uv-cache").to_string_lossy().to_string()),
     ];
 
-    let venv_status = tokio::process::Command::new(&uv_exe)
+    // `uv venv --python 3.11` may need to download an entire Python build
+    // (~30-60MB from astral.sh) on first run — 300s covers a slow/stalled
+    // connection without hanging the provisioning UI forever.
+    let mut venv_cmd = tokio::process::Command::new(&uv_exe);
+    venv_cmd
         .args(["venv", &venv_dir.to_string_lossy(), "--python", "3.11"])
-        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
-        .status()
-        .await
-        .map_err(|e| format!("יצירת סביבת ההרצה למנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))?;
-    if !venv_status.success() {
-        return Err("יצירת סביבת ההרצה למנוע ההקראה נכשלה.".to_string());
+        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
+    let venv_output = match tokio::time::timeout(Duration::from_secs(300), venv_cmd.output()).await {
+        Err(_) => {
+            return Err(
+                "יצירת סביבת ההרצה למנוע ההקראה ארכה יותר מדי זמן, בדוק את החיבור לאינטרנט ונסה שוב."
+                    .to_string(),
+            )
+        }
+        Ok(Err(e)) => {
+            return Err(format!("יצירת סביבת ההרצה למנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))
+        }
+        Ok(Ok(output)) => output,
+    };
+    if !venv_output.status.success() {
+        return Err(format!(
+            "יצירת סביבת ההרצה למנוע ההקראה נכשלה (קוד יציאה: {}).\n{}",
+            venv_output.status.code().map_or_else(|| "לא ידוע".to_string(), |c| c.to_string()),
+            tail_stderr(&venv_output.stderr)
+        ));
     }
 
-    let pip_status = tokio::process::Command::new(&uv_exe)
+    // `piper-tts[http]` pulls in a bigger dependency set (torch etc. via
+    // transitive deps) than the venv step — 600s gives it more room.
+    let mut pip_cmd = tokio::process::Command::new(&uv_exe);
+    pip_cmd
         .args([
             "pip",
             "install",
@@ -213,12 +244,22 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
             // `ModuleNotFoundError: No module named 'flask'`.
             &format!("piper-tts[http]=={PIPER_TTS_VERSION}"),
         ])
-        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())))
-        .status()
-        .await
-        .map_err(|e| format!("התקנת מנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))?;
-    if !pip_status.success() {
-        return Err("התקנת מנוע ההקראה נכשלה.".to_string());
+        .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
+    let pip_output = match tokio::time::timeout(Duration::from_secs(600), pip_cmd.output()).await {
+        Err(_) => {
+            return Err(
+                "התקנת מנוע ההקראה ארכה יותר מדי זמן, בדוק את החיבור לאינטרנט ונסה שוב.".to_string(),
+            )
+        }
+        Ok(Err(e)) => return Err(format!("התקנת מנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})")),
+        Ok(Ok(output)) => output,
+    };
+    if !pip_output.status.success() {
+        return Err(format!(
+            "התקנת מנוע ההקראה נכשלה (קוד יציאה: {}).\n{}",
+            pip_output.status.code().map_or_else(|| "לא ידוע".to_string(), |c| c.to_string()),
+            tail_stderr(&pip_output.stderr)
+        ));
     }
 
     // Same "already downloaded and valid" short-circuit download_model has
@@ -247,7 +288,9 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
         piper_tts_version: PIPER_TTS_VERSION.to_string(),
         voice_name: VOICE_NAME.to_string(),
     };
-    std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap())
+    let marker_json = serde_json::to_string(&marker)
+        .map_err(|e| format!("סידור נתוני הסימון נכשל. (פרטים טכניים: {e})"))?;
+    std::fs::write(get_marker_path(), marker_json)
         .map_err(|e| format!("סימון סיום ההתקנה נכשל. (פרטים טכניים: {e})"))?;
 
     Ok(())
@@ -346,7 +389,18 @@ mod tests {
         }
     }
 
+    // Serializes the ENTIRE with_temp_app_data body (acquired before
+    // MarkerGuard::new()) because all 4 marker tests below share the same
+    // real file path (get_marker_path() isn't per-test-overridable — see
+    // MarkerGuard's doc comment). Without this, `cargo test`'s default
+    // parallel-within-binary execution lets one thread's MarkerGuard
+    // snapshot+clear race another thread's in-progress write, corrupting or
+    // destroying it. Makes `--test-threads=1` redundant for this specific
+    // race, but that flag stays as the documented convention regardless.
+    static MARKER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_temp_app_data<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = MARKER_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = MarkerGuard::new(); // restores the real marker on drop, even on panic
         f()
     }
