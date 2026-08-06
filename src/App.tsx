@@ -47,7 +47,7 @@ const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
 )}`;
 
 type AppStatus = "idle" | "recording" | "transcribing" | "enhancing" | "downloading" | "loading-model";
-type AppView = "main" | "settings" | "onboarding" | "batch";
+type AppView = "main" | "settings" | "onboarding" | "batch" | "narration";
 type BatchFileStatus = "pending" | "processing" | "done" | "cancelled" | "error";
 interface TimedSegment {
   text: string;
@@ -439,6 +439,14 @@ function App() {
   const [recordSource, setRecordSource] = useState<RecordingSource>("mic");
   const [batchRecordElapsed, setBatchRecordElapsed] = useState(0);
   const [batchActiveResultId, setBatchActiveResultId] = useState<number | null>(null);
+  // הקראה (narration) screen state.
+  const [narrationText, setNarrationText] = useState("");
+  const [narrationGenerating, setNarrationGenerating] = useState(false);
+  const [narrationAudioUrl, setNarrationAudioUrl] = useState<string | null>(null);
+  const [narrationBytes, setNarrationBytes] = useState<Uint8Array | null>(null);
+  const [narrationReady, setNarrationReady] = useState(false);
+  const [narrationProvisioning, setNarrationProvisioning] = useState(false);
+  const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
@@ -750,6 +758,14 @@ function App() {
       const data = event.payload as { progress: number };
       setDownloadProgress(data.progress);
     });
+    const unlistenNarrationEngineProgress = listen("narration-engine-download-progress", (event) => {
+      const data = event.payload as { progress: number };
+      setNarrationProvisionProgress(data.progress);
+    });
+    const unlistenNarrationVoiceProgress = listen("narration-voice-download-progress", (event) => {
+      const data = event.payload as { progress: number };
+      setNarrationProvisionProgress(data.progress);
+    });
     const unlistenClose = listen("window-close-attempted", async () => {
       pendingCloseTipRef.current = true;
     });
@@ -775,6 +791,8 @@ function App() {
     );
     return () => {
       unlistenProgress.then((fn) => fn());
+      unlistenNarrationEngineProgress.then((fn) => fn());
+      unlistenNarrationVoiceProgress.then((fn) => fn());
       unlistenClose.then((fn) => fn());
       unlistenFocus.then((fn) => fn());
       unlistenMigration.then((fn) => fn());
@@ -949,6 +967,74 @@ function App() {
       setExporting(null);
     }
   }, [history]);
+
+  // ── הקראה (narration) handlers ──
+  const checkNarrationReady = useCallback(async () => {
+    try {
+      const ready = await invoke<boolean>("ensure_narration_ready");
+      setNarrationReady(ready);
+    } catch {
+      setNarrationReady(false);
+    }
+  }, []);
+
+  const runNarrationSetup = useCallback(async () => {
+    setNarrationProvisioning(true);
+    setNarrationProvisionProgress(0);
+    setError("");
+    try {
+      await invoke("narration_setup");
+      await checkNarrationReady();
+    } catch (e) {
+      setError(`התקנת מנוע ההקראה נכשלה: ${e}`);
+    } finally {
+      setNarrationProvisioning(false);
+    }
+  }, [checkNarrationReady]);
+
+  const generateNarration = useCallback(async () => {
+    if (!narrationText.trim()) return;
+    setNarrationGenerating(true);
+    setError("");
+    try {
+      const bytes = await invoke<number[]>("generate_narration", { text: narrationText });
+      const arr = new Uint8Array(bytes);
+      const blob = new Blob([arr], { type: "audio/wav" });
+      const newUrl = URL.createObjectURL(blob);
+      // Only release the PREVIOUS clip once the new one is confirmed created —
+      // revoking eagerly at function entry would mean a failed second generate
+      // leaves narrationAudioUrl state pointing at an already-revoked URL,
+      // silently breaking playback of the still-valid first clip.
+      if (narrationAudioUrl) {
+        URL.revokeObjectURL(narrationAudioUrl);
+      }
+      setNarrationBytes(arr);
+      setNarrationAudioUrl(newUrl);
+    } catch (e) {
+      setError(`יצירת ההקראה נכשלה: ${e}`);
+    } finally {
+      setNarrationGenerating(false);
+    }
+  }, [narrationText, narrationAudioUrl]);
+
+  const saveNarrationWav = useCallback(async () => {
+    if (!narrationBytes) return;
+    try {
+      const suggested = narrationText.trim().slice(0, 40) || undefined;
+      await invoke<string>("save_narration_wav", {
+        bytes: Array.from(narrationBytes),
+        suggested_name: suggested,
+      });
+    } catch (e) {
+      setError(`שמירת הקובץ נכשלה: ${e}`);
+    }
+  }, [narrationBytes, narrationText]);
+
+  useEffect(() => {
+    if (view === "narration") {
+      checkNarrationReady();
+    }
+  }, [view, checkNarrationReady]);
 
   // ── Batch file transcription handlers ──
   const handlePickAndTranscribe = useCallback(async () => {
@@ -2771,6 +2857,69 @@ function App() {
     );
   }
 
+  if (view === "narration") {
+    return (
+      <main className="container batch-view" dir="rtl">
+        <div className="batch-view-header">
+          <button className="btn-back" onClick={() => setView("main")} aria-label="חזור">חזור</button>
+          <h2 className="batch-view-title">הקראה</h2>
+          <button
+            className="btn-settings-labeled"
+            style={{ marginInlineStart: "auto" }}
+            onClick={() => { setSettingsReturn("narration"); setView("settings"); }}
+            title="הגדרות"
+            aria-label="הגדרות"
+          >
+            <span className="gear" aria-hidden="true">⚙</span> הגדרות
+          </button>
+        </div>
+
+        {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
+
+        {!narrationReady && !narrationProvisioning && (
+          <div className="narration-setup-prompt">
+            <p>מנוע ההקראה עדיין לא הותקן. ההתקנה חד-פעמית, פועלת ברקע, ולא דורשת ידע טכני.</p>
+            <button className="btn-primary" onClick={runNarrationSetup}>התקן מנוע הקראה</button>
+          </div>
+        )}
+
+        {narrationProvisioning && (
+          <div className="narration-setup-progress">
+            <p>מתקין מנוע הקראה… ({narrationProvisionProgress}%)</p>
+            <progress value={narrationProvisionProgress} max={100} />
+          </div>
+        )}
+
+        {narrationReady && (
+          <>
+            <textarea
+              className="narration-textarea"
+              value={narrationText}
+              onChange={(e) => setNarrationText(e.target.value)}
+              placeholder="הדביקו או הקלידו טקסט בעברית להקראה…"
+              dir="rtl"
+              rows={8}
+            />
+            <button
+              className="btn-primary"
+              onClick={generateNarration}
+              disabled={!narrationText.trim() || narrationGenerating}
+            >
+              {narrationGenerating ? "יוצר…" : "צור קול"}
+            </button>
+
+            {narrationAudioUrl && (
+              <div className="narration-result">
+                <audio controls src={narrationAudioUrl} />
+                <button className="btn-secondary" onClick={saveNarrationWav}>שמור כ-WAV</button>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    );
+  }
+
   return (
     <main className="container compact" dir="rtl">
       {showCloseTip && (
@@ -2809,6 +2958,11 @@ function App() {
             onClick={() => setView("batch")}
             aria-label="הקלט ותמלל או תמלול קבצי שמע"
           >הקלט ותמלל / תמלול קבצי שמע</button>
+          <button
+            className="btn-batch-nav btn-mode-narration"
+            onClick={() => setView("narration")}
+            aria-label="הקראה"
+          >🔊 הקראה</button>
         </div>
       </div>
 
