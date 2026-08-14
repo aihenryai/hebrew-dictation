@@ -157,6 +157,19 @@ interface ExportHistoryItem {
 
 /** First 4 words of a transcript, capped at 40 chars — used as a content-derived
  *  export filename for BOTH the regular dictation history and batch file results. */
+// One generated narration kept in the session history. `url` is a blob URL
+// owned by this entry — revoke it when the entry is dropped.
+interface NarrationClip {
+  id: number;
+  text: string;
+  timestamp: string;
+  bytes: Uint8Array;
+  url: string;
+}
+// Lower than the dictation history's 20: each clip holds real audio bytes.
+const NARRATION_HISTORY_MAX = 10;
+let narrationIdCounter = 0;
+
 // Narration speed slider. Integer steps map to piper's length_scale (phoneme
 // duration, so HIGHER IS SLOWER) via exact hundredths, which keeps every
 // position on a clean value and makes the default exactly reachable again
@@ -454,8 +467,12 @@ function App() {
   // קריינות (narration) screen state.
   const [narrationText, setNarrationText] = useState("");
   const [narrationGenerating, setNarrationGenerating] = useState(false);
-  const [narrationAudioUrl, setNarrationAudioUrl] = useState<string | null>(null);
-  const [narrationBytes, setNarrationBytes] = useState<Uint8Array | null>(null);
+  // Past narrations, newest first — same session-scoped, capped shape as the
+  // dictation `history` above. Capped lower because each entry carries real
+  // audio (hundreds of KB) rather than a string. Every entry owns a blob URL
+  // that MUST be revoked when the entry leaves this list, or the audio stays
+  // in memory for the life of the process.
+  const [narrationHistory, setNarrationHistory] = useState<NarrationClip[]>([]);
   const [narrationReady, setNarrationReady] = useState(false);
   const [narrationProvisioning, setNarrationProvisioning] = useState(false);
   const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
@@ -1023,34 +1040,44 @@ function App() {
       });
       const arr = new Uint8Array(bytes);
       const blob = new Blob([arr], { type: "audio/wav" });
-      const newUrl = URL.createObjectURL(blob);
-      // Only release the PREVIOUS clip once the new one is confirmed created —
-      // revoking eagerly at function entry would mean a failed second generate
-      // leaves narrationAudioUrl state pointing at an already-revoked URL,
-      // silently breaking playback of the still-valid first clip.
-      if (narrationAudioUrl) {
-        URL.revokeObjectURL(narrationAudioUrl);
-      }
-      setNarrationBytes(arr);
-      setNarrationAudioUrl(newUrl);
+      const clip: NarrationClip = {
+        id: ++narrationIdCounter,
+        text: narrationText.trim(),
+        timestamp: new Date().toISOString(),
+        bytes: arr,
+        url: URL.createObjectURL(blob),
+      };
+      setNarrationHistory((prev) => {
+        const next = [clip, ...prev];
+        // Release anything pushed past the cap, otherwise its audio is
+        // unreachable but still held in memory.
+        next.slice(NARRATION_HISTORY_MAX).forEach((c) => URL.revokeObjectURL(c.url));
+        return next.slice(0, NARRATION_HISTORY_MAX);
+      });
     } catch (e) {
       setError(`יצירת הקריינות נכשלה: ${e}`);
     } finally {
       setNarrationGenerating(false);
     }
-  }, [narrationText, narrationAudioUrl, narrationRateStep]);
+  }, [narrationText, narrationRateStep]);
 
-  const saveNarrationWav = useCallback(async () => {
-    if (!narrationBytes) return;
+  const deleteNarrationClip = useCallback((id: number) => {
+    setNarrationHistory((prev) => {
+      prev.filter((c) => c.id === id).forEach((c) => URL.revokeObjectURL(c.url));
+      return prev.filter((c) => c.id !== id);
+    });
+  }, []);
+
+  const saveNarrationWav = useCallback(async (clip: NarrationClip) => {
     setNarrationSaveNotice(null);
     try {
       // camelCase, not snake_case: Tauri exposes Rust's `suggested_name` to JS
       // as `suggestedName` (same as `file_path` -> `filePath` elsewhere here).
       // Passing snake_case bound nothing, so the Option<String> silently
       // arrived as None and every file fell back to the generic timestamp name.
-      const suggestedName = firstWordsName(narrationText) || undefined;
+      const suggestedName = firstWordsName(clip.text) || undefined;
       const path = await invoke<string>("save_narration_wav", {
-        bytes: Array.from(narrationBytes),
+        bytes: Array.from(clip.bytes),
         suggestedName,
       });
       setNarrationSaveNotice(`✅ נשמר: ${path}`);
@@ -1061,7 +1088,7 @@ function App() {
         setError(`שמירת הקובץ נכשלה: ${msg}`);
       }
     }
-  }, [narrationBytes, narrationText]);
+  }, []);
 
   useEffect(() => {
     if (view === "narration") {
@@ -2980,16 +3007,39 @@ function App() {
               onClick={generateNarration}
               disabled={!narrationText.trim() || narrationGenerating}
             >
-              {narrationGenerating ? "יוצר…" : "צור קול"}
+              {narrationGenerating ? "יוצר…" : "צור קריינות"}
             </button>
 
-            {narrationAudioUrl && (
-              <div className="narration-result">
-                <audio controls src={narrationAudioUrl} />
-                <button className="btn-secondary" onClick={saveNarrationWav}>שמור כ-WAV</button>
-                {narrationSaveNotice && (
-                  <p className="success-note" style={{ wordBreak: "break-all" }}>{narrationSaveNotice}</p>
-                )}
+            {narrationSaveNotice && (
+              <p className="success-note" style={{ wordBreak: "break-all" }}>{narrationSaveNotice}</p>
+            )}
+
+            {narrationHistory.length > 0 && (
+              <div className="narration-history">
+                <h3 className="narration-history-title">
+                  קריינויות קודמות ({narrationHistory.length})
+                </h3>
+                {narrationHistory.map((clip) => (
+                  <div key={clip.id} className="narration-clip">
+                    <p className="narration-clip-text" title={clip.text}>{clip.text}</p>
+                    <audio controls src={clip.url} />
+                    <div className="narration-clip-actions">
+                      <button className="btn-secondary" onClick={() => saveNarrationWav(clip)}>
+                        שמור כ-WAV
+                      </button>
+                      <button
+                        className="btn-secondary btn-clip-delete"
+                        onClick={() => deleteNarrationClip(clip.id)}
+                        aria-label="מחק קריינות"
+                      >
+                        מחק
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                <p className="narration-history-note">
+                  הרשימה נשמרת עד סגירת האפליקציה. שמרו כ-WAV מה שרוצים לשמור לצמיתות.
+                </p>
               </div>
             )}
           </>
