@@ -2961,13 +2961,13 @@ function App() {
               dir="rtl"
               rows={8}
             />
-            {/* Measured limits, not guesses: the Hebrew-only phonemizer garbles
-                Latin words and digits, and short fragments synthesize
-                inconsistently (identical input can come out clean or slurred).
-                Both improve markedly with full sentences. */}
+            {/* Measured against the current engine, not carried over: the
+                short-sentence instability the old piper engine had is gone
+                (4/4 exact ASR round-trips vs 0/6 before), so that warning was
+                removed. Latin words and digits still garble — the phonemizer
+                is Hebrew-only — and that one still reproduces every time. */}
             <p className="narration-hint">
-              לתוצאה הכי טובה — כתבו משפטים מלאים בעברית בלבד. שמות באנגלית
-              ומספרים עלולים להישמע משובשים, ומשפטים קצרים מאוד פחות יציבים.
+              כתבו בעברית בלבד — שמות באנגלית ומספרים עלולים להישמע משובשים.
             </p>
 
             <div className="narration-rate">
