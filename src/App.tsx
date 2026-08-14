@@ -2918,6 +2918,14 @@ function App() {
               dir="rtl"
               rows={8}
             />
+            {/* Measured limits, not guesses: the Hebrew-only phonemizer garbles
+                Latin words and digits, and short fragments synthesize
+                inconsistently (identical input can come out clean or slurred).
+                Both improve markedly with full sentences. */}
+            <p className="narration-hint">
+              לתוצאה הכי טובה — כתבו משפטים מלאים בעברית בלבד. שמות באנגלית
+              ומספרים עלולים להישמע משובשים, ומשפטים קצרים מאוד פחות יציבים.
+            </p>
 
             <div className="narration-rate">
               <label htmlFor="narration-rate-slider">

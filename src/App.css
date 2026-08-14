@@ -1758,6 +1758,14 @@ body:has(.toolbar-idle) #root {
   text-align: right;
 }
 
+.narration-hint {
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: #7d87a3;
+  text-align: right;
+  margin: -0.25rem 0 0.8rem;
+}
+
 .narration-rate {
   margin-bottom: 0.85rem;
   text-align: right;
