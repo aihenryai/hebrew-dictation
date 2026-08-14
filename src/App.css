@@ -1758,6 +1758,38 @@ body:has(.toolbar-idle) #root {
   text-align: right;
 }
 
+.narration-rate {
+  margin-bottom: 0.85rem;
+  text-align: right;
+}
+.narration-rate label {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.8rem;
+  color: #a0a8c0;
+  margin-bottom: 0.3rem;
+}
+.narration-rate-value {
+  color: #fbbf24;
+  font-weight: 600;
+}
+.narration-rate input[type="range"] {
+  width: 100%;
+  accent-color: #fbbf24;
+  margin: 0;
+}
+/* LTR to match the slider's forced direction, so "איטי" sits under the slow
+   (min) end and "מהיר" under the fast (max) end. */
+.narration-rate-ends {
+  direction: ltr;
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: #6b7594;
+  margin-top: 0.15rem;
+}
+
 .narration-result {
   margin-top: 1rem;
   display: flex;
@@ -2190,10 +2222,8 @@ body:has(.toolbar-idle) #root {
    the two entries read as separate actions (same pattern as the teal/gold
    split already used for other mode pairs in this file). */
 .btn-mode-narration {
-  color: #f0abfc;
-  border-color: #f0abfc55;
-  white-space: normal;
-  line-height: 1.25;
+  color: #fbbf24;
+  border-color: #fbbf2455;
 }
-.btn-mode-narration:hover { background: #3b1332; border-color: #f0abfc; }
+.btn-mode-narration:hover { background: #3a2c08; border-color: #fbbf24; }
 

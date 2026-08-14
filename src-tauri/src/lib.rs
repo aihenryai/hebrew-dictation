@@ -947,7 +947,13 @@ async fn narration_setup(_app: AppHandle) -> Result<(), String> {
 /// the mutex — a second call blocks until the first synthesis completes.
 #[cfg(target_os = "windows")]
 #[tauri::command]
-async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<Vec<u8>, String> {
+async fn generate_narration(
+    state: State<'_, AppState>,
+    text: String,
+    // Optional so an older/simpler caller still gets the tuned default rather
+    // than piper's own too-fast 1.0. Higher = slower (phoneme duration).
+    length_scale: Option<f32>,
+) -> Result<Vec<u8>, String> {
     if text.trim().is_empty() {
         return Err("אין טקסט להקראה".to_string());
     }
@@ -968,7 +974,8 @@ async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<
     // guard.is_none() was just checked/filled above, so this unwrap is safe.
     let result = {
         let server = guard.as_mut().unwrap();
-        server.synthesize_with_restart(&text).await.map_err(|e| e.to_string())
+        let rate = length_scale.unwrap_or(narration::DEFAULT_LENGTH_SCALE);
+        server.synthesize_with_restart(&text, rate).await.map_err(|e| e.to_string())
     };
     // If an adopted (Unmanaged) process is now dead, reset so the next call
     // can re-probe via spawn_or_adopt rather than permanently failing.
@@ -986,6 +993,7 @@ async fn generate_narration(state: State<'_, AppState>, text: String) -> Result<
 async fn generate_narration(
     _state: State<'_, AppState>,
     _text: String,
+    _length_scale: Option<f32>,
 ) -> Result<Vec<u8>, String> {
     Err("הקראה זמינה רק ב-Windows כרגע".to_string())
 }

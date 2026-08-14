@@ -155,8 +155,12 @@ impl NarrationServer {
     /// On `Err` from a failed respawn attempt, `self` retains the `Owned`
     /// variant with a dead child; the next call will retry the respawn
     /// attempt (shutdown on a dead child is a safe no-op).
-    pub async fn synthesize_with_restart(&mut self, text: &str) -> Result<Vec<u8>, NarrationError> {
-        if let Ok(bytes) = synthesize(self.client(), self.port(), text).await {
+    pub async fn synthesize_with_restart(
+        &mut self,
+        text: &str,
+        length_scale: f32,
+    ) -> Result<Vec<u8>, NarrationError> {
+        if let Ok(bytes) = synthesize(self.client(), self.port(), text, length_scale).await {
             return Ok(bytes);
         }
 
@@ -173,7 +177,8 @@ impl NarrationServer {
 
         match Self::spawn_owned(port, reqwest::Client::new()).await {
             Ok(restarted) => {
-                let result = synthesize(restarted.client(), restarted.port(), text).await;
+                let result =
+                    synthesize(restarted.client(), restarted.port(), text, length_scale).await;
                 *self = restarted;
                 result
             }
@@ -244,7 +249,7 @@ mod tests {
             .unwrap();
         let mut server = NarrationServer::Unmanaged { port: 1, client };
 
-        let result = server.synthesize_with_restart("שלום עולם").await;
+        let result = server.synthesize_with_restart("שלום עולם", crate::narration::DEFAULT_LENGTH_SCALE).await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
         assert!(
@@ -284,7 +289,7 @@ mod tests {
 
         // /synthesize fails on the adopted process — must surface as an
         // error, never attempt a respawn on the same port.
-        let result = server.synthesize_with_restart("שלום עולם").await;
+        let result = server.synthesize_with_restart("שלום עולם", crate::narration::DEFAULT_LENGTH_SCALE).await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
     }
@@ -305,7 +310,7 @@ mod tests {
             .expect("spawn_owned should succeed against a real provisioned engine");
 
         // Real proof #1: it actually generates audio, not just "the process started."
-        let audio = synthesize(server.client(), server.port(), "בדיקה")
+        let audio = synthesize(server.client(), server.port(), "בדיקה", crate::narration::DEFAULT_LENGTH_SCALE)
             .await
             .expect("a live, healthy sidecar should synthesize real audio");
         assert!(looks_like_valid_wav(&audio));

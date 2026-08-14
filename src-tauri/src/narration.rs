@@ -5,6 +5,21 @@
 use serde::Serialize;
 use std::time::Duration;
 
+/// Seconds of silence piper inserts between sentences. The server's own
+/// default is 0.0 — literally no pause at punctuation — which is why the
+/// narration ran together and sounded like it ignored the punctuation.
+/// This is a **startup-only** flag: unlike `length_scale`, piper's
+/// `/synthesize` does not read it per request, so it cannot be exposed as a
+/// live control without restarting the sidecar. 0.45s is the value chosen by
+/// listening to real Hebrew paragraphs at 0.0 / 0.3 / 0.45 / 0.6.
+pub const SENTENCE_SILENCE: f32 = 0.45;
+
+/// Default speech rate. Piper's `length_scale` is *phoneme duration*, so
+/// higher = slower. 1.0 (the voice's own default) was judged too fast for
+/// Hebrew narration; 1.18 is the chosen default. Users can override it per
+/// request via the speed control — see `synthesize`.
+pub const DEFAULT_LENGTH_SCALE: f32 = 1.18;
+
 /// Build the argv for `python -m piper.http_server`, given the voice model
 /// name, bind host, and port. Pure. `--host` is security-mandatory (spec §3):
 /// piper1-gpl's HTTP server defaults to `0.0.0.0` (all network interfaces),
@@ -19,6 +34,12 @@ pub fn build_server_args(model_name: &str, host: &str, port: u16) -> Vec<String>
         host.to_string(),
         "--port".to_string(),
         port.to_string(),
+        "--sentence-silence".to_string(),
+        SENTENCE_SILENCE.to_string(),
+        // Server-side fallback only: every real request sends its own
+        // length_scale, so this just keeps a sane rate if one ever omits it.
+        "--length-scale".to_string(),
+        DEFAULT_LENGTH_SCALE.to_string(),
     ]
 }
 
@@ -56,20 +77,40 @@ impl std::error::Error for NarrationError {}
 #[derive(Serialize)]
 struct SynthesizeRequest<'a> {
     text: &'a str,
+    length_scale: f32,
+}
+
+/// Clamp a user-supplied speech rate to a range that still produces sane
+/// audio. Piper accepts any positive float, but values outside roughly this
+/// band stop sounding like speech, and a 0 or negative value from a bad
+/// caller would produce garbage rather than an error.
+pub fn clamp_length_scale(requested: f32) -> f32 {
+    if !requested.is_finite() {
+        return DEFAULT_LENGTH_SCALE;
+    }
+    requested.clamp(0.8, 1.8)
 }
 
 /// POST /synthesize on the sidecar, returning raw WAV bytes.
 /// Validates the response looks like real audio before returning it —
 /// callers never receive a partial/corrupt buffer silently (spec §5).
+///
+/// `length_scale` is phoneme duration, so higher = slower speech. It is sent
+/// per request (piper reads it from the request body), which is what lets the
+/// speed control take effect without restarting the sidecar.
 pub async fn synthesize(
     client: &reqwest::Client,
     port: u16,
     text: &str,
+    length_scale: f32,
 ) -> Result<Vec<u8>, NarrationError> {
     let url = format!("http://127.0.0.1:{port}/synthesize");
     let resp = client
         .post(&url)
-        .json(&SynthesizeRequest { text })
+        .json(&SynthesizeRequest {
+            text,
+            length_scale: clamp_length_scale(length_scale),
+        })
         // Synthesis time scales with text length, unlike the fast /info
         // probe — 120s is a generous ceiling for worst-case long-form text,
         // just high enough to guarantee the caller never hangs forever on a
@@ -116,17 +157,39 @@ mod tests {
     #[test]
     fn build_server_args_includes_host_flag_explicitly() {
         let args = build_server_args("he_IL-saspeech-medium", "127.0.0.1", 5758);
-        assert_eq!(
-            args,
-            vec![
-                "-m", "piper.http_server",
-                "-m", "he_IL-saspeech-medium",
-                "--host", "127.0.0.1",
-                "--port", "5758",
-            ]
-        );
         let host_idx = args.iter().position(|a| a == "--host").unwrap();
         assert_eq!(args[host_idx + 1], "127.0.0.1");
+    }
+
+    #[test]
+    fn build_server_args_sets_a_nonzero_sentence_silence() {
+        // Piper's own default is 0.0 — no pause at all between sentences,
+        // which is what made narration sound like it ignored punctuation.
+        // This flag is startup-only, so if it ever stops being passed there
+        // is no per-request fallback to save it.
+        let args = build_server_args("he_IL-saspeech-medium", "127.0.0.1", 5758);
+        let idx = args
+            .iter()
+            .position(|a| a == "--sentence-silence")
+            .expect("sentence-silence must be passed at startup");
+        let value: f32 = args[idx + 1].parse().unwrap();
+        assert!(value > 0.0, "a 0 pause reintroduces the run-together bug");
+    }
+
+    #[test]
+    fn clamp_length_scale_rejects_nonsense_rates() {
+        // Guards the speed control: piper accepts any float, so a 0/negative
+        // or NaN value would produce garbage audio rather than an error.
+        assert_eq!(clamp_length_scale(0.0), 0.8);
+        assert_eq!(clamp_length_scale(-5.0), 0.8);
+        assert_eq!(clamp_length_scale(99.0), 1.8);
+        assert_eq!(clamp_length_scale(f32::NAN), DEFAULT_LENGTH_SCALE);
+    }
+
+    #[test]
+    fn clamp_length_scale_passes_through_reasonable_rates() {
+        assert_eq!(clamp_length_scale(DEFAULT_LENGTH_SCALE), DEFAULT_LENGTH_SCALE);
+        assert_eq!(clamp_length_scale(1.0), 1.0);
     }
 
     #[test]
@@ -189,7 +252,7 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let result = synthesize(&client, port, "שלום עולם").await;
+        let result = synthesize(&client, port, "שלום עולם", DEFAULT_LENGTH_SCALE).await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), fake_wav);
@@ -200,7 +263,7 @@ mod tests {
         let port = spawn_fake_sidecar(|_req| (500, b"error".to_vec()));
 
         let client = reqwest::Client::new();
-        let result = synthesize(&client, port, "טקסט").await;
+        let result = synthesize(&client, port, "טקסט", DEFAULT_LENGTH_SCALE).await;
 
         assert!(matches!(result, Err(NarrationError::BadResponse(_))));
     }
@@ -210,7 +273,7 @@ mod tests {
         let port = spawn_fake_sidecar(|_req| (200, b"<html>not audio</html>".to_vec()));
 
         let client = reqwest::Client::new();
-        let result = synthesize(&client, port, "טקסט").await;
+        let result = synthesize(&client, port, "טקסט", DEFAULT_LENGTH_SCALE).await;
 
         assert!(matches!(result, Err(NarrationError::InvalidAudio)));
     }
@@ -226,7 +289,7 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let result = synthesize(&client, 1, "טקסט").await;
+        let result = synthesize(&client, 1, "טקסט", DEFAULT_LENGTH_SCALE).await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
     }

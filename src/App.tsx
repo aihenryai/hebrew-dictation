@@ -448,6 +448,9 @@ function App() {
   const [narrationProvisioning, setNarrationProvisioning] = useState(false);
   const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
   const [narrationSaveNotice, setNarrationSaveNotice] = useState<string | null>(null);
+  // Speech rate = piper's length_scale (phoneme duration), so HIGHER IS SLOWER.
+  // Default matches the backend's DEFAULT_LENGTH_SCALE.
+  const [narrationRate, setNarrationRate] = useState(1.18);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
@@ -998,7 +1001,10 @@ function App() {
     setNarrationGenerating(true);
     setError("");
     try {
-      const bytes = await invoke<number[]>("generate_narration", { text: narrationText });
+      const bytes = await invoke<number[]>("generate_narration", {
+        text: narrationText,
+        lengthScale: narrationRate,
+      });
       const arr = new Uint8Array(bytes);
       const blob = new Blob([arr], { type: "audio/wav" });
       const newUrl = URL.createObjectURL(blob);
@@ -1016,7 +1022,7 @@ function App() {
     } finally {
       setNarrationGenerating(false);
     }
-  }, [narrationText, narrationAudioUrl]);
+  }, [narrationText, narrationAudioUrl, narrationRate]);
 
   const saveNarrationWav = useCallback(async () => {
     if (!narrationBytes) return;
@@ -2912,6 +2918,37 @@ function App() {
               dir="rtl"
               rows={8}
             />
+
+            <div className="narration-rate">
+              <label htmlFor="narration-rate-slider">
+                קצב הדיבור
+                <span className="narration-rate-value">
+                  {narrationRate <= 1.0 ? "מהיר" : narrationRate >= 1.4 ? "איטי" : "רגיל"}
+                </span>
+              </label>
+              {/* Forced LTR: a range input in an RTL container flips which end
+                  is min, which would silently invert the labels below. Pinning
+                  direction here makes left=min=slow and right=max=fast in every
+                  case, so the end labels can't drift out of sync with the track.
+                  Value is speech RATE (higher = faster); length_scale is its
+                  inverse, since piper measures phoneme duration. */}
+              <input
+                id="narration-rate-slider"
+                style={{ direction: "ltr" }}
+                type="range"
+                min={0.62}
+                max={1.11}
+                step={0.01}
+                value={1 / narrationRate}
+                onChange={(e) => setNarrationRate(1 / parseFloat(e.target.value))}
+                aria-label="קצב הדיבור בהקראה"
+              />
+              <div className="narration-rate-ends">
+                <span>איטי</span>
+                <span>מהיר</span>
+              </div>
+            </div>
+
             <button
               className="btn-primary"
               onClick={generateNarration}
@@ -2972,7 +3009,7 @@ function App() {
             className="btn-batch-nav btn-mode-combined"
             onClick={() => setView("batch")}
             aria-label="הקלט ותמלל או תמלול קבצי שמע"
-          >הקלט ותמלל / תמלול קבצי שמע</button>
+          >🎧 הקלט ותמלל</button>
           <button
             className="btn-batch-nav btn-mode-narration"
             onClick={() => setView("narration")}
