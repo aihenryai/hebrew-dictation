@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
 
 /// Pinned `uv` release facts (verified against github.com/astral-sh/uv/releases).
 /// Bump deliberately, not casually — a new `uv` version changes the exact
@@ -227,10 +226,18 @@ fn tail_stderr(stderr: &[u8]) -> String {
     lines[start..].join("\n")
 }
 
-/// Run the full provisioning flow if not already done: `uv` → venv →
-/// `piper-tts` → voice → atomic marker. Safe to call every time the user
-/// opens the narration screen — returns immediately if already `Ready`.
-pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
+/// Run the full provisioning flow if not already done: `uv` → venv → pip →
+/// voice + config + diacritizer + tokenizer → server script → atomic marker.
+/// Safe to call every time the user opens the narration screen — returns
+/// immediately if already `Ready`.
+///
+/// Generic over `R: tauri::Runtime` for the same reason as
+/// `ensure_uv_available`: it makes the whole flow testable against
+/// `tauri::test::mock_app()`. The real call site passes a plain `&AppHandle`
+/// and infers `Wry`, so this is not a breaking change.
+pub async fn provision_narration_engine<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<(), String> {
     if narration_engine_state() == NarrationEngineState::Ready {
         return Ok(());
     }
@@ -444,6 +451,40 @@ mod tests {
         // confusing hash-mismatch failure instead of a clear "these don't
         // match" signal. This test makes the drift fail fast and legibly.
         assert!(UV_DOWNLOAD_URL.contains(UV_VERSION));
+    }
+
+    #[tokio::test]
+    #[ignore = "provisions the ENTIRE engine for real: ~520MB of downloads plus a venv and pip install, several minutes. Run explicitly with `-- --ignored`. Leaves a working engine behind on purpose."]
+    async fn provision_narration_engine_produces_a_usable_engine() {
+        // The one test that exercises the real chain end to end: uv -> managed
+        // Python -> venv -> pip -> the four artifacts -> marker. Everything
+        // else about provisioning is either a pure-function unit test or a
+        // manual click, and the pieces have failed independently before (a
+        // missing voice config, a system-Python fallback), so the assembled
+        // whole is worth one slow, explicit check.
+        let app = tauri::test::mock_app();
+
+        let result = provision_narration_engine(app.handle()).await;
+        assert!(result.is_ok(), "provisioning failed: {result:?}");
+
+        // Every artifact the sidecar's argv points at must actually exist —
+        // the marker alone would happily be written over a missing file.
+        for path in [
+            get_voice_path(),
+            get_voice_config_path(),
+            get_phonikud_path(),
+            get_tokenizer_path(),
+            get_server_script_path(),
+            get_venv_dir().join("Scripts").join("python.exe"),
+        ] {
+            assert!(path.exists(), "missing after provisioning: {}", path.display());
+        }
+
+        assert_eq!(narration_engine_state(), NarrationEngineState::Ready);
+
+        // Idempotence: a second call must be a cheap no-op, not a re-download.
+        let again = provision_narration_engine(app.handle()).await;
+        assert!(again.is_ok(), "re-provisioning should no-op, got {again:?}");
     }
 
     #[tokio::test]
