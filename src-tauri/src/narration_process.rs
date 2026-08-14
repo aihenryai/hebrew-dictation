@@ -6,7 +6,7 @@
 //! Phase 1); a later task provides the non-Windows Tauri-command stub.
 
 use crate::narration::{build_server_args, health_check, synthesize, NarrationError};
-use crate::narration_provision::{get_venv_dir, VOICE_NAME};
+use crate::narration_provision::get_venv_dir;
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]
@@ -71,7 +71,19 @@ impl NarrationServer {
             ));
         }
 
-        let args = build_server_args(VOICE_NAME, "127.0.0.1", port);
+        let script = crate::narration_provision::get_server_script_path();
+        let voice = crate::narration_provision::get_voice_path();
+        let config = crate::narration_provision::get_voice_config_path();
+        let phonikud = crate::narration_provision::get_phonikud_path();
+        let tokenizer = crate::narration_provision::get_tokenizer_path();
+        let paths = crate::narration::ServerPaths {
+            script: &script.to_string_lossy(),
+            voice: &voice.to_string_lossy(),
+            config: &config.to_string_lossy(),
+            phonikud: &phonikud.to_string_lossy(),
+            tokenizer: &tokenizer.to_string_lossy(),
+        };
+        let args = build_server_args(&paths, "127.0.0.1", port);
 
         // piper's http_server resolves `-m <voice>` against `--data-dir`, which
         // defaults to the *child process's* CWD — not this app's install dir.

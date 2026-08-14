@@ -20,16 +20,42 @@ pub const SENTENCE_SILENCE: f32 = 0.45;
 /// request via the speed control — see `synthesize`.
 pub const DEFAULT_LENGTH_SCALE: f32 = 1.18;
 
-/// Build the argv for `python -m piper.http_server`, given the voice model
-/// name, bind host, and port. Pure. `--host` is security-mandatory (spec §3):
-/// piper1-gpl's HTTP server defaults to `0.0.0.0` (all network interfaces),
-/// so omitting this flag would expose the synthesis endpoint to the LAN.
-pub fn build_server_args(model_name: &str, host: &str, port: u16) -> Vec<String> {
+/// Paths the narration sidecar needs on its command line. Grouped into a
+/// struct because there are four of them and positional args of the same type
+/// are easy to transpose silently.
+pub struct ServerPaths<'a> {
+    /// Our own server script, written to app-data during provisioning.
+    pub script: &'a str,
+    /// The VITS voice `.onnx`.
+    pub voice: &'a str,
+    /// The voice's `.onnx.json` config (phoneme map, sample rate).
+    pub config: &'a str,
+    /// The Phonikud diacritizer `.onnx`.
+    pub phonikud: &'a str,
+    /// Local tokenizer for the diacritizer, so it never reaches the network.
+    pub tokenizer: &'a str,
+}
+
+/// Build the argv for our narration server script.
+///
+/// This runs our own script rather than `python -m piper.http_server`: the
+/// voices declare `phoneme_type: "raw"` and expect stress-marked IPA, which
+/// piper's server cannot produce — it phonemizes from nikud, which encodes
+/// vowels but not stress.
+///
+/// `--host` is security-mandatory: binding all interfaces would expose the
+/// synthesis endpoint to the LAN.
+pub fn build_server_args(paths: &ServerPaths<'_>, host: &str, port: u16) -> Vec<String> {
     vec![
-        "-m".to_string(),
-        "piper.http_server".to_string(),
-        "-m".to_string(),
-        model_name.to_string(),
+        paths.script.to_string(),
+        "--model".to_string(),
+        paths.voice.to_string(),
+        "--config".to_string(),
+        paths.config.to_string(),
+        "--phonikud".to_string(),
+        paths.phonikud.to_string(),
+        "--tokenizer".to_string(),
+        paths.tokenizer.to_string(),
         "--host".to_string(),
         host.to_string(),
         "--port".to_string(),
@@ -154,37 +180,51 @@ pub async fn health_check(client: &reqwest::Client, port: u16) -> bool {
 mod tests {
     use super::*;
 
+    fn test_paths() -> ServerPaths<'static> {
+        ServerPaths {
+            script: "C:\\app\\narration_server.py",
+            voice: "C:\\app\\michael.onnx",
+            config: "C:\\app\\model.config.json",
+            phonikud: "C:\\app\\phonikud-1.0.int8.onnx",
+            tokenizer: "C:\\app\\tokenizer.json",
+        }
+    }
+
     #[test]
     fn build_server_args_includes_host_flag_explicitly() {
-        let args = build_server_args("he_IL-saspeech-medium", "127.0.0.1", 5758);
+        let args = build_server_args(&test_paths(), "127.0.0.1", 5758);
         let host_idx = args.iter().position(|a| a == "--host").unwrap();
         assert_eq!(args[host_idx + 1], "127.0.0.1");
     }
 
     #[test]
-    fn build_server_args_passes_the_module_voice_and_port() {
-        // Covers the mandatory args that aren't flag-tuning: dropping any of
-        // them silently launches the wrong thing (or nothing) rather than
-        // failing a narrower flag assertion.
-        let args = build_server_args("he_IL-saspeech-medium", "127.0.0.1", 5758);
-        assert_eq!(args[0], "-m");
-        assert_eq!(args[1], "piper.http_server");
-        let voice_idx = args
-            .iter()
-            .position(|a| a == "he_IL-saspeech-medium")
-            .expect("the voice name must be passed");
-        assert_eq!(args[voice_idx - 1], "-m");
-        let port_idx = args.iter().position(|a| a == "--port").unwrap();
-        assert_eq!(args[port_idx + 1], "5758");
+    fn build_server_args_passes_every_required_path_and_the_port() {
+        // All five paths are mandatory and are easy to transpose; a missing
+        // one surfaces as a confusing Python argparse error at spawn time
+        // rather than here.
+        let args = build_server_args(&test_paths(), "127.0.0.1", 5758);
+        assert_eq!(args[0], "C:\\app\\narration_server.py", "script must be argv[0]");
+        for (flag, expected) in [
+            ("--model", "C:\\app\\michael.onnx"),
+            ("--config", "C:\\app\\model.config.json"),
+            ("--phonikud", "C:\\app\\phonikud-1.0.int8.onnx"),
+            ("--tokenizer", "C:\\app\\tokenizer.json"),
+            ("--port", "5758"),
+        ] {
+            let idx = args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} must be passed"));
+            assert_eq!(args[idx + 1], expected, "wrong value after {flag}");
+        }
     }
 
     #[test]
     fn build_server_args_sets_a_nonzero_sentence_silence() {
-        // Piper's own default is 0.0 — no pause at all between sentences,
-        // which is what made narration sound like it ignored punctuation.
-        // This flag is startup-only, so if it ever stops being passed there
-        // is no per-request fallback to save it.
-        let args = build_server_args("he_IL-saspeech-medium", "127.0.0.1", 5758);
+        // The pause between sentences is startup-only — unlike length_scale
+        // there is no per-request fallback, so losing this flag silently
+        // reintroduces the run-together delivery.
+        let args = build_server_args(&test_paths(), "127.0.0.1", 5758);
         let idx = args
             .iter()
             .position(|a| a == "--sentence-silence")

@@ -1,9 +1,9 @@
 //! Provisions the Hebrew narration engine: an isolated `uv`-managed Python
-//! venv running `piper-tts`, plus the Hebrew voice model. Everything lives
+//! venv, the Phonikud diacritizer, and the Hebrew voice model. Everything lives
 //! under app-data — no system Python, no PATH/registry changes.
 //! Windows-only (macOS out of scope for Phase 1).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -29,10 +29,6 @@ fn get_uv_zip_path() -> PathBuf {
 
 pub fn get_uv_exe_path() -> PathBuf {
     get_narration_dir().join("uv").join("uv.exe")
-}
-
-pub fn is_uv_ready() -> bool {
-    get_uv_exe_path().exists()
 }
 
 /// Download `uv` (hash-verified via `model::download_and_verify`) and extract
@@ -109,40 +105,92 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
 /// separate flag file or partial-state tracking. A provisioning run that dies
 /// halfway leaves this marker absent, so the state machine naturally reports
 /// "not provisioned" and a retry is just running provisioning again — every
-/// step (uv download, venv creation, pip install, voice download) is already
-/// idempotent/overwrite-safe on its own.
+/// step (uv download, venv creation, pip install, artifact downloads) is
+/// already idempotent/overwrite-safe on its own.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct NarrationEngineMarker {
     marker_version: u32,
-    piper_tts_version: String,
+    engine: String,
     voice_name: String,
 }
 
-const MARKER_VERSION: u32 = 1;
-// Pinned from a spike that ran the real HTTP server end-to-end and verified
-// these values against the actual downloaded artifacts.
-const PIPER_TTS_VERSION: &str = "1.6.0";
-pub const VOICE_NAME: &str = "he_IL-saspeech-medium"; // pub: a later sidecar-lifecycle module needs this too
-const VOICE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/he/he_IL/saspeech/medium/he_IL-saspeech-medium.onnx";
-const VOICE_SIZE: u64 = 63_221_984;
-const VOICE_SHA256: &str = "3dc067debc9e782a8a0d095dbb58786648743d406366dcc2aa81009660873b4d";
-// piper's `PiperVoice.load()` requires this config sidecar next to the
-// `.onnx` model (speaker count, phoneme map, inference defaults) — without
-// it the sidecar crashes immediately on startup with a FileNotFoundError.
-const VOICE_CONFIG_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/he/he_IL/saspeech/medium/he_IL-saspeech-medium.onnx.json";
-const VOICE_CONFIG_SIZE: u64 = 5_269;
-const VOICE_CONFIG_SHA256: &str = "e9800a282a6cf2e44b3ad97f640b38e35ed246dfe070458d13bfcf206befc5bf";
+/// Bumped to 2 when the engine moved from piper's own phonemizer to
+/// Phonikud. An existing v1 marker therefore reads as "not provisioned" and
+/// the new artifacts are fetched, rather than leaving a working-looking
+/// install pointed at a voice the new server can't drive.
+const MARKER_VERSION: u32 = 2;
+
+/// Python packages the sidecar imports. `piper-tts` is deliberately gone: we
+/// run our own server and inference now, so its dependency tree (including
+/// espeak-ng) is no longer installed.
+const PIP_PACKAGES: [&str; 5] = [
+    "onnxruntime==1.28.0",
+    "numpy",
+    "phonikud",
+    "phonikud-onnx",
+    "tokenizers",
+];
+
+/// Voice: a VITS model trained on Phonikud's stress-marked IPA. "michael" was
+/// chosen over the "shaul" checkpoint by listening to both against the
+/// previously shipped voice on the same paragraph.
+pub const VOICE_NAME: &str = "michael"; // pub: the sidecar-lifecycle module needs this too
+const VOICE_URL: &str =
+    "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/michael.onnx";
+const VOICE_SIZE: u64 = 63_516_050;
+const VOICE_SHA256: &str = "d2824d46ecd7ca8a206686d818d3178effe4661ce78bdb4e754eed32fe604320";
+
+/// Shared config for the Phonikud voices: phoneme→id map, sample rate,
+/// inference defaults. Without it the server cannot map IPA to symbol ids.
+const VOICE_CONFIG_URL: &str =
+    "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/model.config.json";
+const VOICE_CONFIG_SIZE: u64 = 7_073;
+const VOICE_CONFIG_SHA256: &str =
+    "7f790dce7e26969a535ecda2715cc7da9c5261269cbf11c213d107b611458679";
+
+/// The diacritizer that adds nikud AND stress. Stress is the part plain nikud
+/// never encoded, and its absence is what made the old output sound flat.
+const PHONIKUD_URL: &str =
+    "https://huggingface.co/thewh1teagle/phonikud-onnx/resolve/main/phonikud-1.0.int8.onnx";
+const PHONIKUD_SIZE: u64 = 307_844_158;
+const PHONIKUD_SHA256: &str =
+    "113afb58d3140502aa1e7691cdc6b240b56cf97e5852fc870e1a7fb5a400dd62";
+
+/// Tokenizer for the diacritizer. Downloaded here so the sidecar never calls
+/// out to HuggingFace at synthesis time — `phonikud_onnx` would otherwise
+/// fetch it on every construction, breaking offline use.
+const TOKENIZER_URL: &str =
+    "https://huggingface.co/dicta-il/dictabert-large-char-menaked/resolve/main/tokenizer.json";
+const TOKENIZER_SIZE: u64 = 18_016;
+const TOKENIZER_SHA256: &str =
+    "8e62e3b46c924e14fc32c749ef8944c311411ce9c4dc01c5b606953a169140ba";
+
+/// The sidecar itself, compiled into the binary and written out during
+/// provisioning so the installed engine is self-contained.
+const NARRATION_SERVER_PY: &str = include_str!("../resources/narration_server.py");
 
 pub fn get_venv_dir() -> PathBuf { // pub: a later sidecar-lifecycle module needs the venv's python.exe path
     get_narration_dir().join("venv")
 }
 
-fn get_voice_path() -> PathBuf {
+pub fn get_voice_path() -> PathBuf {
     get_narration_dir().join(format!("{VOICE_NAME}.onnx"))
 }
 
-fn get_voice_config_path() -> PathBuf {
-    get_narration_dir().join(format!("{VOICE_NAME}.onnx.json"))
+pub fn get_voice_config_path() -> PathBuf {
+    get_narration_dir().join("model.config.json")
+}
+
+pub fn get_phonikud_path() -> PathBuf {
+    get_narration_dir().join("phonikud-1.0.int8.onnx")
+}
+
+pub fn get_tokenizer_path() -> PathBuf {
+    get_narration_dir().join("tokenizer.json")
+}
+
+pub fn get_server_script_path() -> PathBuf {
+    get_narration_dir().join("narration_server.py")
 }
 
 fn get_marker_path() -> PathBuf {
@@ -191,7 +239,7 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
     // and immediately instead of a confusing HTTP/URL error partway through
     // provisioning. (All constants above are real, pinned values — this is
     // defense in depth, not expected to ever fire.)
-    if PIPER_TTS_VERSION.starts_with('<') || VOICE_URL.starts_with('<') || VOICE_SHA256.starts_with('<') {
+    if VOICE_URL.starts_with('<') || VOICE_SHA256.starts_with('<') || PHONIKUD_SHA256.starts_with('<') {
         return Err(
             "מנוע הקריינות עדיין לא מוגדר בקוד (קבועים מסוג placeholder לא הוחלפו בערכי ה-spike האמיתיים)."
                 .to_string(),
@@ -246,20 +294,12 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
         ));
     }
 
-    // `piper-tts[http]` pulls in a bigger dependency set (torch etc. via
-    // transitive deps) than the venv step — 600s gives it more room.
+    // onnxruntime is the heavy one here (~200MB of wheels with its deps) —
+    // 600s gives a slow connection room without hanging the UI forever.
     let mut pip_cmd = tokio::process::Command::new(&uv_exe);
     pip_cmd
-        .args([
-            "pip",
-            "install",
-            "--python",
-            &venv_dir.to_string_lossy(),
-            // [http] is required — plain piper-tts has no Flask dependency, so
-            // `python -m piper.http_server` fails with
-            // `ModuleNotFoundError: No module named 'flask'`.
-            &format!("piper-tts[http]=={PIPER_TTS_VERSION}"),
-        ])
+        .args(["pip", "install", "--python", &venv_dir.to_string_lossy()])
+        .args(PIP_PACKAGES)
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
     let pip_output = match tokio::time::timeout(Duration::from_secs(600), pip_cmd.output()).await {
         Err(_) => {
@@ -301,6 +341,22 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
         .await?;
     }
 
+    let tokenizer_path = get_tokenizer_path();
+    let tokenizer_already_valid = tokenizer_path.exists()
+        && std::fs::metadata(&tokenizer_path).map(|m| m.len() == TOKENIZER_SIZE).unwrap_or(false);
+    if !tokenizer_already_valid {
+        crate::model::download_and_verify(
+            app,
+            TOKENIZER_URL,
+            &tokenizer_path,
+            TOKENIZER_SIZE,
+            TOKENIZER_SHA256,
+            "narration-voice-download-progress",
+            "מנתח הטקסט",
+        )
+        .await?;
+    }
+
     let voice_path = get_voice_path();
     let voice_already_valid = voice_path.exists()
         && std::fs::metadata(&voice_path).map(|m| m.len() == VOICE_SIZE).unwrap_or(false);
@@ -317,10 +373,39 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
         .await?;
     }
 
+    // Largest artifact (~308MB), so it goes last: an earlier failure costs
+    // the user less bandwidth before it surfaces.
+    let phonikud_path = get_phonikud_path();
+    let phonikud_already_valid = phonikud_path.exists()
+        && std::fs::metadata(&phonikud_path).map(|m| m.len() == PHONIKUD_SIZE).unwrap_or(false);
+    if !phonikud_already_valid {
+        crate::model::download_and_verify(
+            app,
+            PHONIKUD_URL,
+            &phonikud_path,
+            PHONIKUD_SIZE,
+            PHONIKUD_SHA256,
+            "narration-voice-download-progress",
+            "מנוע ההטעמה",
+        )
+        .await?;
+    }
+
+    // Written unconditionally rather than only when absent, so a rebuilt or
+    // patched server script ships with the app upgrade instead of leaving a
+    // stale copy behind from a previous install.
+    std::fs::write(get_server_script_path(), NARRATION_SERVER_PY)
+        .map_err(|e| format!("כתיבת שרת הקריינות נכשלה. (פרטים טכניים: {e})"))?;
+
+    // Reclaim the ~63MB piper voice from the pre-Phonikud engine. Best-effort:
+    // failing to delete a leftover must never fail provisioning.
+    let _ = std::fs::remove_file(narration_dir.join("he_IL-saspeech-medium.onnx"));
+    let _ = std::fs::remove_file(narration_dir.join("he_IL-saspeech-medium.onnx.json"));
+
     // Written LAST and only here — this is the atomic completion marker.
     let marker = NarrationEngineMarker {
         marker_version: MARKER_VERSION,
-        piper_tts_version: PIPER_TTS_VERSION.to_string(),
+        engine: "phonikud".to_string(),
         voice_name: VOICE_NAME.to_string(),
     };
     let marker_json = serde_json::to_string(&marker)
@@ -334,6 +419,7 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn narration_dir_is_under_app_data_narration_subfolder() {
@@ -346,15 +432,6 @@ mod tests {
         let path = get_uv_exe_path();
         assert!(path.ends_with(Path::new("uv").join("uv.exe")));
         assert!(path.starts_with(get_narration_dir()));
-    }
-
-    #[test]
-    fn is_uv_ready_false_when_not_downloaded() {
-        // get_uv_exe_path() points at a real app-data location that won't
-        // exist on a fresh test-running machine/CI runner.
-        if !get_uv_exe_path().exists() {
-            assert!(!is_uv_ready());
-        }
     }
 
     #[test]
@@ -491,7 +568,7 @@ mod tests {
             std::fs::create_dir_all(get_narration_dir()).unwrap();
             let marker = NarrationEngineMarker {
                 marker_version: MARKER_VERSION,
-                piper_tts_version: "1.6.0".to_string(),
+                engine: "phonikud".to_string(),
                 voice_name: VOICE_NAME.to_string(),
             };
             std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap()).unwrap();
