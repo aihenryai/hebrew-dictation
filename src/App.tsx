@@ -955,8 +955,8 @@ function App() {
       const items: ExportHistoryItem[] = history.map((h) => ({ text: h.text, timestamp: h.timestamp }));
       // Name the file after its content (most recent dictation's opening words),
       // same as the batch/file-transcription export — not a generic timestamp.
-      const suggested_name = history[0]?.text ? firstWordsName(history[0].text) : "";
-      const path = await invoke<string>("export_history", { items, format, suggested_name });
+      const suggestedName = history[0]?.text ? firstWordsName(history[0].text) : "";
+      const path = await invoke<string>("export_history", { items, format, suggestedName });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
@@ -1022,10 +1022,14 @@ function App() {
     if (!narrationBytes) return;
     setNarrationSaveNotice(null);
     try {
-      const suggested = narrationText.trim().slice(0, 40) || undefined;
+      // camelCase, not snake_case: Tauri exposes Rust's `suggested_name` to JS
+      // as `suggestedName` (same as `file_path` -> `filePath` elsewhere here).
+      // Passing snake_case bound nothing, so the Option<String> silently
+      // arrived as None and every file fell back to the generic timestamp name.
+      const suggestedName = firstWordsName(narrationText) || undefined;
       const path = await invoke<string>("save_narration_wav", {
         bytes: Array.from(narrationBytes),
-        suggested_name: suggested,
+        suggestedName,
       });
       setNarrationSaveNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setNarrationSaveNotice(null), 6000);
@@ -1264,7 +1268,7 @@ function App() {
       await invoke<string>("export_history", {
         items: [{ text: t, timestamp: new Date().toISOString() }],
         format,
-        suggested_name: firstWordsName(t),
+        suggestedName: firstWordsName(t),
       });
     } catch (e) {
       const msg = String(e);
@@ -1277,8 +1281,8 @@ function App() {
     if (done.length === 0) return;
     try {
       const items = done.map((r) => ({ text: r.transcript, timestamp: new Date().toISOString() }));
-      const suggested_name = generateExportName(done);
-      const path = await invoke<string>("export_history", { items, format, suggested_name });
+      const suggestedName = generateExportName(done);
+      const path = await invoke<string>("export_history", { items, format, suggestedName });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {
@@ -1298,7 +1302,7 @@ function App() {
       await invoke<string>("export_srt", {
         items: [segments],
         styles: [isCallCloud ? "Call" : "Diarization"],
-        suggested_name: firstWordsName(transcriptForName),
+        suggestedName: firstWordsName(transcriptForName),
       });
     } catch (e) {
       const msg = String(e);
@@ -1312,8 +1316,8 @@ function App() {
     try {
       const items = eligible.map((r) => r.segments!);
       const styles = eligible.map((r) => (r.isCallCloud ? "Call" : "Diarization"));
-      const suggested_name = generateExportName(eligible);
-      const path = await invoke<string>("export_srt", { items, styles, suggested_name });
+      const suggestedName = generateExportName(eligible);
+      const path = await invoke<string>("export_srt", { items, styles, suggestedName });
       setExportNotice(`✅ נשמר: ${path}`);
       window.setTimeout(() => setExportNotice(null), 6000);
     } catch (e) {

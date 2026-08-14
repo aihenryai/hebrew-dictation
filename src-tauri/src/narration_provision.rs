@@ -218,7 +218,13 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
     // connection without hanging the provisioning UI forever.
     let mut venv_cmd = tokio::process::Command::new(&uv_exe);
     venv_cmd
-        .args(["venv", &venv_dir.to_string_lossy(), "--python", "3.11"])
+        // `--managed-python` is what actually guarantees the app's "no Python
+        // required" promise: without it, uv is free to satisfy `--python 3.11`
+        // from a system install if the user happens to have that exact version,
+        // silently making the engine depend on their Python instead of ours.
+        // With it, uv only ever uses the interpreter it downloaded into
+        // UV_PYTHON_INSTALL_DIR under our own app-data folder.
+        .args(["venv", &venv_dir.to_string_lossy(), "--python", "3.11", "--managed-python"])
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
     let venv_output = match tokio::time::timeout(Duration::from_secs(300), venv_cmd.output()).await {
         Err(_) => {

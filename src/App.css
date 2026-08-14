@@ -1738,6 +1738,10 @@ body:has(.toolbar-idle) #root {
 
 .narration-textarea {
   width: 100%;
+  /* This stylesheet has no global `* { box-sizing }` reset — without this,
+     width:100% + padding + border overflows the container and the box gets
+     visibly clipped at the edges. */
+  box-sizing: border-box;
   min-height: 160px;
   background: #0f1729;
   border: 1px solid #2a3a5e;
@@ -1745,9 +1749,13 @@ body:has(.toolbar-idle) #root {
   color: #e5e9f5;
   font-family: inherit;
   font-size: 0.95rem;
+  line-height: 1.5;
   padding: 0.75rem;
   resize: vertical;
   margin-bottom: 0.75rem;
+  /* Hebrew input: keep punctuation and cursor on the correct side. */
+  direction: rtl;
+  text-align: right;
 }
 
 .narration-result {
