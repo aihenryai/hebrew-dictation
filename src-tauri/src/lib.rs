@@ -936,7 +936,7 @@ async fn narration_setup(app: AppHandle) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 async fn narration_setup(_app: AppHandle) -> Result<(), String> {
-    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+    Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
 
 /// Generate Hebrew narration audio for `text`, returning raw WAV bytes.
@@ -955,10 +955,10 @@ async fn generate_narration(
     length_scale: Option<f32>,
 ) -> Result<Vec<u8>, String> {
     if text.trim().is_empty() {
-        return Err("אין טקסט להקראה".to_string());
+        return Err("אין טקסט לקריינות".to_string());
     }
     if narration_provision::narration_engine_state() != narration_provision::NarrationEngineState::Ready {
-        return Err("מנוע ההקראה עדיין לא הותקן. לך להגדרות והתקן אותו קודם.".to_string());
+        return Err("מנוע הקריינות עדיין לא הותקן. לך להגדרות והתקן אותו קודם.".to_string());
     }
 
     let port = {
@@ -995,7 +995,7 @@ async fn generate_narration(
     _text: String,
     _length_scale: Option<f32>,
 ) -> Result<Vec<u8>, String> {
-    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+    Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
 
 /// Save previously-generated narration WAV bytes to a user-chosen path.
@@ -1013,7 +1013,7 @@ async fn save_narration_wav(
     use tauri_plugin_dialog::DialogExt;
 
     if bytes.is_empty() {
-        return Err("אין הקלטה לשמירה — צור הקראה קודם.".to_string());
+        return Err("אין קריינות לשמירה — צור קריינות קודם.".to_string());
     }
 
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M");
@@ -1028,7 +1028,7 @@ async fn save_narration_wav(
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<std::path::PathBuf>>();
     app.dialog()
         .file()
-        .set_title("שמור את ההקראה כ-WAV")
+        .set_title("שמור את הקריינות כ-WAV")
         .set_file_name(&default_name)
         .add_filter("קובץ WAV", &["wav"])
         .save_file(move |result| {
@@ -1058,7 +1058,7 @@ async fn save_narration_wav(
     _bytes: Vec<u8>,
     _suggested_name: Option<String>,
 ) -> Result<String, String> {
-    Err("הקראה זמינה רק ב-Windows כרגע".to_string())
+    Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
 
 /// Delete a temporary recording WAV produced by `stop_batch_recording_to_file`

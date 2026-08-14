@@ -66,7 +66,7 @@ impl NarrationServer {
         let python_exe = venv_dir.join("Scripts").join("python.exe");
         if !python_exe.exists() {
             return Err(format!(
-                "מנוע ההקראה לא מותקן כראוי — python.exe לא נמצא בנתיב הצפוי ({}).",
+                "מנוע הקריינות לא מותקן כראוי — python.exe לא נמצא בנתיב הצפוי ({}).",
                 python_exe.display()
             ));
         }
@@ -86,7 +86,7 @@ impl NarrationServer {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("הפעלת מנוע ההקראה נכשלה. (פרטים טכניים: {e})"))?;
+            .map_err(|e| format!("הפעלת מנוע הקריינות נכשלה. (פרטים טכניים: {e})"))?;
 
         // Layer (b): Windows Job Object with KILL_ON_JOB_CLOSE — the sidecar
         // dies with this app even on a hard crash/taskkill, not just clean exit.
@@ -95,13 +95,13 @@ impl NarrationServer {
             let mut info = ExtendedLimitInfo::new();
             info.limit_kill_on_job_close();
             let job = Job::create_with_limit_info(&info)
-                .map_err(|e| format!("יצירת הגנת תהליך למנוע ההקראה נכשלה. (פרטים טכניים: {e})"))?;
+                .map_err(|e| format!("יצירת הגנת תהליך למנוע הקריינות נכשלה. (פרטים טכניים: {e})"))?;
             let handle = child
                 .raw_handle()
-                .ok_or_else(|| "מנוע ההקראה יצא מיד לאחר ההפעלה.".to_string())?
+                .ok_or_else(|| "מנוע הקריינות יצא מיד לאחר ההפעלה.".to_string())?
                 as isize;
             job.assign_process(handle)
-                .map_err(|e| format!("שיוך מנוע ההקראה להגנת התהליך נכשל. (פרטים טכניים: {e})"))?;
+                .map_err(|e| format!("שיוך מנוע הקריינות להגנת התהליך נכשל. (פרטים טכניים: {e})"))?;
             job
         };
 
@@ -119,13 +119,13 @@ impl NarrationServer {
             }
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
-                    "מנוע ההקראה קרס מיד לאחר ההפעלה (קוד יציאה: {status}). ודא שהמנוע הותקן כראוי."
+                    "מנוע הקריינות קרס מיד לאחר ההפעלה (קוד יציאה: {status}). ודא שהמנוע הותקן כראוי."
                 ));
             }
             attempts += 1;
             if attempts > 60 {
                 let _ = child.kill().await;
-                return Err("מנוע ההקראה לא הגיב בזמן סביר. נסה שוב.".to_string());
+                return Err("מנוע הקריינות לא הגיב בזמן סביר. נסה שוב.".to_string());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -168,7 +168,7 @@ impl NarrationServer {
             NarrationServer::Owned { port, .. } => *port,
             NarrationServer::Unmanaged { .. } => {
                 return Err(NarrationError::Unreachable(
-                    "מנוע ההקראה (שאומץ מריצה קודמת) לא הגיב. נסה שוב.".to_string(),
+                    "מנוע הקריינות (שאומץ מריצה קודמת) לא הגיב. נסה שוב.".to_string(),
                 ));
             }
         };

@@ -52,7 +52,7 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
         UV_ZIP_SIZE,
         UV_ZIP_SHA256,
         "narration-engine-download-progress",
-        "מנוע ההקראה",
+        "מנוע הקריינות",
     )
     .await?;
 
@@ -82,21 +82,21 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
             .status()
     })
     .await
-    .map_err(|e| format!("חילוץ מנוע ההקראה נכשל להתחיל (task panic). (פרטים טכניים: {e})"))?
-    .map_err(|e| format!("חילוץ מנוע ההקראה נכשל להתחיל. (פרטים טכניים: {e})"))?;
+    .map_err(|e| format!("חילוץ מנוע הקריינות נכשל להתחיל (task panic). (פרטים טכניים: {e})"))?
+    .map_err(|e| format!("חילוץ מנוע הקריינות נכשל להתחיל. (פרטים טכניים: {e})"))?;
 
     let _ = std::fs::remove_file(&zip_path);
 
     if !status.success() {
         return Err(format!(
-            "חילוץ מנוע ההקראה נכשל (קוד יציאה: {}). נסה להוריד מחדש.",
+            "חילוץ מנוע הקריינות נכשל (קוד יציאה: {}). נסה להוריד מחדש.",
             status.code().map_or_else(|| "לא ידוע".to_string(), |c| c.to_string())
         ));
     }
 
     if !uv_exe.exists() {
         return Err(format!(
-            "חילוץ מנוע ההקראה הושלם אך uv.exe לא נמצא בנתיב הצפוי ({}).",
+            "חילוץ מנוע הקריינות הושלם אך uv.exe לא נמצא בנתיב הצפוי ({}).",
             uv_exe.display()
         ));
     }
@@ -193,7 +193,7 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
     // defense in depth, not expected to ever fire.)
     if PIPER_TTS_VERSION.starts_with('<') || VOICE_URL.starts_with('<') || VOICE_SHA256.starts_with('<') {
         return Err(
-            "מנוע ההקראה עדיין לא מוגדר בקוד (קבועים מסוג placeholder לא הוחלפו בערכי ה-spike האמיתיים)."
+            "מנוע הקריינות עדיין לא מוגדר בקוד (קבועים מסוג placeholder לא הוחלפו בערכי ה-spike האמיתיים)."
                 .to_string(),
         );
     }
@@ -229,18 +229,18 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
     let venv_output = match tokio::time::timeout(Duration::from_secs(300), venv_cmd.output()).await {
         Err(_) => {
             return Err(
-                "יצירת סביבת ההרצה למנוע ההקראה ארכה יותר מדי זמן, בדוק את החיבור לאינטרנט ונסה שוב."
+                "יצירת סביבת ההרצה למנוע הקריינות ארכה יותר מדי זמן, בדוק את החיבור לאינטרנט ונסה שוב."
                     .to_string(),
             )
         }
         Ok(Err(e)) => {
-            return Err(format!("יצירת סביבת ההרצה למנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})"))
+            return Err(format!("יצירת סביבת ההרצה למנוע הקריינות נכשלה להתחיל. (פרטים טכניים: {e})"))
         }
         Ok(Ok(output)) => output,
     };
     if !venv_output.status.success() {
         return Err(format!(
-            "יצירת סביבת ההרצה למנוע ההקראה נכשלה (קוד יציאה: {}).\n{}",
+            "יצירת סביבת ההרצה למנוע הקריינות נכשלה (קוד יציאה: {}).\n{}",
             venv_output.status.code().map_or_else(|| "לא ידוע".to_string(), |c| c.to_string()),
             tail_stderr(&venv_output.stderr)
         ));
@@ -264,15 +264,15 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
     let pip_output = match tokio::time::timeout(Duration::from_secs(600), pip_cmd.output()).await {
         Err(_) => {
             return Err(
-                "התקנת מנוע ההקראה ארכה יותר מדי זמן, בדוק את החיבור לאינטרנט ונסה שוב.".to_string(),
+                "התקנת מנוע הקריינות ארכה יותר מדי זמן, בדוק את החיבור לאינטרנט ונסה שוב.".to_string(),
             )
         }
-        Ok(Err(e)) => return Err(format!("התקנת מנוע ההקראה נכשלה להתחיל. (פרטים טכניים: {e})")),
+        Ok(Err(e)) => return Err(format!("התקנת מנוע הקריינות נכשלה להתחיל. (פרטים טכניים: {e})")),
         Ok(Ok(output)) => output,
     };
     if !pip_output.status.success() {
         return Err(format!(
-            "התקנת מנוע ההקראה נכשלה (קוד יציאה: {}).\n{}",
+            "התקנת מנוע הקריינות נכשלה (קוד יציאה: {}).\n{}",
             pip_output.status.code().map_or_else(|| "לא ידוע".to_string(), |c| c.to_string()),
             tail_stderr(&pip_output.stderr)
         ));
@@ -296,7 +296,7 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
             VOICE_CONFIG_SIZE,
             VOICE_CONFIG_SHA256,
             "narration-voice-download-progress",
-            "הגדרות קול ההקראה",
+            "הגדרות קול הקריינות",
         )
         .await?;
     }
@@ -312,7 +312,7 @@ pub async fn provision_narration_engine(app: &AppHandle) -> Result<(), String> {
             VOICE_SIZE,
             VOICE_SHA256,
             "narration-voice-download-progress",
-            "קול ההקראה",
+            "קול הקריינות",
         )
         .await?;
     }

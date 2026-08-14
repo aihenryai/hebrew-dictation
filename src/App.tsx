@@ -451,7 +451,7 @@ function App() {
   const [recordSource, setRecordSource] = useState<RecordingSource>("mic");
   const [batchRecordElapsed, setBatchRecordElapsed] = useState(0);
   const [batchActiveResultId, setBatchActiveResultId] = useState<number | null>(null);
-  // הקראה (narration) screen state.
+  // קריינות (narration) screen state.
   const [narrationText, setNarrationText] = useState("");
   const [narrationGenerating, setNarrationGenerating] = useState(false);
   const [narrationAudioUrl, setNarrationAudioUrl] = useState<string | null>(null);
@@ -988,7 +988,7 @@ function App() {
     }
   }, [history]);
 
-  // ── הקראה (narration) handlers ──
+  // ── קריינות (narration) handlers ──
   const checkNarrationReady = useCallback(async () => {
     try {
       const ready = await invoke<boolean>("ensure_narration_ready");
@@ -1006,7 +1006,7 @@ function App() {
       await invoke("narration_setup");
       await checkNarrationReady();
     } catch (e) {
-      setError(`התקנת מנוע ההקראה נכשלה: ${e}`);
+      setError(`התקנת מנוע הקריינות נכשלה: ${e}`);
     } finally {
       setNarrationProvisioning(false);
     }
@@ -1034,7 +1034,7 @@ function App() {
       setNarrationBytes(arr);
       setNarrationAudioUrl(newUrl);
     } catch (e) {
-      setError(`יצירת ההקראה נכשלה: ${e}`);
+      setError(`יצירת הקריינות נכשלה: ${e}`);
     } finally {
       setNarrationGenerating(false);
     }
@@ -2895,7 +2895,7 @@ function App() {
       <main className="container batch-view" dir="rtl">
         <div className="batch-view-header">
           <button className="btn-back" onClick={() => setView("main")} aria-label="חזור">חזור</button>
-          <h2 className="batch-view-title">הקראה</h2>
+          <h2 className="batch-view-title">צור קריינות</h2>
           <button
             className="btn-settings-labeled"
             style={{ marginInlineStart: "auto" }}
@@ -2911,14 +2911,14 @@ function App() {
 
         {!narrationReady && !narrationProvisioning && (
           <div className="narration-setup-prompt">
-            <p>מנוע ההקראה עדיין לא הותקן. ההתקנה חד-פעמית, פועלת ברקע, ולא דורשת ידע טכני.</p>
-            <button className="btn-primary" onClick={runNarrationSetup}>התקן מנוע הקראה</button>
+            <p>מנוע הקריינות עדיין לא הותקן. ההתקנה חד-פעמית, פועלת ברקע, ולא דורשת ידע טכני.</p>
+            <button className="btn-primary" onClick={runNarrationSetup}>התקן מנוע קריינות</button>
           </div>
         )}
 
         {narrationProvisioning && (
           <div className="narration-setup-progress">
-            <p>מתקין מנוע הקראה… ({narrationProvisionProgress}%)</p>
+            <p>מתקין מנוע קריינות… ({narrationProvisionProgress}%)</p>
             <progress value={narrationProvisionProgress} max={100} />
           </div>
         )}
@@ -2929,8 +2929,8 @@ function App() {
               className="narration-textarea"
               value={narrationText}
               onChange={(e) => setNarrationText(e.target.value)}
-              placeholder="הדביקו או הקלידו טקסט בעברית להקראה…"
-              aria-label="טקסט להקראה"
+              placeholder="הדביקו או הקלידו טקסט בעברית לקריינות…"
+              aria-label="טקסט לקריינות"
               dir="rtl"
               rows={8}
             />
@@ -2967,7 +2967,7 @@ function App() {
                 step={1}
                 value={narrationRateStep}
                 onChange={(e) => setNarrationRateStep(parseInt(e.target.value, 10))}
-                aria-label="קצב הדיבור בהקראה"
+                aria-label="קצב הדיבור בקריינות"
               />
               <div className="narration-rate-ends">
                 <span>איטי</span>
@@ -3039,8 +3039,8 @@ function App() {
           <button
             className="btn-batch-nav btn-mode-narration"
             onClick={() => setView("narration")}
-            aria-label="הקראה"
-          >🔊 הקראה</button>
+            aria-label="צור קריינות"
+          >🔊 צור קריינות</button>
         </div>
       </div>
 

@@ -65,9 +65,9 @@ pub enum NarrationError {
 impl std::fmt::Display for NarrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NarrationError::Unreachable(e) => write!(f, "מנוע ההקראה לא זמין: {e}"),
-            NarrationError::BadResponse(e) => write!(f, "מנוע ההקראה החזיר שגיאה: {e}"),
-            NarrationError::InvalidAudio => write!(f, "מנוע ההקראה החזיר תשובה לא תקינה"),
+            NarrationError::Unreachable(e) => write!(f, "מנוע הקריינות לא זמין: {e}"),
+            NarrationError::BadResponse(e) => write!(f, "מנוע הקריינות החזיר שגיאה: {e}"),
+            NarrationError::InvalidAudio => write!(f, "מנוע הקריינות החזיר תשובה לא תקינה"),
         }
     }
 }
