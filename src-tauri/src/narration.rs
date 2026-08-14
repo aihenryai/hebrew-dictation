@@ -162,6 +162,23 @@ mod tests {
     }
 
     #[test]
+    fn build_server_args_passes_the_module_voice_and_port() {
+        // Covers the mandatory args that aren't flag-tuning: dropping any of
+        // them silently launches the wrong thing (or nothing) rather than
+        // failing a narrower flag assertion.
+        let args = build_server_args("he_IL-saspeech-medium", "127.0.0.1", 5758);
+        assert_eq!(args[0], "-m");
+        assert_eq!(args[1], "piper.http_server");
+        let voice_idx = args
+            .iter()
+            .position(|a| a == "he_IL-saspeech-medium")
+            .expect("the voice name must be passed");
+        assert_eq!(args[voice_idx - 1], "-m");
+        let port_idx = args.iter().position(|a| a == "--port").unwrap();
+        assert_eq!(args[port_idx + 1], "5758");
+    }
+
+    #[test]
     fn build_server_args_sets_a_nonzero_sentence_silence() {
         // Piper's own default is 0.0 — no pause at all between sentences,
         // which is what made narration sound like it ignored punctuation.
@@ -183,7 +200,11 @@ mod tests {
         assert_eq!(clamp_length_scale(0.0), 0.8);
         assert_eq!(clamp_length_scale(-5.0), 0.8);
         assert_eq!(clamp_length_scale(99.0), 1.8);
+        // All three non-finite values, not just NaN: `clamp` on an infinity
+        // would otherwise silently return a range bound instead of the default.
         assert_eq!(clamp_length_scale(f32::NAN), DEFAULT_LENGTH_SCALE);
+        assert_eq!(clamp_length_scale(f32::INFINITY), DEFAULT_LENGTH_SCALE);
+        assert_eq!(clamp_length_scale(f32::NEG_INFINITY), DEFAULT_LENGTH_SCALE);
     }
 
     #[test]

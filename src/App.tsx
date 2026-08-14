@@ -157,6 +157,18 @@ interface ExportHistoryItem {
 
 /** First 4 words of a transcript, capped at 40 chars — used as a content-derived
  *  export filename for BOTH the regular dictation history and batch file results. */
+// Narration speed slider. Integer steps map to piper's length_scale (phoneme
+// duration, so HIGHER IS SLOWER) via exact hundredths, which keeps every
+// position on a clean value and makes the default exactly reachable again
+// after the user drags away from it:
+//   step 0  -> 1.60 (slowest)   step 6 -> 1.18 (default)   step 10 -> 0.90 (fastest)
+// Step 6 must stay equal to the backend's DEFAULT_LENGTH_SCALE.
+const NARRATION_RATE_STEPS = 10;
+const NARRATION_DEFAULT_STEP = 6;
+function narrationStepToLengthScale(step: number): number {
+  return (160 - step * 7) / 100;
+}
+
 function firstWordsName(text: string): string {
   const words = text.trim().split(/\s+/).slice(0, 4).join(" ");
   return words.length > 40 ? words.substring(0, 40) : words;
@@ -448,9 +460,13 @@ function App() {
   const [narrationProvisioning, setNarrationProvisioning] = useState(false);
   const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
   const [narrationSaveNotice, setNarrationSaveNotice] = useState<string | null>(null);
-  // Speech rate = piper's length_scale (phoneme duration), so HIGHER IS SLOWER.
-  // Default matches the backend's DEFAULT_LENGTH_SCALE.
-  const [narrationRate, setNarrationRate] = useState(1.18);
+  // Speed slider position, 0 (slowest) to NARRATION_RATE_STEPS (fastest).
+  // Stored as an integer step rather than the float it maps to: the value the
+  // backend wants is length_scale (phoneme duration, so higher = SLOWER),
+  // which is the inverse of what the slider shows. Keeping the inverse in
+  // state invited a double inversion, and a float slider position could not
+  // land exactly back on the default. See narrationLengthScale below.
+  const [narrationRateStep, setNarrationRateStep] = useState(NARRATION_DEFAULT_STEP);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
@@ -1003,7 +1019,7 @@ function App() {
     try {
       const bytes = await invoke<number[]>("generate_narration", {
         text: narrationText,
-        lengthScale: narrationRate,
+        lengthScale: narrationStepToLengthScale(narrationRateStep),
       });
       const arr = new Uint8Array(bytes);
       const blob = new Blob([arr], { type: "audio/wav" });
@@ -1022,7 +1038,7 @@ function App() {
     } finally {
       setNarrationGenerating(false);
     }
-  }, [narrationText, narrationAudioUrl, narrationRate]);
+  }, [narrationText, narrationAudioUrl, narrationRateStep]);
 
   const saveNarrationWav = useCallback(async () => {
     if (!narrationBytes) return;
@@ -2931,24 +2947,26 @@ function App() {
               <label htmlFor="narration-rate-slider">
                 קצב הדיבור
                 <span className="narration-rate-value">
-                  {narrationRate <= 1.0 ? "מהיר" : narrationRate >= 1.4 ? "איטי" : "רגיל"}
+                  {narrationRateStep === NARRATION_DEFAULT_STEP
+                    ? "רגיל"
+                    : narrationRateStep > NARRATION_DEFAULT_STEP
+                      ? "מהיר"
+                      : "איטי"}
                 </span>
               </label>
               {/* Forced LTR: a range input in an RTL container flips which end
                   is min, which would silently invert the labels below. Pinning
-                  direction here makes left=min=slow and right=max=fast in every
-                  case, so the end labels can't drift out of sync with the track.
-                  Value is speech RATE (higher = faster); length_scale is its
-                  inverse, since piper measures phoneme duration. */}
+                  direction here makes left=min=slowest and right=max=fastest in
+                  every case, so the end labels can't drift out of sync. */}
               <input
                 id="narration-rate-slider"
                 style={{ direction: "ltr" }}
                 type="range"
-                min={0.62}
-                max={1.11}
-                step={0.01}
-                value={1 / narrationRate}
-                onChange={(e) => setNarrationRate(1 / parseFloat(e.target.value))}
+                min={0}
+                max={NARRATION_RATE_STEPS}
+                step={1}
+                value={narrationRateStep}
+                onChange={(e) => setNarrationRateStep(parseInt(e.target.value, 10))}
                 aria-label="קצב הדיבור בהקראה"
               />
               <div className="narration-rate-ends">
