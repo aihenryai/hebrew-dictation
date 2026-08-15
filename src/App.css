@@ -1808,6 +1808,48 @@ body:has(.toolbar-idle) #root {
   width: 100%;
 }
 
+.narration-voices {
+  margin-bottom: 0.85rem;
+  text-align: right;
+}
+.narration-voices-title {
+  display: block;
+  font-size: 0.8rem;
+  color: #a0a8c0;
+  margin-bottom: 0.3rem;
+}
+.narration-voice-options {
+  display: flex;
+  gap: 0.4rem;
+}
+.narration-voice-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+  background: none;
+  border: 1px solid #2a3a5e;
+  border-radius: 6px;
+  color: #cdd4e6;
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.narration-voice-btn:hover:not(:disabled) { border-color: #fbbf24; }
+.narration-voice-btn:disabled { opacity: 0.6; cursor: default; }
+.narration-voice-btn.is-selected {
+  color: #fbbf24;
+  border-color: #fbbf24;
+  background: #3a2c08;
+}
+.narration-voice-size {
+  font-size: 0.65rem;
+  color: #6b7594;
+}
+
 .narration-advanced {
   margin-bottom: 0.85rem;
   text-align: right;

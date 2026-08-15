@@ -130,14 +130,53 @@ const PIP_PACKAGES: [&str; 5] = [
     "tokenizers",
 ];
 
-/// Voice: a VITS model trained on Phonikud's stress-marked IPA. "michael" was
-/// chosen over the "shaul" checkpoint by listening to both against the
-/// previously shipped voice on the same paragraph.
-pub const VOICE_NAME: &str = "michael"; // pub: the sidecar-lifecycle module needs this too
-const VOICE_URL: &str =
-    "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/michael.onnx";
-const VOICE_SIZE: u64 = 63_516_050;
-const VOICE_SHA256: &str = "d2824d46ecd7ca8a206686d818d3178effe4661ce78bdb4e754eed32fe604320";
+/// A selectable narration voice. All are VITS models trained on Phonikud's
+/// stress-marked IPA and share one `model.config.json`, so switching voices
+/// means swapping one ~63MB file — no other artifact changes.
+pub struct NarrationVoice {
+    /// Stable id: the filename stem and the value stored in settings.
+    pub id: &'static str,
+    /// Hebrew label for the picker.
+    pub label: &'static str,
+    pub url: &'static str,
+    pub size: u64,
+    pub sha256: &'static str,
+}
+
+/// The catalog. Deliberately only the two voices Henry picked by ear from the
+/// four the upstream repo publishes — the other two were rejected, and there
+/// is no reason to offer a 63MB download nobody wants. All are male; no free
+/// Hebrew female voice exists (see the spike findings).
+pub const VOICES: [NarrationVoice; 2] = [
+    NarrationVoice {
+        id: "michael",
+        label: "מיכאל",
+        url: "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/michael.onnx",
+        size: 63_516_050,
+        sha256: "d2824d46ecd7ca8a206686d818d3178effe4661ce78bdb4e754eed32fe604320",
+    },
+    NarrationVoice {
+        id: "shaul",
+        label: "שאול",
+        url: "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/shaul.onnx",
+        size: 63_516_050,
+        sha256: "7bcbd364b0bc357df8ef6c7c873e48f22897df16ec6c9d8f9d7ef792f6ae03c9",
+    },
+];
+
+/// Voice installed by the initial provisioning run, and the fallback whenever
+/// a stored setting names a voice this build no longer ships.
+pub const DEFAULT_VOICE: &str = "michael";
+
+/// Look a voice up by id, falling back to the default rather than failing:
+/// a settings file naming a removed voice must degrade to working audio, not
+/// a hard error the user cannot clear from the UI.
+pub fn voice_by_id(id: &str) -> &'static NarrationVoice {
+    VOICES
+        .iter()
+        .find(|v| v.id == id)
+        .unwrap_or_else(|| VOICES.iter().find(|v| v.id == DEFAULT_VOICE).unwrap())
+}
 
 /// Shared config for the Phonikud voices: phoneme→id map, sample rate,
 /// inference defaults. Without it the server cannot map IPA to symbol ids.
@@ -172,8 +211,39 @@ pub fn get_venv_dir() -> PathBuf { // pub: a later sidecar-lifecycle module need
     get_narration_dir().join("venv")
 }
 
-pub fn get_voice_path() -> PathBuf {
-    get_narration_dir().join(format!("{VOICE_NAME}.onnx"))
+pub fn get_voice_path(voice_id: &str) -> PathBuf {
+    get_narration_dir().join(format!("{}.onnx", voice_by_id(voice_id).id))
+}
+
+/// True when this voice's model file is present at its expected size. Size
+/// alone rather than a re-hash: this is called on every screen open, and
+/// `download_and_verify` already hash-checks before the file is put in place.
+pub fn is_voice_downloaded(voice_id: &str) -> bool {
+    let v = voice_by_id(voice_id);
+    let path = get_voice_path(v.id);
+    std::fs::metadata(&path).map(|m| m.len() == v.size).unwrap_or(false)
+}
+
+/// Download one voice if it isn't already present. Used when the user picks a
+/// voice that wasn't installed at provisioning time.
+pub async fn ensure_voice_downloaded<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    voice_id: &str,
+) -> Result<(), String> {
+    let v = voice_by_id(voice_id);
+    if is_voice_downloaded(v.id) {
+        return Ok(());
+    }
+    crate::model::download_and_verify(
+        app,
+        v.url,
+        &get_voice_path(v.id),
+        v.size,
+        v.sha256,
+        "narration-voice-download-progress",
+        "קול הקריינות",
+    )
+    .await
 }
 
 pub fn get_voice_config_path() -> PathBuf {
@@ -276,7 +346,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
     // and immediately instead of a confusing HTTP/URL error partway through
     // provisioning. (All constants above are real, pinned values — this is
     // defense in depth, not expected to ever fire.)
-    if VOICE_URL.starts_with('<') || VOICE_SHA256.starts_with('<') || PHONIKUD_SHA256.starts_with('<') {
+    if PHONIKUD_SHA256.starts_with('<') || TOKENIZER_SHA256.starts_with('<') {
         return Err(
             "מנוע הקריינות עדיין לא מוגדר בקוד (קבועים מסוג placeholder לא הוחלפו בערכי ה-spike האמיתיים)."
                 .to_string(),
@@ -394,21 +464,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         .await?;
     }
 
-    let voice_path = get_voice_path();
-    let voice_already_valid = voice_path.exists()
-        && std::fs::metadata(&voice_path).map(|m| m.len() == VOICE_SIZE).unwrap_or(false);
-    if !voice_already_valid {
-        crate::model::download_and_verify(
-            app,
-            VOICE_URL,
-            &voice_path,
-            VOICE_SIZE,
-            VOICE_SHA256,
-            "narration-voice-download-progress",
-            "קול הקריינות",
-        )
-        .await?;
-    }
+    ensure_voice_downloaded(app, DEFAULT_VOICE).await?;
 
     // Largest artifact (~308MB), so it goes last: an earlier failure costs
     // the user less bandwidth before it surfaces.
@@ -439,7 +495,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
     let marker = NarrationEngineMarker {
         marker_version: MARKER_VERSION,
         engine: "phonikud".to_string(),
-        voice_name: VOICE_NAME.to_string(),
+        voice_name: DEFAULT_VOICE.to_string(),
     };
     let marker_json = serde_json::to_string(&marker)
         .map_err(|e| format!("סידור נתוני הסימון נכשל. (פרטים טכניים: {e})"))?;
@@ -524,7 +580,7 @@ mod tests {
         // Every artifact the sidecar's argv points at must actually exist —
         // the marker alone would happily be written over a missing file.
         for path in [
-            get_voice_path(),
+            get_voice_path(DEFAULT_VOICE),
             get_voice_config_path(),
             get_phonikud_path(),
             get_tokenizer_path(),
@@ -664,7 +720,7 @@ mod tests {
             let marker = NarrationEngineMarker {
                 marker_version: MARKER_VERSION,
                 engine: "phonikud".to_string(),
-                voice_name: VOICE_NAME.to_string(),
+                voice_name: DEFAULT_VOICE.to_string(),
             };
             std::fs::write(get_marker_path(), serde_json::to_string(&marker).unwrap()).unwrap();
 

@@ -25,6 +25,9 @@ pub enum NarrationServer {
         #[cfg(target_os = "windows")]
         _job: Job,
         port: u16,
+        /// Remembered so a restart respawns the SAME voice the user picked,
+        /// rather than silently reverting to the default mid-session.
+        voice_id: String,
         client: reqwest::Client,
     },
     Unmanaged {
@@ -53,15 +56,19 @@ impl NarrationServer {
     /// This is both the normal "start the engine" path AND the stale-sweep
     /// concept from the design — there is deliberately no separate sweep
     /// function; see the module-level design note above.
-    pub async fn spawn_or_adopt(port: u16) -> Result<Self, String> {
+    pub async fn spawn_or_adopt(port: u16, voice_id: &str) -> Result<Self, String> {
         let client = reqwest::Client::new();
         if health_check(&client, port).await {
             return Ok(NarrationServer::Unmanaged { port, client });
         }
-        Self::spawn_owned(port, client).await
+        Self::spawn_owned(port, voice_id, client).await
     }
 
-    async fn spawn_owned(port: u16, client: reqwest::Client) -> Result<Self, String> {
+    async fn spawn_owned(
+        port: u16,
+        voice_id: &str,
+        client: reqwest::Client,
+    ) -> Result<Self, String> {
         let venv_dir = get_venv_dir();
         let python_exe = venv_dir.join("Scripts").join("python.exe");
         if !python_exe.exists() {
@@ -72,7 +79,7 @@ impl NarrationServer {
         }
 
         let script = crate::narration_provision::get_server_script_path();
-        let voice = crate::narration_provision::get_voice_path();
+        let voice = crate::narration_provision::get_voice_path(voice_id);
         let config = crate::narration_provision::get_voice_config_path();
         let phonikud = crate::narration_provision::get_phonikud_path();
         let tokenizer = crate::narration_provision::get_tokenizer_path();
@@ -146,6 +153,7 @@ impl NarrationServer {
             #[cfg(target_os = "windows")]
             _job: job,
             port,
+            voice_id: voice_id.to_string(),
             client,
         })
     }
@@ -175,8 +183,8 @@ impl NarrationServer {
             return Ok(bytes);
         }
 
-        let port = match self {
-            NarrationServer::Owned { port, .. } => *port,
+        let (port, voice_id) = match self {
+            NarrationServer::Owned { port, voice_id, .. } => (*port, voice_id.clone()),
             NarrationServer::Unmanaged { .. } => {
                 return Err(NarrationError::Unreachable(
                     "מנוע הקריינות (שאומץ מריצה קודמת) לא הגיב. נסה שוב.".to_string(),
@@ -186,7 +194,7 @@ impl NarrationServer {
 
         self.shutdown().await;
 
-        match Self::spawn_owned(port, reqwest::Client::new()).await {
+        match Self::spawn_owned(port, &voice_id, reqwest::Client::new()).await {
             Ok(restarted) => {
                 let result =
                     synthesize(restarted.client(), restarted.port(), text, params).await;
@@ -234,7 +242,7 @@ mod tests {
     async fn spawn_or_adopt_returns_unmanaged_when_port_already_healthy() {
         let port = spawn_fake_healthy_sidecar();
 
-        let result = NarrationServer::spawn_or_adopt(port).await;
+        let result = NarrationServer::spawn_or_adopt(port, crate::narration_provision::DEFAULT_VOICE).await;
 
         assert!(
             matches!(result, Ok(NarrationServer::Unmanaged { .. })),
@@ -295,7 +303,7 @@ mod tests {
         let port = spawn_fake_healthy_info_failing_synthesize();
 
         // Adopts (Unmanaged) because /info answers healthily.
-        let mut server = NarrationServer::spawn_or_adopt(port).await.unwrap();
+        let mut server = NarrationServer::spawn_or_adopt(port, crate::narration_provision::DEFAULT_VOICE).await.unwrap();
         assert!(matches!(server, NarrationServer::Unmanaged { .. }));
 
         // /synthesize fails on the adopted process — must surface as an
@@ -316,7 +324,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener); // free the port so piper's own bind() can claim it
 
-        let mut server = NarrationServer::spawn_owned(port, reqwest::Client::new())
+        let mut server = NarrationServer::spawn_owned(port, crate::narration_provision::DEFAULT_VOICE, reqwest::Client::new())
             .await
             .expect("spawn_owned should succeed against a real provisioned engine");
 

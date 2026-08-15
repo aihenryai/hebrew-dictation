@@ -991,6 +991,91 @@ async fn delete_narration_engine(_state: State<'_, AppState>) -> Result<u64, Str
     Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
 
+/// One entry in the narration voice picker.
+#[derive(serde::Serialize)]
+pub struct NarrationVoiceInfo {
+    id: String,
+    label: String,
+    /// Whether the ~63MB model is already on disk, so the UI can show a
+    /// download size instead of implying the switch is instant.
+    downloaded: bool,
+    size_bytes: u64,
+    selected: bool,
+}
+
+/// The voices this build offers, each flagged with whether it is downloaded
+/// and which one is currently selected.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn list_narration_voices(state: State<'_, AppState>) -> Result<Vec<NarrationVoiceInfo>, String> {
+    let selected = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.narration_voice.clone()
+    };
+    Ok(narration_provision::VOICES
+        .iter()
+        .map(|v| NarrationVoiceInfo {
+            id: v.id.to_string(),
+            label: v.label.to_string(),
+            downloaded: narration_provision::is_voice_downloaded(v.id),
+            size_bytes: v.size,
+            selected: v.id == selected,
+        })
+        .collect())
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn list_narration_voices(_state: State<'_, AppState>) -> Result<Vec<NarrationVoiceInfo>, String> {
+    Ok(Vec::new())
+}
+
+/// Switch the active narration voice, downloading it first if needed.
+///
+/// The voice is a sidecar startup argument, so the running process is shut
+/// down here rather than left serving the previous voice — the next generate
+/// respawns with the new one. Downloading BEFORE persisting the setting means
+/// a failed download leaves the previous, working voice selected instead of
+/// pointing the app at a file that isn't there.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn set_narration_voice(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    voice_id: String,
+) -> Result<(), String> {
+    if !narration_provision::VOICES.iter().any(|v| v.id == voice_id) {
+        return Err("קול לא מוכר".to_string());
+    }
+
+    narration_provision::ensure_voice_downloaded(&app, &voice_id).await?;
+
+    {
+        let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+        settings.narration_voice = voice_id;
+        settings::save_settings(&settings)?;
+    }
+
+    let mut guard = state.narration_server.lock().await;
+    if let Some(server) = guard.as_mut() {
+        server.shutdown().await;
+    }
+    *guard = None;
+    Ok(())
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn set_narration_voice(
+    _app: AppHandle,
+    _state: State<'_, AppState>,
+    _voice_id: String,
+) -> Result<(), String> {
+    Err("קריינות זמינה רק ב-Windows כרגע".to_string())
+}
+
 /// Generate Hebrew narration audio for `text`, returning raw WAV bytes.
 /// Lazily spawns/adopts the sidecar on first call in a session — never from
 /// `setup()`. Guards: empty text (client should already disable the button,
@@ -1013,14 +1098,15 @@ async fn generate_narration(
         return Err("מנוע הקריינות עדיין לא הותקן. לך להגדרות והתקן אותו קודם.".to_string());
     }
 
-    let port = {
+    let (port, voice_id) = {
         let settings = state.settings.lock().map_err(|e| e.to_string())?;
-        settings.narration_port
+        (settings.narration_port, settings.narration_voice.clone())
     };
 
     let mut guard = state.narration_server.lock().await;
     if guard.is_none() {
-        let server = narration_process::NarrationServer::spawn_or_adopt(port).await?;
+        let server =
+            narration_process::NarrationServer::spawn_or_adopt(port, &voice_id).await?;
         *guard = Some(server);
     }
     // guard.is_none() was just checked/filled above, so this unwrap is safe.
@@ -2333,6 +2419,8 @@ pub fn run() {
             narration_setup,
             generate_narration,
             delete_narration_engine,
+            list_narration_voices,
+            set_narration_voice,
             save_narration_wav,
             delete_temp_recording,
             pick_audio_file,

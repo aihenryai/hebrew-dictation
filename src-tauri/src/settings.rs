@@ -140,6 +140,10 @@ pub struct AppSettings {
     /// (sibling of the local API's 5757). No dedicated frontend UI in Phase 1.
     #[serde(default = "default_narration_port")]
     pub narration_port: u16,
+    /// Selected narration voice id. `#[serde(default)]` so an older settings
+    /// file simply gets the default rather than failing to parse.
+    #[serde(default = "default_narration_voice")]
+    pub narration_voice: String,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -174,6 +178,7 @@ pub struct RedactedSettings {
     pub local_api_enabled: bool,
     pub local_api_port: u16,
     pub narration_port: u16,
+    pub narration_voice: String,
 }
 
 impl AppSettings {
@@ -208,6 +213,7 @@ impl AppSettings {
             local_api_enabled: self.local_api_enabled,
             local_api_port: self.local_api_port,
             narration_port: self.narration_port,
+            narration_voice: self.narration_voice.clone(),
         }
     }
 }
@@ -252,6 +258,10 @@ fn default_local_api_port() -> u16 {
     5757
 }
 
+fn default_narration_voice() -> String {
+    crate::narration_provision::DEFAULT_VOICE.to_string()
+}
+
 fn default_narration_port() -> u16 {
     5758
 }
@@ -288,6 +298,7 @@ impl Default for AppSettings {
             local_api_enabled: false,
             local_api_port: default_local_api_port(),
             narration_port: default_narration_port(),
+            narration_voice: default_narration_voice(),
         }
     }
 }
@@ -486,6 +497,7 @@ impl AppSettings {
         incoming.local_api_enabled = self.local_api_enabled;
         incoming.local_api_port = self.local_api_port;
         incoming.narration_port = self.narration_port;
+        incoming.narration_voice = self.narration_voice.clone();
         incoming
     }
 }

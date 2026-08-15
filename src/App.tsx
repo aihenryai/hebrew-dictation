@@ -157,6 +157,16 @@ interface ExportHistoryItem {
 
 /** First 4 words of a transcript, capped at 40 chars — used as a content-derived
  *  export filename for BOTH the regular dictation history and batch file results. */
+interface NarrationVoiceInfo {
+  id: string;
+  label: string;
+  /// False until the ~63MB model has been downloaded, so the picker can say
+  /// so instead of implying the switch is instant.
+  downloaded: boolean;
+  size_bytes: number;
+  selected: boolean;
+}
+
 // One generated narration kept in the session history. `url` is a blob URL
 // owned by this entry — revoke it when the entry is dropped.
 interface NarrationClip {
@@ -511,6 +521,8 @@ function App() {
   const [narrationNoiseWStep, setNarrationNoiseWStep] = useState(NARRATION_NOISE_DEFAULT_STEP);
   const [narrationAdvancedOpen, setNarrationAdvancedOpen] = useState(false);
   const [narrationDeleting, setNarrationDeleting] = useState(false);
+  const [narrationVoices, setNarrationVoices] = useState<NarrationVoiceInfo[]>([]);
+  const [narrationSwitchingVoice, setNarrationSwitchingVoice] = useState<string | null>(null);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
@@ -1099,6 +1111,29 @@ function App() {
     narrationNoiseWStep,
   ]);
 
+  const refreshNarrationVoices = useCallback(async () => {
+    try {
+      setNarrationVoices(await invoke<NarrationVoiceInfo[]>("list_narration_voices"));
+    } catch {
+      // A failure here only costs the picker; the screen stays usable with
+      // whatever voice is already selected.
+      setNarrationVoices([]);
+    }
+  }, []);
+
+  const selectNarrationVoice = useCallback(async (voiceId: string) => {
+    setNarrationSwitchingVoice(voiceId);
+    setError("");
+    try {
+      await invoke("set_narration_voice", { voiceId });
+      await refreshNarrationVoices();
+    } catch (e) {
+      setError(`החלפת הקול נכשלה: ${e}`);
+    } finally {
+      setNarrationSwitchingVoice(null);
+    }
+  }, [refreshNarrationVoices]);
+
   const deleteNarrationEngine = useCallback(async () => {
     setNarrationDeleting(true);
     setError("");
@@ -1147,8 +1182,9 @@ function App() {
   useEffect(() => {
     if (view === "narration") {
       checkNarrationReady();
+      refreshNarrationVoices();
     }
-  }, [view, checkNarrationReady]);
+  }, [view, checkNarrationReady, refreshNarrationVoices]);
 
   // ── Batch file transcription handlers ──
   const handlePickAndTranscribe = useCallback(async () => {
@@ -3023,6 +3059,30 @@ function App() {
             <p className="narration-hint">
               כתבו בעברית בלבד — שמות באנגלית ומספרים עלולים להישמע משובשים.
             </p>
+
+            {narrationVoices.length > 1 && (
+              <div className="narration-voices">
+                <span className="narration-voices-title">קול</span>
+                <div className="narration-voice-options">
+                  {narrationVoices.map((v) => (
+                    <button
+                      key={v.id}
+                      className={`narration-voice-btn${v.selected ? " is-selected" : ""}`}
+                      onClick={() => selectNarrationVoice(v.id)}
+                      disabled={narrationSwitchingVoice !== null}
+                      aria-pressed={v.selected}
+                    >
+                      {narrationSwitchingVoice === v.id ? "מוריד…" : v.label}
+                      {!v.downloaded && narrationSwitchingVoice !== v.id && (
+                        <span className="narration-voice-size">
+                          {(v.size_bytes / 1024 / 1024).toFixed(0)}MB
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="narration-rate">
               <label htmlFor="narration-rate-slider">
