@@ -216,6 +216,29 @@ pub fn narration_engine_state() -> NarrationEngineState {
     }
 }
 
+/// Write the bundled sidecar script to app-data, overwriting any older copy.
+///
+/// Called on BOTH provisioning paths — the full install and the
+/// already-provisioned early return — because the script travels inside the
+/// app binary while the downloaded artifacts do not. Skipping it when the
+/// marker reads Ready would pin every user to whichever version of the
+/// script happened to be current at their first install.
+///
+/// Skips the write when the content already matches, so the common case
+/// costs one read instead of a rewrite on every screen open.
+fn sync_server_script() -> Result<(), String> {
+    let path = get_server_script_path();
+    if std::fs::read_to_string(&path).is_ok_and(|existing| existing == NARRATION_SERVER_PY) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("יצירת תיקיית המנוע נכשלה. (פרטים טכניים: {e})"))?;
+    }
+    std::fs::write(&path, NARRATION_SERVER_PY)
+        .map_err(|e| format!("כתיבת שרת הקריינות נכשלה. (פרטים טכניים: {e})"))
+}
+
 /// Last ~5 lines of a subprocess's stderr, for embedding in an error
 /// message. Lossy-converts — `uv`/pip stderr is expected to be UTF-8, but
 /// this must never panic on a stray non-UTF-8 byte.
@@ -239,6 +262,13 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
     if narration_engine_state() == NarrationEngineState::Ready {
+        // Refresh the sidecar script even on the already-provisioned path.
+        // It ships inside the binary, so an app update can carry a fixed or
+        // extended server while the downloaded artifacts are untouched and
+        // the marker still reads Ready. Returning early without this wrote
+        // the script exactly once, at first install, and every later change
+        // to it silently never reached disk.
+        sync_server_script()?;
         return Ok(());
     }
 
@@ -398,11 +428,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         .await?;
     }
 
-    // Written unconditionally rather than only when absent, so a rebuilt or
-    // patched server script ships with the app upgrade instead of leaving a
-    // stale copy behind from a previous install.
-    std::fs::write(get_server_script_path(), NARRATION_SERVER_PY)
-        .map_err(|e| format!("כתיבת שרת הקריינות נכשלה. (פרטים טכניים: {e})"))?;
+    sync_server_script()?;
 
     // Reclaim the ~63MB piper voice from the pre-Phonikud engine. Best-effort:
     // failing to delete a leftover must never fail provisioning.
@@ -451,6 +477,34 @@ mod tests {
         // confusing hash-mismatch failure instead of a clear "these don't
         // match" signal. This test makes the drift fail fast and legibly.
         assert!(UV_DOWNLOAD_URL.contains(UV_VERSION));
+    }
+
+    #[test]
+    fn sync_server_script_overwrites_a_stale_copy() {
+        // Regression: the script used to be written only on the full
+        // provisioning path, so once the marker read Ready every later change
+        // to the sidecar silently never reached disk and the app kept running
+        // whatever version shipped at first install.
+        let _lock = MARKER_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let path = get_server_script_path();
+        let original = std::fs::read_to_string(&path).ok();
+
+        std::fs::create_dir_all(get_narration_dir()).unwrap();
+        std::fs::write(&path, "# stale, from an older app version\n").unwrap();
+
+        sync_server_script().expect("sync should rewrite the stale script");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            NARRATION_SERVER_PY,
+            "a stale script must be replaced with the bundled one"
+        );
+
+        match original {
+            Some(contents) => std::fs::write(&path, contents).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     #[tokio::test]

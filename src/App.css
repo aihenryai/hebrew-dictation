@@ -1808,6 +1808,46 @@ body:has(.toolbar-idle) #root {
   width: 100%;
 }
 
+.narration-advanced {
+  margin-bottom: 0.85rem;
+  text-align: right;
+  border: 1px solid #2a3a5e;
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+}
+.narration-advanced summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: #a0a8c0;
+  user-select: none;
+}
+.narration-advanced summary:hover { color: #cdd4e6; }
+.narration-advanced .narration-rate {
+  margin-top: 0.7rem;
+  margin-bottom: 0.6rem;
+}
+.narration-reset {
+  width: 100%;
+  font-size: 0.75rem;
+  padding: 0.3rem;
+}
+
+.narration-engine-admin {
+  margin-top: 1.4rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid #23304f;
+  text-align: right;
+}
+.btn-danger-outline {
+  width: 100%;
+  color: #f87171;
+  border-color: #f8717155;
+}
+.btn-danger-outline:hover:not(:disabled) {
+  background: #3b1414;
+  border-color: #f87171;
+}
+
 .narration-history {
   margin-top: 1.1rem;
   text-align: right;

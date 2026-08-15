@@ -170,16 +170,38 @@ interface NarrationClip {
 const NARRATION_HISTORY_MAX = 10;
 let narrationIdCounter = 0;
 
-// Narration speed slider. Integer steps map to piper's length_scale (phoneme
-// duration, so HIGHER IS SLOWER) via exact hundredths, which keeps every
-// position on a clean value and makes the default exactly reachable again
-// after the user drags away from it:
-//   step 0  -> 1.60 (slowest)   step 6 -> 1.18 (default)   step 10 -> 0.90 (fastest)
-// Step 6 must stay equal to the backend's DEFAULT_LENGTH_SCALE.
+// Narration tuning sliders. Every slider stores an INTEGER step and maps to
+// its float on the way out. That is not incidental: a float slider position
+// could not land back exactly on the backend's default once dragged away,
+// so "return to default" became unreachable. Each mapping below is built so
+// the default step lands on the backend constant exactly.
+
+// length_scale is phoneme duration, so HIGHER IS SLOWER:
+//   step 0 -> 1.60 (slowest)   step 6 -> 1.18 (default)   step 10 -> 0.90 (fastest)
 const NARRATION_RATE_STEPS = 10;
 const NARRATION_DEFAULT_STEP = 6;
 function narrationStepToLengthScale(step: number): number {
   return (160 - step * 7) / 100;
+}
+
+// Pause between sentences, in 0.05s increments. Step 9 -> 0.45s, the backend
+// default, exactly.
+const NARRATION_SILENCE_STEPS = 24;
+const NARRATION_SILENCE_DEFAULT_STEP = 9;
+function narrationStepToSilence(step: number): number {
+  return step * 5 / 100;
+}
+
+// Expressiveness (noise_scale) and crispness (noise_w) are expressed as a
+// MULTIPLIER of the voice config's own defaults rather than absolute values,
+// so step 5 is exactly 1.0x — i.e. exactly the backend default — and the
+// range stays meaningful if those defaults ever change.
+const NARRATION_NOISE_STEPS = 10;
+const NARRATION_NOISE_DEFAULT_STEP = 5;
+const BACKEND_NOISE_SCALE = 0.667;
+const BACKEND_NOISE_W = 0.8;
+function narrationStepToMultiplier(step: number): number {
+  return (50 + step * 10) / 100; // 0.5x .. 1.5x, step 5 -> 1.0x
 }
 
 function firstWordsName(text: string): string {
@@ -484,6 +506,11 @@ function App() {
   // state invited a double inversion, and a float slider position could not
   // land exactly back on the default. See narrationLengthScale below.
   const [narrationRateStep, setNarrationRateStep] = useState(NARRATION_DEFAULT_STEP);
+  const [narrationSilenceStep, setNarrationSilenceStep] = useState(NARRATION_SILENCE_DEFAULT_STEP);
+  const [narrationNoiseStep, setNarrationNoiseStep] = useState(NARRATION_NOISE_DEFAULT_STEP);
+  const [narrationNoiseWStep, setNarrationNoiseWStep] = useState(NARRATION_NOISE_DEFAULT_STEP);
+  const [narrationAdvancedOpen, setNarrationAdvancedOpen] = useState(false);
+  const [narrationDeleting, setNarrationDeleting] = useState(false);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const batchRecordingRef = useRef(false);
   const updateRef = useRef<Update | null>(null);
@@ -1036,7 +1063,12 @@ function App() {
     try {
       const bytes = await invoke<number[]>("generate_narration", {
         text: narrationText,
-        lengthScale: narrationStepToLengthScale(narrationRateStep),
+        params: {
+          length_scale: narrationStepToLengthScale(narrationRateStep),
+          sentence_silence: narrationStepToSilence(narrationSilenceStep),
+          noise_scale: BACKEND_NOISE_SCALE * narrationStepToMultiplier(narrationNoiseStep),
+          noise_w: BACKEND_NOISE_W * narrationStepToMultiplier(narrationNoiseWStep),
+        },
       });
       const arr = new Uint8Array(bytes);
       const blob = new Blob([arr], { type: "audio/wav" });
@@ -1059,7 +1091,29 @@ function App() {
     } finally {
       setNarrationGenerating(false);
     }
-  }, [narrationText, narrationRateStep]);
+  }, [
+    narrationText,
+    narrationRateStep,
+    narrationSilenceStep,
+    narrationNoiseStep,
+    narrationNoiseWStep,
+  ]);
+
+  const deleteNarrationEngine = useCallback(async () => {
+    setNarrationDeleting(true);
+    setError("");
+    setNarrationSaveNotice(null);
+    try {
+      const freed = await invoke<number>("delete_narration_engine");
+      setNarrationReady(false);
+      setNarrationSaveNotice(`✅ המנוע נמחק, פונו ${(freed / 1024 / 1024).toFixed(0)}MB`);
+      window.setTimeout(() => setNarrationSaveNotice(null), 8000);
+    } catch (e) {
+      setError(`מחיקת המנוע נכשלה: ${e}`);
+    } finally {
+      setNarrationDeleting(false);
+    }
+  }, []);
 
   const deleteNarrationClip = useCallback((id: number) => {
     setNarrationHistory((prev) => {
@@ -3002,6 +3056,102 @@ function App() {
               </div>
             </div>
 
+            <div className="narration-rate">
+              <label htmlFor="narration-silence-slider">
+                הפסקה בין משפטים
+                <span className="narration-rate-value">
+                  {narrationStepToSilence(narrationSilenceStep).toFixed(2)} שנ׳
+                </span>
+              </label>
+              <input
+                id="narration-silence-slider"
+                style={{ direction: "ltr" }}
+                type="range"
+                min={0}
+                max={NARRATION_SILENCE_STEPS}
+                step={1}
+                value={narrationSilenceStep}
+                onChange={(e) => setNarrationSilenceStep(parseInt(e.target.value, 10))}
+                aria-label="אורך ההפסקה בין משפטים"
+              />
+              <div className="narration-rate-ends">
+                <span>ללא</span>
+                <span>ארוכה</span>
+              </div>
+            </div>
+
+            <details
+              className="narration-advanced"
+              open={narrationAdvancedOpen}
+              onToggle={(e) => setNarrationAdvancedOpen((e.target as HTMLDetailsElement).open)}
+            >
+              <summary>הגדרות מתקדמות</summary>
+
+              <div className="narration-rate">
+                <label htmlFor="narration-noise-slider">
+                  הבעתיות
+                  <span className="narration-rate-value">
+                    {narrationNoiseStep === NARRATION_NOISE_DEFAULT_STEP
+                      ? "רגיל"
+                      : `${narrationStepToMultiplier(narrationNoiseStep).toFixed(1)}×`}
+                  </span>
+                </label>
+                <input
+                  id="narration-noise-slider"
+                  style={{ direction: "ltr" }}
+                  type="range"
+                  min={0}
+                  max={NARRATION_NOISE_STEPS}
+                  step={1}
+                  value={narrationNoiseStep}
+                  onChange={(e) => setNarrationNoiseStep(parseInt(e.target.value, 10))}
+                  aria-label="מידת ההבעתיות של הקול"
+                />
+                <div className="narration-rate-ends">
+                  <span>שטוח</span>
+                  <span>מודגש</span>
+                </div>
+              </div>
+
+              <div className="narration-rate">
+                <label htmlFor="narration-noisew-slider">
+                  חדות ההברות
+                  <span className="narration-rate-value">
+                    {narrationNoiseWStep === NARRATION_NOISE_DEFAULT_STEP
+                      ? "רגיל"
+                      : `${narrationStepToMultiplier(narrationNoiseWStep).toFixed(1)}×`}
+                  </span>
+                </label>
+                <input
+                  id="narration-noisew-slider"
+                  style={{ direction: "ltr" }}
+                  type="range"
+                  min={0}
+                  max={NARRATION_NOISE_STEPS}
+                  step={1}
+                  value={narrationNoiseWStep}
+                  onChange={(e) => setNarrationNoiseWStep(parseInt(e.target.value, 10))}
+                  aria-label="חדות ההפרדה בין הברות"
+                />
+                <div className="narration-rate-ends">
+                  <span>מובלע</span>
+                  <span>חד</span>
+                </div>
+              </div>
+
+              <button
+                className="btn-secondary narration-reset"
+                onClick={() => {
+                  setNarrationRateStep(NARRATION_DEFAULT_STEP);
+                  setNarrationSilenceStep(NARRATION_SILENCE_DEFAULT_STEP);
+                  setNarrationNoiseStep(NARRATION_NOISE_DEFAULT_STEP);
+                  setNarrationNoiseWStep(NARRATION_NOISE_DEFAULT_STEP);
+                }}
+              >
+                אפס לברירת מחדל
+              </button>
+            </details>
+
             <button
               className="btn-primary"
               onClick={generateNarration}
@@ -3042,6 +3192,19 @@ function App() {
                 </p>
               </div>
             )}
+
+            <div className="narration-engine-admin">
+              <button
+                className="btn-secondary btn-danger-outline"
+                onClick={deleteNarrationEngine}
+                disabled={narrationDeleting}
+              >
+                {narrationDeleting ? "מוחק…" : "מחק את מנוע הקריינות"}
+              </button>
+              <p className="narration-history-note">
+                מפנה כ-700MB. אפשר להתקין מחדש בכל רגע — הקריינויות שכבר נוצרו לא מושפעות.
+              </p>
+            </div>
           </>
         )}
       </main>
