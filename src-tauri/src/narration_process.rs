@@ -5,7 +5,7 @@
 //! healthy," never the HTTP details. Windows-only (macOS out of scope for
 //! Phase 1); a later task provides the non-Windows Tauri-command stub.
 
-use crate::narration::{build_server_args, health_check, synthesize, NarrationError};
+use crate::narration::{build_server_args, health_check, synthesize, NarrationError, NarrationParams};
 use crate::narration_provision::get_venv_dir;
 use std::time::Duration;
 
@@ -85,12 +85,11 @@ impl NarrationServer {
         };
         let args = build_server_args(&paths, "127.0.0.1", port);
 
-        // piper's http_server resolves `-m <voice>` against `--data-dir`, which
-        // defaults to the *child process's* CWD — not this app's install dir.
-        // Without pinning it explicitly, the voice lookup depends on whatever
-        // directory happened to launch the app and fails with "Unable to find
-        // voice" in any real deployment. The voice file lives directly in
-        // `get_narration_dir()` (see `narration_provision::get_voice_path`).
+        // Pin the child's CWD to the engine directory. Paths are absolute so
+        // this is not strictly required today, but the previous engine
+        // resolved its voice relative to CWD and failed in any real
+        // deployment because of it — keeping this makes that class of bug
+        // impossible to reintroduce.
         let mut child = tokio::process::Command::new(&python_exe)
             .args(&args)
             .current_dir(crate::narration_provision::get_narration_dir())
@@ -117,8 +116,8 @@ impl NarrationServer {
             job
         };
 
-        // Poll /info until healthy or a 30s ceiling — piper1-gpl's cold start
-        // (loading the ONNX voice + Nakdimon) is real wall-clock time, not instant.
+        // Poll /info until healthy or a 30s ceiling — cold start (loading the
+        // diacritizer and the ONNX voice) is real wall-clock time, not instant.
         // Also check whether the child has already exited on each iteration:
         // a crash (e.g. a missing/misconfigured voice) fails fast, and without
         // this check the loop would burn the full 30s ceiling polling a dead
@@ -170,9 +169,9 @@ impl NarrationServer {
     pub async fn synthesize_with_restart(
         &mut self,
         text: &str,
-        length_scale: f32,
+        params: NarrationParams,
     ) -> Result<Vec<u8>, NarrationError> {
-        if let Ok(bytes) = synthesize(self.client(), self.port(), text, length_scale).await {
+        if let Ok(bytes) = synthesize(self.client(), self.port(), text, params).await {
             return Ok(bytes);
         }
 
@@ -190,7 +189,7 @@ impl NarrationServer {
         match Self::spawn_owned(port, reqwest::Client::new()).await {
             Ok(restarted) => {
                 let result =
-                    synthesize(restarted.client(), restarted.port(), text, length_scale).await;
+                    synthesize(restarted.client(), restarted.port(), text, params).await;
                 *self = restarted;
                 result
             }
@@ -261,7 +260,7 @@ mod tests {
             .unwrap();
         let mut server = NarrationServer::Unmanaged { port: 1, client };
 
-        let result = server.synthesize_with_restart("שלום עולם", crate::narration::DEFAULT_LENGTH_SCALE).await;
+        let result = server.synthesize_with_restart("שלום עולם", NarrationParams::default()).await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
         assert!(
@@ -301,7 +300,7 @@ mod tests {
 
         // /synthesize fails on the adopted process — must surface as an
         // error, never attempt a respawn on the same port.
-        let result = server.synthesize_with_restart("שלום עולם", crate::narration::DEFAULT_LENGTH_SCALE).await;
+        let result = server.synthesize_with_restart("שלום עולם", NarrationParams::default()).await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
     }
@@ -322,7 +321,7 @@ mod tests {
             .expect("spawn_owned should succeed against a real provisioned engine");
 
         // Real proof #1: it actually generates audio, not just "the process started."
-        let audio = synthesize(server.client(), server.port(), "בדיקה", crate::narration::DEFAULT_LENGTH_SCALE)
+        let audio = synthesize(server.client(), server.port(), "בדיקה", NarrationParams::default())
             .await
             .expect("a live, healthy sidecar should synthesize real audio");
         assert!(looks_like_valid_wav(&audio));

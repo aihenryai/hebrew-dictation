@@ -90,7 +90,9 @@ class Synthesizer:
         ids.extend(self.phoneme_id_map["$"])
         return ids
 
-    def synthesize_sentence(self, sentence: str, length_scale: float):
+    def synthesize_sentence(
+        self, sentence: str, length_scale: float, noise_scale: float, noise_w: float
+    ):
         with_diacritics = self.phonikud.add_diacritics(sentence)
         ipa = self._phonemize(with_diacritics)
         ids = self.to_ids(ipa)
@@ -98,7 +100,7 @@ class Synthesizer:
             "input": np.array([ids], dtype=np.int64),
             "input_lengths": np.array([len(ids)], dtype=np.int64),
             "scales": np.array(
-                [self.noise_scale, length_scale, self.noise_w], dtype=np.float32
+                [noise_scale, length_scale, noise_w], dtype=np.float32
             ),
         }
         if self.num_speakers > 1:
@@ -109,14 +111,23 @@ class Synthesizer:
             audio = audio / peak * 0.95
         return (audio * 32767).astype(np.int16)
 
-    def synthesize(self, text: str, length_scale: float, sentence_silence: float):
+    def synthesize(
+        self,
+        text: str,
+        length_scale: float,
+        sentence_silence: float,
+        noise_scale: float,
+        noise_w: float,
+    ):
         sentences = split_sentences(text) or [text]
         silence = np.zeros(int(self.sample_rate * sentence_silence), dtype=np.int16)
         chunks = []
         for i, sentence in enumerate(sentences):
             if i > 0 and silence.size:
                 chunks.append(silence)
-            chunks.append(self.synthesize_sentence(sentence, length_scale))
+            chunks.append(
+                self.synthesize_sentence(sentence, length_scale, noise_scale, noise_w)
+            )
         pcm = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
 
         buf = io.BytesIO()
@@ -166,8 +177,18 @@ def make_handler(synth: Synthesizer, args):
                 if not text:
                     self.send_error(400, "empty text")
                     return
+                # Every knob is per-request with the startup flag as fallback.
+                # sentence_silence in particular could not be per-request under
+                # piper's server, which is why it used to be fixed.
                 length_scale = float(payload.get("length_scale", args.length_scale))
-                wav = synth.synthesize(text, length_scale, args.sentence_silence)
+                sentence_silence = float(
+                    payload.get("sentence_silence", args.sentence_silence)
+                )
+                noise_scale = float(payload.get("noise_scale", synth.noise_scale))
+                noise_w = float(payload.get("noise_w", synth.noise_w))
+                wav = synth.synthesize(
+                    text, length_scale, sentence_silence, noise_scale, noise_w
+                )
             except Exception as exc:  # noqa: BLE001 - report, never kill the server
                 self.send_error(500, str(exc)[:200])
                 return

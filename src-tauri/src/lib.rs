@@ -939,6 +939,58 @@ async fn narration_setup(_app: AppHandle) -> Result<(), String> {
     Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
 
+/// Delete the whole narration engine (~700MB) and report how much was freed.
+///
+/// Shuts the sidecar down FIRST: on Windows the running process holds its
+/// own executable and the loaded `.onnx` files open, so deleting underneath
+/// it would fail partway and leave a half-removed engine that still looks
+/// provisioned. Clearing the state handle also means the next generate
+/// re-probes from scratch rather than reusing a handle to a killed process.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn delete_narration_engine(state: State<'_, AppState>) -> Result<u64, String> {
+    {
+        let mut guard = state.narration_server.lock().await;
+        if let Some(server) = guard.as_mut() {
+            server.shutdown().await;
+        }
+        *guard = None;
+    }
+
+    let dir = narration_provision::get_narration_dir();
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    fn dir_size(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => dir_size(&e.path()),
+                Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+    let freed = dir_size(&dir);
+
+    std::fs::remove_dir_all(&dir).map_err(|e| {
+        format!("מחיקת מנוע הקריינות נכשלה — ייתכן שקובץ עדיין בשימוש. סגור את האפליקציה ונסה שוב. (פרטים טכניים: {e})")
+    })?;
+
+    Ok(freed)
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn delete_narration_engine(_state: State<'_, AppState>) -> Result<u64, String> {
+    Err("קריינות זמינה רק ב-Windows כרגע".to_string())
+}
+
 /// Generate Hebrew narration audio for `text`, returning raw WAV bytes.
 /// Lazily spawns/adopts the sidecar on first call in a session — never from
 /// `setup()`. Guards: empty text (client should already disable the button,
@@ -950,9 +1002,9 @@ async fn narration_setup(_app: AppHandle) -> Result<(), String> {
 async fn generate_narration(
     state: State<'_, AppState>,
     text: String,
-    // Optional so an older/simpler caller still gets the tuned default rather
-    // than piper's own too-fast 1.0. Higher = slower (phoneme duration).
-    length_scale: Option<f32>,
+    // Optional so a caller that omits it still gets the tuned defaults
+    // rather than the voice's own (too fast, no pause at punctuation).
+    params: Option<narration::NarrationParams>,
 ) -> Result<Vec<u8>, String> {
     if text.trim().is_empty() {
         return Err("אין טקסט לקריינות".to_string());
@@ -974,8 +1026,8 @@ async fn generate_narration(
     // guard.is_none() was just checked/filled above, so this unwrap is safe.
     let result = {
         let server = guard.as_mut().unwrap();
-        let rate = length_scale.unwrap_or(narration::DEFAULT_LENGTH_SCALE);
-        server.synthesize_with_restart(&text, rate).await.map_err(|e| e.to_string())
+        let params = params.unwrap_or_default();
+        server.synthesize_with_restart(&text, params).await.map_err(|e| e.to_string())
     };
     // If an adopted (Unmanaged) process is now dead, reset so the next call
     // can re-probe via spawn_or_adopt rather than permanently failing.
@@ -993,7 +1045,7 @@ async fn generate_narration(
 async fn generate_narration(
     _state: State<'_, AppState>,
     _text: String,
-    _length_scale: Option<f32>,
+    _params: Option<narration::NarrationParams>,
 ) -> Result<Vec<u8>, String> {
     Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
@@ -2280,6 +2332,7 @@ pub fn run() {
             ensure_narration_ready,
             narration_setup,
             generate_narration,
+            delete_narration_engine,
             save_narration_wav,
             delete_temp_recording,
             pick_audio_file,
