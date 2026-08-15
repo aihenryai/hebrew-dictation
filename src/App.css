@@ -2375,3 +2375,12 @@ body:has(.toolbar-idle) #root {
 }
 .btn-mode-narration:hover { background: #3a2c08; border-color: #fbbf24; }
 
+
+.narration-setup-hint {
+  font-size: 0.7rem;
+  color: #6b7594;
+  margin-top: 0.5rem;
+}
+.narration-setup-progress progress {
+  width: 100%;
+}

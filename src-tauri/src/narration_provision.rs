@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
 /// Pinned `uv` release facts (verified against github.com/astral-sh/uv/releases).
 /// Bump deliberately, not casually — a new `uv` version changes the exact
@@ -143,24 +144,19 @@ pub struct NarrationVoice {
     pub sha256: &'static str,
 }
 
-/// The catalog. Deliberately only the two voices Henry picked by ear from the
-/// four the upstream repo publishes — the other two were rejected, and there
-/// is no reason to offer a 63MB download nobody wants. All are male; no free
-/// Hebrew female voice exists (see the spike findings).
-pub const VOICES: [NarrationVoice; 2] = [
+/// The catalog. Upstream publishes four checkpoints; all four were generated
+/// and judged by ear, and only this one was kept — "shaul" in particular was
+/// rejected as clearly worse. Offering a 63MB download of a voice nobody
+/// wants is worse than not offering it. The picker hides itself while this
+/// holds a single entry, and adding a voice back is just another element.
+/// All are male; no free Hebrew female voice exists (see the spike findings).
+pub const VOICES: [NarrationVoice; 1] = [
     NarrationVoice {
         id: "michael",
         label: "מיכאל",
         url: "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/michael.onnx",
         size: 63_516_050,
         sha256: "d2824d46ecd7ca8a206686d818d3178effe4661ce78bdb4e754eed32fe604320",
-    },
-    NarrationVoice {
-        id: "shaul",
-        label: "שאול",
-        url: "https://huggingface.co/Phonikud/phonikud-tts-checkpoints/resolve/main/shaul.onnx",
-        size: 63_516_050,
-        sha256: "7bcbd364b0bc357df8ef6c7c873e48f22897df16ec6c9d8f9d7ef792f6ae03c9",
     },
 ];
 
@@ -286,6 +282,37 @@ pub fn narration_engine_state() -> NarrationEngineState {
     }
 }
 
+/// Delete `<id>.onnx` files for voices this build no longer offers, so a
+/// voice removed from the catalog stops costing the user 63MB forever.
+/// Deliberately matches only the exact `.onnx` files we could have written —
+/// never a wildcard sweep of the directory, which shares space with the venv,
+/// the diacritizer and the config.
+fn remove_uncatalogued_voices() {
+    const KNOWN_RETIRED: [&str; 3] = ["shaul", "shaul_whisper_heb_ipa1", "model"];
+    for id in KNOWN_RETIRED {
+        if VOICES.iter().any(|v| v.id == id) {
+            continue;
+        }
+        let _ = std::fs::remove_file(get_narration_dir().join(format!("{id}.onnx")));
+    }
+}
+
+/// Total provisioning steps, for the "step N of M" readout.
+const SETUP_STEPS: u8 = 7;
+
+/// Announce the current provisioning step and reset the progress bar.
+///
+/// Without this the UI only ever saw download progress, so the two slowest
+/// steps — creating the venv (which downloads a whole Python) and installing
+/// the packages — emitted nothing at all and left the bar frozen at the 100%
+/// of the *previous* download for a minute or more. That reads as a hang.
+fn emit_stage<R: tauri::Runtime>(app: &tauri::AppHandle<R>, step: u8, label: &str) {
+    let _ = app.emit(
+        "narration-setup-stage",
+        serde_json::json!({ "step": step, "total": SETUP_STEPS, "label": label }),
+    );
+}
+
 /// Write the bundled sidecar script to app-data, overwriting any older copy.
 ///
 /// Called on BOTH provisioning paths — the full install and the
@@ -353,6 +380,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         );
     }
 
+    emit_stage(app, 1, "מוריד את מנהל הסביבה");
     let uv_exe = ensure_uv_available(app).await?;
     let narration_dir = get_narration_dir();
     let venv_dir = get_venv_dir();
@@ -371,6 +399,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
     // `uv venv --python 3.11` may need to download an entire Python build
     // (~30-60MB from astral.sh) on first run — 300s covers a slow/stalled
     // connection without hanging the provisioning UI forever.
+    emit_stage(app, 2, "מתקין סביבת פייתון (עשוי לקחת דקה)");
     let mut venv_cmd = tokio::process::Command::new(&uv_exe);
     venv_cmd
         // `--managed-python` is what actually guarantees the app's "no Python
@@ -379,7 +408,20 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         // silently making the engine depend on their Python instead of ours.
         // With it, uv only ever uses the interpreter it downloaded into
         // UV_PYTHON_INSTALL_DIR under our own app-data folder.
-        .args(["venv", &venv_dir.to_string_lossy(), "--python", "3.11", "--managed-python"])
+        // `--clear` is what makes this step retryable: `uv venv` ERRORS on an
+        // existing directory, so without it any failure after this point (a
+        // dropped connection during the ~308MB download, say) left every
+        // retry failing here forever -- with this module's own "each step is
+        // idempotent" claim quietly untrue. Rebuilding costs ~20s and
+        // guarantees the installed package set matches PIP_PACKAGES.
+        .args([
+            "venv",
+            &venv_dir.to_string_lossy(),
+            "--python",
+            "3.11",
+            "--managed-python",
+            "--clear",
+        ])
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
     let venv_output = match tokio::time::timeout(Duration::from_secs(300), venv_cmd.output()).await {
         Err(_) => {
@@ -403,6 +445,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
 
     // onnxruntime is the heavy one here (~200MB of wheels with its deps) —
     // 600s gives a slow connection room without hanging the UI forever.
+    emit_stage(app, 3, "מתקין חבילות");
     let mut pip_cmd = tokio::process::Command::new(&uv_exe);
     pip_cmd
         .args(["pip", "install", "--python", &venv_dir.to_string_lossy()])
@@ -432,6 +475,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
     // Config first — it's a few KB, so any progress-bar flash from it is
     // over before the much longer model download even shows meaningful
     // progress.
+    emit_stage(app, 4, "מוריד הגדרות קול");
     let voice_config_path = get_voice_config_path();
     let voice_config_already_valid = voice_config_path.exists()
         && std::fs::metadata(&voice_config_path).map(|m| m.len() == VOICE_CONFIG_SIZE).unwrap_or(false);
@@ -448,6 +492,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         .await?;
     }
 
+    emit_stage(app, 5, "מוריד מנתח טקסט");
     let tokenizer_path = get_tokenizer_path();
     let tokenizer_already_valid = tokenizer_path.exists()
         && std::fs::metadata(&tokenizer_path).map(|m| m.len() == TOKENIZER_SIZE).unwrap_or(false);
@@ -464,10 +509,12 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         .await?;
     }
 
+    emit_stage(app, 6, "מוריד קול");
     ensure_voice_downloaded(app, DEFAULT_VOICE).await?;
 
     // Largest artifact (~308MB), so it goes last: an earlier failure costs
     // the user less bandwidth before it surfaces.
+    emit_stage(app, 7, "מוריד מנוע הטעמה (הקובץ הגדול)");
     let phonikud_path = get_phonikud_path();
     let phonikud_already_valid = phonikud_path.exists()
         && std::fs::metadata(&phonikud_path).map(|m| m.len() == PHONIKUD_SIZE).unwrap_or(false);
@@ -486,10 +533,12 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
 
     sync_server_script()?;
 
-    // Reclaim the ~63MB piper voice from the pre-Phonikud engine. Best-effort:
+    // Reclaim ~63MB per stale voice: the pre-Phonikud piper voice, and any
+    // voice dropped from the catalog since it was downloaded. Best-effort —
     // failing to delete a leftover must never fail provisioning.
     let _ = std::fs::remove_file(narration_dir.join("he_IL-saspeech-medium.onnx"));
     let _ = std::fs::remove_file(narration_dir.join("he_IL-saspeech-medium.onnx.json"));
+    remove_uncatalogued_voices();
 
     // Written LAST and only here — this is the atomic completion marker.
     let marker = NarrationEngineMarker {
@@ -574,8 +623,29 @@ mod tests {
         // whole is worth one slow, explicit check.
         let app = tauri::test::mock_app();
 
+        // Capture the stage events. The slow steps (venv, pip) emit no
+        // download progress, so these are the ONLY signal the UI has that
+        // anything is happening — a silent step reads as a hang, which is
+        // exactly what a user reported before they existed.
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let sink = seen.clone();
+        tauri::Listener::listen(app.handle(), "narration-setup-stage", move |event: tauri::Event| {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                if let Some(step) = v.get("step").and_then(|s| s.as_u64()) {
+                    sink.lock().unwrap().push(step as u8);
+                }
+            }
+        });
+
         let result = provision_narration_engine(app.handle()).await;
         assert!(result.is_ok(), "provisioning failed: {result:?}");
+
+        let steps = seen.lock().unwrap().clone();
+        assert_eq!(
+            steps,
+            (1..=SETUP_STEPS).collect::<Vec<u8>>(),
+            "every step must report, in order, or the UI goes silent mid-install"
+        );
 
         // Every artifact the sidecar's argv points at must actually exist —
         // the marker alone would happily be written over a missing file.

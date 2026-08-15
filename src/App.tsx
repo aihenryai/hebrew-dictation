@@ -521,6 +521,9 @@ function App() {
   const [narrationNoiseWStep, setNarrationNoiseWStep] = useState(NARRATION_NOISE_DEFAULT_STEP);
   const [narrationAdvancedOpen, setNarrationAdvancedOpen] = useState(false);
   const [narrationDeleting, setNarrationDeleting] = useState(false);
+  const [narrationStage, setNarrationStage] = useState<
+    { step: number; total: number; label: string } | null
+  >(null);
   const [narrationVoices, setNarrationVoices] = useState<NarrationVoiceInfo[]>([]);
   const [narrationSwitchingVoice, setNarrationSwitchingVoice] = useState<string | null>(null);
   const batchRecordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -842,6 +845,15 @@ function App() {
       const data = event.payload as { progress: number };
       setNarrationProvisionProgress(data.progress);
     });
+    // Reset the bar on every new step. The two slowest steps (creating the
+    // venv, installing packages) emit no download progress at all, so without
+    // this the bar sat at the previous download's 100% for over a minute and
+    // looked hung.
+    const unlistenNarrationStage = listen("narration-setup-stage", (event) => {
+      const data = event.payload as { step: number; total: number; label: string };
+      setNarrationStage(data);
+      setNarrationProvisionProgress(0);
+    });
     const unlistenClose = listen("window-close-attempted", async () => {
       pendingCloseTipRef.current = true;
     });
@@ -869,6 +881,7 @@ function App() {
       unlistenProgress.then((fn) => fn());
       unlistenNarrationEngineProgress.then((fn) => fn());
       unlistenNarrationVoiceProgress.then((fn) => fn());
+      unlistenNarrationStage.then((fn) => fn());
       unlistenClose.then((fn) => fn());
       unlistenFocus.then((fn) => fn());
       unlistenMigration.then((fn) => fn());
@@ -1057,6 +1070,7 @@ function App() {
   const runNarrationSetup = useCallback(async () => {
     setNarrationProvisioning(true);
     setNarrationProvisionProgress(0);
+    setNarrationStage(null);
     setError("");
     try {
       await invoke("narration_setup");
@@ -3035,8 +3049,22 @@ function App() {
 
         {narrationProvisioning && (
           <div className="narration-setup-progress">
-            <p>מתקין מנוע קריינות… ({narrationProvisionProgress}%)</p>
-            <progress value={narrationProvisionProgress} max={100} />
+            <p>
+              {narrationStage
+                ? `${narrationStage.label} (${narrationStage.step}/${narrationStage.total})`
+                : "מתחיל התקנה…"}
+            </p>
+            {/* Steps that download report real progress; the venv and package
+                steps cannot, so they show an indeterminate bar rather than a
+                number frozen at the previous step's 100%. */}
+            {narrationProvisionProgress > 0 ? (
+              <progress value={narrationProvisionProgress} max={100} />
+            ) : (
+              <progress />
+            )}
+            <p className="narration-setup-hint">
+              ההתקנה חד-פעמית ומורידה כ-600MB. אפשר להשאיר את זה רץ ברקע.
+            </p>
           </div>
         )}
 
