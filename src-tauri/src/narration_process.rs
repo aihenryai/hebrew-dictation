@@ -171,6 +171,9 @@ impl NarrationServer {
     /// `spawn_or_adopt`'s adopt-instead-of-kill design was trying to avoid.
     /// So an `Unmanaged` failure just surfaces the error; the caller can
     /// re-run `spawn_or_adopt` from scratch, which correctly re-probes health.
+    ///
+    /// Restarting is also gated on the error KIND, not merely on failure: only
+    /// `Unreachable` implies the process may be dead.
     /// On `Err` from a failed respawn attempt, `self` retains the `Owned`
     /// variant with a dead child; the next call will retry the respawn
     /// attempt (shutdown on a dead child is a safe no-op).
@@ -179,17 +182,27 @@ impl NarrationServer {
         text: &str,
         params: NarrationParams,
     ) -> Result<Vec<u8>, NarrationError> {
-        if let Ok(bytes) = synthesize(self.client(), self.port(), text, params).await {
-            return Ok(bytes);
+        let first_error = match synthesize(self.client(), self.port(), text, params).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => e,
+        };
+
+        // Restart ONLY when the error suggests the process is gone. A 4xx/5xx
+        // proves the opposite — narration_server.py catches synthesis errors
+        // and deliberately keeps serving — and a timeout usually just means
+        // the text was long. Restarting on those killed a healthy engine, paid
+        // a full cold start (re-loading the 308MB diacritizer), retried the
+        // same input and failed identically, turning one error into two.
+        if !matches!(first_error, NarrationError::Unreachable(_)) {
+            return Err(first_error);
         }
 
         let (port, voice_id) = match self {
             NarrationServer::Owned { port, voice_id, .. } => (*port, voice_id.clone()),
-            NarrationServer::Unmanaged { .. } => {
-                return Err(NarrationError::Unreachable(
-                    "מנוע הקריינות (שאומץ מריצה קודמת) לא הגיב. נסה שוב.".to_string(),
-                ));
-            }
+            // Surface the real error rather than a hardcoded string: with
+            // stdout/stderr piped to null, this is the only diagnostic the
+            // user or a bug report will ever see.
+            NarrationServer::Unmanaged { .. } => return Err(first_error),
         };
 
         self.shutdown().await;
@@ -203,6 +216,14 @@ impl NarrationServer {
             }
             Err(e) => Err(NarrationError::Unreachable(e)),
         }
+    }
+
+    /// True when this handle can actually terminate its sidecar. `Unmanaged`
+    /// cannot: it adopted a process it never spawned and holds no handle to
+    /// it, so callers that need the process GONE (deleting the engine's files,
+    /// for instance) must not assume `shutdown()` achieved anything.
+    pub fn can_shutdown(&self) -> bool {
+        matches!(self, NarrationServer::Owned { .. })
     }
 
     /// Kill the process if we own it. A no-op for `Unmanaged` — there is
@@ -310,7 +331,17 @@ mod tests {
         // error, never attempt a respawn on the same port.
         let result = server.synthesize_with_restart("שלום עולם", NarrationParams::default()).await;
 
-        assert!(matches!(result, Err(NarrationError::Unreachable(_))));
+        // The REAL error must survive. This previously asserted `Unreachable`,
+        // because the code replaced every adopted-sidecar failure with one
+        // hardcoded message — discarding the only diagnostic available, given
+        // the child's stdout/stderr go to null. The fake sidecar answers /info
+        // but returns 500 from /synthesize, so BadResponse is the truth here.
+        assert!(
+            matches!(result, Err(NarrationError::BadResponse(_))),
+            "the sidecar's actual error must reach the caller, got {result:?}"
+        );
+        // Still Unmanaged: no respawn was attempted on the adopted port.
+        assert!(matches!(server, NarrationServer::Unmanaged { .. }));
     }
 
     #[tokio::test]

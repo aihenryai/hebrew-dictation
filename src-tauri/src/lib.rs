@@ -949,13 +949,26 @@ async fn narration_setup(_app: AppHandle) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn delete_narration_engine(state: State<'_, AppState>) -> Result<u64, String> {
-    {
-        let mut guard = state.narration_server.lock().await;
-        if let Some(server) = guard.as_mut() {
-            server.shutdown().await;
+    // The guard is held for the WHOLE command, not just the shutdown. Walking
+    // ~700MB for dir_size and then unlinking it takes seconds, and
+    // generate_narration only re-checks "is it provisioned" while holding this
+    // same lock — so releasing early let a concurrent generate spawn python
+    // against a directory mid-deletion, failing the delete with a sharing
+    // violation and leaving a half-removed engine.
+    let mut guard = state.narration_server.lock().await;
+    if let Some(server) = guard.as_mut() {
+        // An adopted sidecar cannot be killed — we hold no handle to it. Refuse
+        // rather than delete files out from under a process that is still
+        // serving them, which would fail partway with a misleading error.
+        if !server.can_shutdown() {
+            return Err(
+                "מנוע הקריינות פועל מתהליך קודם שלא ניתן לסגור מכאן. סגור את האפליקציה, פתח מחדש, ונסה שוב."
+                    .to_string(),
+            );
         }
-        *guard = None;
+        server.shutdown().await;
     }
+    *guard = None;
 
     let dir = narration_provision::get_narration_dir();
     if !dir.exists() {
@@ -1052,9 +1065,16 @@ async fn set_narration_voice(
     narration_provision::ensure_voice_downloaded(&app, &voice_id).await?;
 
     {
+        // Build the new settings, persist them, and only then publish to the
+        // shared in-memory copy. Mutating first meant a failed save returned
+        // via `?` with memory already changed and the sidecar never restarted,
+        // leaving memory, disk and the running process disagreeing about which
+        // voice is active.
         let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
-        settings.narration_voice = voice_id;
-        settings::save_settings(&settings)?;
+        let mut updated = settings.clone();
+        updated.narration_voice = voice_id;
+        settings::save_settings(&updated)?;
+        *settings = updated;
     }
 
     let mut guard = state.narration_server.lock().await;
@@ -1104,6 +1124,13 @@ async fn generate_narration(
     };
 
     let mut guard = state.narration_server.lock().await;
+    // Re-check under the lock. The pre-flight check above runs before we wait
+    // for the mutex, so it can be stale by the time we get it — most obviously
+    // when delete_narration_engine is holding the lock and is about to remove
+    // the very files we would spawn from.
+    if narration_provision::narration_engine_state() != narration_provision::NarrationEngineState::Ready {
+        return Err("מנוע הקריינות עדיין לא הותקן. לך להגדרות והתקן אותו קודם.".to_string());
+    }
     if guard.is_none() {
         let server =
             narration_process::NarrationServer::spawn_or_adopt(port, &voice_id).await?;

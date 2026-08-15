@@ -4,6 +4,78 @@
 
 ---
 
+## ✅ 2026-08-15 — SHIPPED (unreleased): Hebrew narration — "צור קריינות", local, free, offline
+
+Text → Hebrew speech, entirely on-device. Reachable from the home screen ("🔊 צור קריינות").
+**Not yet released** — it is on `main`, unreleased, and Henry has used it but has not signed off
+on the final round.
+
+**Architecture — read this before touching anything.** The app provisions an isolated Python
+environment into app-data using `uv` (never the user's Python — `--managed-python` enforces
+that, and an A/B test proved that without it uv silently picked up the machine's system
+CPython). It then runs **our own sidecar script** as a local HTTP server on `127.0.0.1:5758`
+and talks to it over the same API piper's server used (`GET /info`, `POST /synthesize` → WAV).
+
+**The engine is Phonikud, NOT piper.** This is the single most important fact here, and every
+spec/plan doc in `docs/superpowers/` still describes the old design. piper phonemizes from
+nikud, which encodes vowels but **not stress** — that is what made the output sound flat with
+words running together, and no amount of parameter tuning fixes it. Phonikud (Interspeech
+2026) emits stress-marked IPA. Henry A/B'd the shipped voice against two Phonikud checkpoints
+and judged `michael` "much better". Because those voices declare `phoneme_type: "raw"` and
+expect IPA, piper's own HTTP server cannot drive them — hence our own script
+(`src-tauri/resources/narration_server.py`, bundled via `include_str!`, written to app-data
+during provisioning). `piper-tts` is no longer installed at all.
+
+| File | Role |
+|---|---|
+| `src-tauri/resources/narration_server.py` | the sidecar: text → nikud+stress → IPA → VITS ONNX → WAV |
+| `src-tauri/src/narration.rs` | HTTP client, `NarrationParams`, argv builder |
+| `src-tauri/src/narration_process.rs` | spawn/adopt/restart/shutdown + Windows Job Object |
+| `src-tauri/src/narration_provision.rs` | provisioning, voice catalog, stage events, script sync |
+| `src-tauri/src/lib.rs` | 6 Tauri commands (setup, generate, save, delete, list voices, set voice) |
+
+**Cost:** ~695MB on disk, ~592MB RAM while the sidecar runs. The bulk is the 308MB
+diacritizer. One-time install, ~7 reported steps.
+
+**Known limitation, measured not guessed:** Latin words and digits inside Hebrew text garble
+(0/4 exact ASR round-trips) — the phonemizer is Hebrew-only. The UI says so. The
+short-utterance instability the old engine had is **gone** (4/4 exact, vs 0/6 before) — do not
+re-add that warning. **No female Hebrew voice exists** in any free/open engine as of
+2026-08-15; every open Hebrew voice traces to two or three male speakers. That ceiling is
+real — see the spike-findings addendum.
+
+**Traps that already bit, do not reintroduce:**
+- Tauri exposes a Rust `snake_case` command arg to JS as `camelCase`. Passing `snake_case`
+  binds **nothing** and an `Option<T>` silently arrives as `None`. This shipped once already
+  (every saved file got a generic name). ⚠️ **There is still one live instance of this bug in
+  `src/App.tsx:920`** — `invoke("update_settings", { patch: ... })` binds nothing, so that
+  streaming-migration never persists and `.catch(() => {})` hides it. It is pre-existing and
+  outside narration, so it was left alone. **Do not "fix" it by renaming `patch` →
+  `newSettings`**: that would pass a partial object as a full `AppSettings` and serde-default
+  every unlisted field. Send the full settings object with the one field changed.
+- `uv venv` **errors** on an existing directory. Without `--clear`, any failure after the venv
+  step made every retry fail there forever.
+- Provisioning early-returns when the marker says Ready, so anything written only on the full
+  path (the sidecar script) never reaches existing installs. `sync_server_script()` runs on
+  both paths for exactly this reason.
+- Only `NarrationError::Unreachable` may trigger a sidecar restart. A 5xx proves the process is
+  alive (the script catches synthesis errors and keeps serving) and a timeout usually just
+  means the text was long; restarting on those killed a healthy engine and paid a full cold
+  start to fail identically.
+
+**Verification status.** 99 unit tests plus 4 `#[ignore]` integration tests that hit the real
+network and a real engine (`cargo test -- --ignored`), including one that provisions the entire
+engine end to end and asserts all 7 stage events fire in order. A multi-agent review of the
+whole feature was run; it produced 82 raw findings but **hit a session limit partway**, so only
+the lifecycle dimension was fully adversarially verified — provisioning, frontend, sidecar and
+docs findings are **unverified** and worth re-running (`Workflow` script saved under
+`workflows/scripts/narration-final-review-*.js`).
+
+**What Henry still has not confirmed:** the delete-engine button and the reworked install
+screen. Everything else he has used and approved.
+
+---
+
 ## 🔬 2026-07-19 — RESEARCH: on-device vs cloud for Hebrew cleanup → recommend switching Groq → Gemini
 
 Full cited report (3 research legs — Hebrew models, Windows/Rust runtime, cloud alternative): **`docs/research/2026-07-19-hebrew-cleanup-provider.md`**. Triggered by the macOS app [ghost-pepper](https://github.com/matthartman/ghost-pepper) (on-device dictation + cleanup). No code written.
@@ -250,7 +322,7 @@ Remaining polish: no UI toggle, no WebSocket live stream. (Unit tests: now 7 in 
 
 *Original research:* Voicebox's MCP lets agents *speak* in the cloned voice; the inverse here gives Claude Code/Cursor voice *dictation into the agent session* (dictate-into-agent, not just into a text field). Best built as a thin wrapper over #1's local API rather than re-embedding the transcription logic — so **#1 first, then #2 is a small adapter.**
 
-**4. The actual Voicebox-shaped feature (TTS, not just its API pattern) — 🔬 RESEARCH DONE 2026-07-29, NOT started.** Henry wants the inverse pairing this app doesn't have: text→voice generation in Hebrew, wrapped for non-technical users the same way this app wraps whisper-rs. Full model research (what's open-source AND good at Hebrew, what was tried and rejected, exact working API params) lives in **`HANDOFF-TTS-VOICE-GENERATION.md`** (same folder) — deliberately kept separate from this file since it's a new, unstarted feature, not a fix to shipped code. Short version: the answer is **VoxCPM2** (OpenBMB, open-source); read the other file before touching this.
+**4. The actual Voicebox-shaped feature (TTS) — ✅ BUILT 2026-08-15, see the top section.** Shipped as "צור קריינות": local, free, offline Hebrew text→speech. **The 2026-07-29 research in `HANDOFF-TTS-VOICE-GENERATION.md` is now historical — its conclusion was superseded.** That file recommended **VoxCPM2**, which was subsequently tested and **rejected on intonation** along with MiniMax, ElevenLabs IVC, RVC and Deepdub. What actually shipped is Phonikud stress-marked IPA driving a VITS ONNX voice, which is a different answer to a problem that turned out to be about *stress marking*, not about model size. Read the top section, not that file, before touching this.
 
 **3. LLM text-cleanup — ⚠️ ALREADY EXISTS, do NOT rebuild.** Henry's read was "the app injects raw STT with no punctuation/disfluency cleanup," and he rightly YAGNI-flagged it. Code check: it's **already shipped as "Smart Cleanup / רישוף חכם" (`enhance.rs`, spec `docs/superpowers/specs/2026-06-15-smart-cleanup-design.md`)** — runs the transcript through Groq Llama-3.3-70b to strip fillers (אהה/אמ/יעני/כאילו), repetitions and false-starts and fix Hebrew punctuation, with a hallucination guard (>2× raw length → reject; plus a truncation guard added 2026-07-19 — `finish_reason=="length"` → reject, see the top section) and graceful fallback to raw text on any error. It's **opt-in** (`enhance_enabled` setting), wired via the `enhance_text` command. The cloud batch path also already sends `smart_format=true&punctuate=true`, so cloud transcripts are already punctuated. → **Not an engineering gap.** The only real questions: (a) product — should Smart Cleanup be more discoverable / default-on? (b) does it cover the **streaming**-inject path or only batch? (streaming bypasses the command path per the v2.11.0 focus-bug fix — verify). Nothing to build unless Henry wants it always-on.
 

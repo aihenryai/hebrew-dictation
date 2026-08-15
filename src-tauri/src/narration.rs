@@ -83,8 +83,15 @@ pub fn looks_like_valid_wav(bytes: &[u8]) -> bool {
 
 #[derive(Debug)]
 pub enum NarrationError {
-    /// Couldn't reach the sidecar at all (connection refused, DNS, timeout).
+    /// Couldn't reach the sidecar at all (connection refused, reset, DNS).
+    /// This is the ONLY variant that implies the process may be dead, and so
+    /// the only one that justifies killing and respawning it.
     Unreachable(String),
+    /// The sidecar accepted the request but didn't answer within the deadline.
+    /// Distinct from `Unreachable` on purpose: a long text legitimately takes
+    /// a long time, and a timeout there says nothing about process health —
+    /// restarting on it kills a working engine mid-synthesis.
+    Timeout(String),
     /// Sidecar responded, but with a non-2xx status.
     BadResponse(String),
     /// Sidecar responded 2xx, but the body doesn't look like a WAV file.
@@ -95,6 +102,10 @@ impl std::fmt::Display for NarrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NarrationError::Unreachable(e) => write!(f, "מנוע הקריינות לא זמין: {e}"),
+            NarrationError::Timeout(_) => write!(
+                f,
+                "יצירת הקריינות ארכה יותר מדי זמן. נסה טקסט קצר יותר, או פצל אותו לכמה חלקים."
+            ),
             NarrationError::BadResponse(e) => write!(f, "מנוע הקריינות החזיר שגיאה: {e}"),
             NarrationError::InvalidAudio => write!(f, "מנוע הקריינות החזיר תשובה לא תקינה"),
         }
@@ -189,7 +200,13 @@ pub async fn synthesize(
         .timeout(Duration::from_secs(120))
         .send()
         .await
-        .map_err(|e| NarrationError::Unreachable(e.to_string()))?;
+        .map_err(|e| {
+            if e.is_timeout() {
+                NarrationError::Timeout(e.to_string())
+            } else {
+                NarrationError::Unreachable(e.to_string())
+            }
+        })?;
 
     if !resp.status().is_success() {
         return Err(NarrationError::BadResponse(format!("HTTP {}", resp.status())));
