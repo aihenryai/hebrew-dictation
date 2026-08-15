@@ -1,7 +1,44 @@
 # Hebrew TTS Narration — Phase 1 (Local, Generic Voice) — Design Spec
 
+> # ⚠️ SUPERSEDED IN PART — read this box before coding against anything below
+>
+> **This spec is the historical design record. It was implemented, then the engine was
+> replaced. The body below is preserved as written; several load-bearing parts of it are
+> no longer true.** Ground truth for the shipped feature is `HANDOFF.md` (top section) and
+> the code itself.
+>
+> **The one thing to internalise:** the engine is **Phonikud**, not piper. piper phonemizes
+> from nikud, which encodes vowels but **not stress** — that is what made the shipped output
+> sound flat with words running together, and it is not fixable by tuning. Phonikud
+> (Interspeech 2026) emits stress-marked IPA. Henry A/B'd it against the piper voice and
+> chose the `michael` checkpoint. `piper-tts` is no longer installed at all.
+>
+> | What this spec says | What actually shipped |
+> |---|---|
+> | §2.1/§2.6 phonemization: `phoneme_type: "hebrew"`, Nakdimon bundled in the wheel, espeak-ng | Phonikud diacritizer as a **separate 308MB ONNX download**; voices declare `phoneme_type: "raw"` and consume IPA |
+> | §2.2 voice `he_IL-saspeech-medium`, SASPEECH/IPBC non-commercial, credits attribution required | `michael` from the Phonikud checkpoints; the IPBC/SASPEECH constraint **no longer applies** |
+> | §2.3/§3 runtime `python -m piper.http_server …` | **our own script**, `src-tauri/resources/narration_server.py`, bundled via `include_str!` and written to app-data during provisioning. Same HTTP surface on purpose, so the Rust client was unchanged |
+> | §2.4 `uv` installs `piper-tts[http]`; ~200-300MB | installs `onnxruntime`, `numpy`, `phonikud`, `phonikud-onnx`, `tokenizers`; real footprint **~695MB on disk, ~592MB RAM** |
+> | §2.4 marker file contents | `engine.json` = `{marker_version: 2, engine: "phonikud", voice_name: "michael"}` |
+> | §2.5 GPL-3.0 analysis of piper1-gpl | piper is not installed; that analysis is moot |
+> | §3(c) + §8 "startup stale-sidecar sweep" | **never built.** Folded into `spawn_or_adopt`, which health-checks and adopts instead — deliberately, see its doc comment |
+> | §3/§4 sidecar spawns on entering the screen, "מכין את מנוע ההקראה…" | spawns lazily on **first generate**, not on screen entry |
+> | §7 three-state provisioning machine | the enum has **two** states (`NotProvisioned`, `Ready`) |
+> | Non-goal: "voice selection UI" | a voice picker **shipped** (catalog + on-demand download). It currently holds one voice, so it hides itself |
+> | §2.2 limitation #1: short-utterance instability | **measured away by the engine swap** — 4/4 exact ASR round-trips vs 0/6 before. Do not re-add this warning |
+> | 3 Tauri commands | **6**, plus per-request tuning params, session history, and install stage events |
+>
+> **Still true and still load-bearing:** the guiding principle (§1), the "no system Python"
+> requirement (now enforced by `--managed-python`), `--host 127.0.0.1` being
+> security-mandatory, hash-verification of every download, the Windows Job Object teardown,
+> Windows-only scope, and limitation #2 (Latin words and digits garble — still reproduces,
+> 0/4 exact).
+>
+> **Also newly known:** there is **no free/open female Hebrew voice** as of 2026-08-15. Every
+> open Hebrew voice traces to two or three male speakers. That ceiling is real.
+
 - **Date:** 2026-07-31 · **Revised same day** (rev 2 — architecture corrected after primary-source verification; see §2.1)
-- **Status:** Draft (pending spec-review loop + user approval)
+- **Status:** Implemented 2026-08 — then partially superseded by the Phonikud engine swap (see the box above). Historical record.
 - **Author:** Claude (brainstormed with Henry; rev 2 reflection pass verified every load-bearing claim against primary sources)
 - **Backlog origin:** `HANDOFF.md` backlog item #4 ("the actual Voicebox-shaped feature") and its research in `HANDOFF-TTS-VOICE-GENERATION.md`. That research picked VoxCPM2 as the best open-source Hebrew **voice-cloning** model, but VoxCPM2 hard-requires NVIDIA GPU + CUDA + Python/PyTorch — it cannot be the zero-friction "local" tier that `whisper-rs` is for STT. This spec fills that gap with a generic-voice local tier; cloning is Phase 2.
 

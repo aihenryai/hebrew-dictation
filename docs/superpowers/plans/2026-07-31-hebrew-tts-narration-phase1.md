@@ -1,10 +1,47 @@
 # Hebrew TTS Narration Phase 1 Implementation Plan
 
+> # ✅ EXECUTED, THEN SUPERSEDED — do NOT implement this plan
+>
+> **All 7 chunks were executed in 2026-08. The feature shipped. Then the engine was
+> replaced wholesale, so the code in this plan no longer matches the code in the repo.**
+> This file is the historical execution record. For what the feature actually is, read
+> `HANDOFF.md` (top section); for how it works, read the code.
+>
+> **⚠️ The code samples below are the specific hazard.** They are complete, copy-pasteable,
+> and wrong. If you lift any of them you will reintroduce bugs that were already found and
+> fixed. Concretely:
+>
+> - **Chunk 2's `narration.rs`** builds piper's argv (`-m piper.http_server -m <voice>`).
+>   The real `build_server_args` runs **our own script** with `--model/--config/--phonikud/
+>   --tokenizer`. It also predates `NarrationParams` entirely (per-request `length_scale`,
+>   `sentence_silence`, `noise_scale`, `noise_w`).
+> - **Chunk 3** pins `piper-tts[http]==1.6.0` and the `he_IL-saspeech-medium` constants, and
+>   writes a marker with `piper_tts_version` at `MARKER_VERSION: 1`. Reality:
+>   `onnxruntime`/`numpy`/`phonikud`/`phonikud-onnx`/`tokenizers`, the `michael` voice,
+>   marker v2 with an `engine` field. The `uv venv` invocation here is also missing
+>   `--managed-python` (without which uv silently uses the user's system Python) and
+>   `--clear` (without which **every retry after a mid-install failure fails forever**).
+> - **Chunk 4's `spawn_owned`** predates the CWD pin, the `try_wait` crash detection, and the
+>   `voice_id` parameter. Its restart logic also restarts on *any* error; the real one
+>   restarts only on `Unreachable`, because a 5xx proves the sidecar is alive and a timeout
+>   usually just means the text was long.
+> - **Chunk 6's frontend snippet invokes `save_narration_wav` with `suggested_name`.**
+>   That is the exact shipped bug: Tauri exposes a Rust `snake_case` arg to JS as
+>   `camelCase`, so it bound nothing and every saved file silently got a generic name. It
+>   must be `suggestedName`.
+> - **Chunk 1 (the whole spike)** measured piper. Its conclusions about short-utterance
+>   instability no longer hold — see the findings doc's Addendum 2.
+> - **Chunk 7's** integration tests exist but have been rewritten, and a full end-to-end
+>   provisioning test was added that did not exist here.
+>
+> Also shipped but nowhere in this plan: engine deletion, a voice catalog with on-demand
+> download, install stage events, and session narration history.
+>
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a local, CPU-only, generic-Hebrew-voice text-to-speech ("הקראה") feature to hebrew-dictation, mirroring the zero-friction local UX `whisper-rs` already provides for speech-to-text.
 
-**Architecture:** The app manages an isolated Python runtime (provisioned on-demand via the `uv` package manager, hash-verified, invisible to the user) that runs `piper1-gpl`'s built-in HTTP server as a warm background sidecar on `127.0.0.1`. Rust owns the sidecar's full lifecycle (spawn, health-check, crash-recovery, guaranteed teardown including a Windows Job Object for crash cases and a startup sweep for orphans) and talks to it over local HTTP. The frontend gets a new "הקראה" screen: paste Hebrew text, get a WAV back, play it, optionally save it.
+**Architecture (as planned — see the box above for what shipped):** The app manages an isolated Python runtime (provisioned on-demand via the `uv` package manager, hash-verified, invisible to the user) that runs `piper1-gpl`'s built-in HTTP server as a warm background sidecar on `127.0.0.1`. Rust owns the sidecar's full lifecycle (spawn, health-check, crash-recovery, guaranteed teardown including a Windows Job Object for crash cases and a startup sweep for orphans) and talks to it over local HTTP. The frontend gets a new "הקראה" screen: paste Hebrew text, get a WAV back, play it, optionally save it.
 
 **Tech Stack:** Rust (Tauri v2, `tokio::process`, `reqwest`), `piper1-gpl` (Python, GPL-3.0, run as a subprocess — never linked into the app), `uv` (Python env manager, MIT), the `he_IL-saspeech-medium` Piper voice (SASPEECH corpus), React/TypeScript frontend.
 

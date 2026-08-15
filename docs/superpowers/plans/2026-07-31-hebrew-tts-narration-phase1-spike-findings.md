@@ -4,7 +4,27 @@
 
 ---
 
-## Pinned Facts (for Chunk 2+)
+## Pinned Facts (for Chunk 2+) — ⚠️ ALL SUPERSEDED, DO NOT CODE AGAINST THESE
+
+> **Every value in this section measured piper1-gpl, which is no longer the engine.** It was
+> replaced by Phonikud in 2026-08 because nikud encodes vowels but not stress, and missing
+> stress — not the voice, not the parameters — is what made the output sound flat. Kept only
+> as the record of what the spike actually measured.
+>
+> Superseded, specifically: the `piper-tts` version and `[http]` extra (piper is not
+> installed at all); the `he_IL-saspeech-medium` URL/size/hash (the voice is now `michael`
+> from the Phonikud checkpoints); "Nakdimon is bundled in the wheel, no separate download"
+> (the diacritizer is now a **separate 308MB ONNX artifact**); the SASPEECH/IPBC
+> non-commercial license constraint (**no longer applies** — that voice was removed); and
+> the measured server behaviour (Content-Type quirk, `/info` shape, ~940ms latency, ~448MB
+> RSS), which described piper's Flask server rather than the sidecar we now ship. Current
+> figures: ~695MB on disk, ~592MB RAM.
+>
+> **Current pinned values live in `src-tauri/src/narration_provision.rs`** as hash-verified
+> constants. That file is the source of truth.
+>
+> **Read Addendum 2 further down before trusting the quality conclusions** — the
+> short-utterance instability documented here was measured away by the engine swap.
 
 - **`piper-tts` exact version:** `1.6.0` (installed via `pip install "piper-tts>=1.6.0"`, resolved to 1.6.0 — no newer patch available at spike time).
 - **HTTP extra required:** yes — plain `pip install piper-tts` gives `ModuleNotFoundError: No module named 'flask'` when running `python -m piper.http_server`. Must install `pip install "piper-tts[http]"`. **This is a required fix to Chunk 3's provisioning plan** — `PIPER_TTS_VERSION` should drive an install of `piper-tts[http]==1.6.0`, not bare `piper-tts==1.6.0`.
