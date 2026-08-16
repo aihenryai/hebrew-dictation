@@ -941,11 +941,20 @@ async fn narration_setup(_app: AppHandle) -> Result<(), String> {
 
 /// Delete the whole narration engine (~700MB) and report how much was freed.
 ///
-/// Shuts the sidecar down FIRST: on Windows the running process holds its
-/// own executable and the loaded `.onnx` files open, so deleting underneath
-/// it would fail partway and leave a half-removed engine that still looks
-/// provisioned. Clearing the state handle also means the next generate
-/// re-probes from scratch rather than reusing a handle to a killed process.
+/// Stops the sidecar FIRST: on Windows a running process holds its own
+/// executable and its loaded DLLs open, so deleting underneath it fails
+/// partway and leaves a half-removed engine.
+///
+/// ⚠️ The stop is a sweep of the engine DIRECTORY, not just of the handle in
+/// `AppState`. That handle was never the authority on who is using these
+/// files, and trusting it is exactly how this went wrong in practice: a
+/// sidecar this instance never tracked — a leftover from a restarted dev run,
+/// a second app instance, one started by hand on another port — left the
+/// handle `None`, so the command skipped straight to `remove_dir_all`, deleted
+/// the marker and the models, then hit "Access is denied" on the venv the live
+/// process was running from. The result was an engine that reported "not
+/// installed" while still occupying ~600MB, whose reinstall then also failed
+/// on the same locked venv.
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn delete_narration_engine(state: State<'_, AppState>) -> Result<u64, String> {
@@ -957,44 +966,59 @@ async fn delete_narration_engine(state: State<'_, AppState>) -> Result<u64, Stri
     // violation and leaving a half-removed engine.
     let mut guard = state.narration_server.lock().await;
     if let Some(server) = guard.as_mut() {
-        // An adopted sidecar cannot be killed — we hold no handle to it. Refuse
-        // rather than delete files out from under a process that is still
-        // serving them, which would fail partway with a misleading error.
-        if !server.can_shutdown() {
-            return Err(
-                "מנוע הקריינות פועל מתהליך קודם שלא ניתן לסגור מכאן. סגור את האפליקציה, פתח מחדש, ונסה שוב."
-                    .to_string(),
-            );
-        }
         server.shutdown().await;
     }
+    // Clearing the handle also means the next generate re-probes from scratch
+    // rather than reusing a handle to a killed process. It additionally drops
+    // the Job Object, whose KILL_ON_JOB_CLOSE is one more thing the sweep
+    // below does not have to rely on.
     *guard = None;
+
+    // An untracked sidecar is still a sidecar. This is the check that makes
+    // the command correct rather than merely usually-correct.
+    let survivors = narration_process::kill_processes_under_narration_dir().await;
+    if let Some(first) = survivors.first() {
+        // Refuse BEFORE touching a single file: a clear error the user can act
+        // on beats a partially deleted engine, which is strictly harder to
+        // recover from than one that was never touched.
+        return Err(format!(
+            "מנוע הקריינות עדיין פועל ולא ניתן לסגור אותו: {first}. סגור את האפליקציה, פתח מחדש, ונסה שוב."
+        ));
+    }
 
     let dir = narration_provision::get_narration_dir();
     if !dir.exists() {
         return Ok(0);
     }
+    let freed = narration_provision::narration_dir_size();
 
-    fn dir_size(path: &std::path::Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return 0;
-        };
-        entries
-            .filter_map(|e| e.ok())
-            .map(|e| match e.file_type() {
-                Ok(t) if t.is_dir() => dir_size(&e.path()),
-                Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
-                Err(_) => 0,
-            })
-            .sum()
-    }
-    let freed = dir_size(&dir);
-
-    std::fs::remove_dir_all(&dir).map_err(|e| {
+    narration_provision::remove_dir_all_with_retry(&dir).await.map_err(|e| {
         format!("מחיקת מנוע הקריינות נכשלה — ייתכן שקובץ עדיין בשימוש. סגור את האפליקציה ונסה שוב. (פרטים טכניים: {e})")
     })?;
 
     Ok(freed)
+}
+
+/// Bytes the narration engine occupies on disk right now, 0 when there is
+/// nothing to delete.
+///
+/// Deliberately independent of `ensure_narration_ready`: that reads the
+/// marker, and a delete that failed partway removes the marker while leaving
+/// hundreds of megabytes behind. Keying the settings screen's delete button
+/// off the marker would hide the leftovers precisely when they most need
+/// clearing — which is what happened, since the narration screen's own delete
+/// button lives inside a `narrationReady` branch and vanished with it.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+fn narration_engine_footprint() -> u64 {
+    narration_provision::narration_dir_size()
+}
+
+/// Non-Windows stub so the command is always registrable in `generate_handler!`.
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+fn narration_engine_footprint() -> u64 {
+    0
 }
 
 /// Non-Windows stub so the command is always registrable in `generate_handler!`.
@@ -2446,6 +2470,7 @@ pub fn run() {
             narration_setup,
             generate_narration,
             delete_narration_engine,
+            narration_engine_footprint,
             list_narration_voices,
             set_narration_voice,
             save_narration_wav,

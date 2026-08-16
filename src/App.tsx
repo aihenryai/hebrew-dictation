@@ -521,6 +521,11 @@ function App() {
   const [narrationNoiseWStep, setNarrationNoiseWStep] = useState(NARRATION_NOISE_DEFAULT_STEP);
   const [narrationAdvancedOpen, setNarrationAdvancedOpen] = useState(false);
   const [narrationDeleting, setNarrationDeleting] = useState(false);
+  // Bytes the engine occupies on disk. Tracked separately from
+  // narrationReady, which reads the install marker: a delete that failed
+  // partway removes the marker and leaves hundreds of megabytes behind, so
+  // "not ready" and "nothing on disk" are genuinely different states.
+  const [narrationFootprint, setNarrationFootprint] = useState(0);
   const [narrationStage, setNarrationStage] = useState<
     { step: number; total: number; label: string } | null
   >(null);
@@ -1067,6 +1072,15 @@ function App() {
     }
   }, []);
 
+  const refreshNarrationFootprint = useCallback(async () => {
+    try {
+      setNarrationFootprint(await invoke<number>("narration_engine_footprint"));
+    } catch {
+      // Only costs the settings readout; nothing else depends on this.
+      setNarrationFootprint(0);
+    }
+  }, []);
+
   const runNarrationSetup = useCallback(async () => {
     setNarrationProvisioning(true);
     setNarrationProvisionProgress(0);
@@ -1161,8 +1175,12 @@ function App() {
       setError(`מחיקת המנוע נכשלה: ${e}`);
     } finally {
       setNarrationDeleting(false);
+      // Re-read on BOTH paths. A refused delete leaves the bytes exactly where
+      // they were, and a failed one may still have removed part of the tree —
+      // either way the number on screen must reflect the disk, not the attempt.
+      await refreshNarrationFootprint();
     }
-  }, []);
+  }, [refreshNarrationFootprint]);
 
   const deleteNarrationClip = useCallback((id: number) => {
     setNarrationHistory((prev) => {
@@ -1198,7 +1216,14 @@ function App() {
       checkNarrationReady();
       refreshNarrationVoices();
     }
-  }, [view, checkNarrationReady, refreshNarrationVoices]);
+    // Settings reports the engine's real on-disk size, which changes out from
+    // under this screen (an install, a delete, a delete that failed partway).
+    // Read it on every entry — mount-time only would show a stale number.
+    if (view === "settings") {
+      checkNarrationReady();
+      refreshNarrationFootprint();
+    }
+  }, [view, checkNarrationReady, refreshNarrationVoices, refreshNarrationFootprint]);
 
   // ── Batch file transcription handlers ──
   const handlePickAndTranscribe = useCallback(async () => {
@@ -2626,6 +2651,34 @@ function App() {
             })}
           </div>
         </div>
+
+        {/* Narration engine — shown whenever bytes exist on disk, NOT when
+            narrationReady is true. Those differ exactly when it matters: a
+            delete that failed partway removes the install marker and leaves
+            ~600MB behind, and the narration screen's own delete button is
+            inside a `narrationReady` branch, so it disappears at that moment.
+            Keying off the footprint keeps the leftovers reachable. */}
+        {narrationFootprint > 0 && (
+          <div className="settings-section">
+            <h3>מנוע קריינות</h3>
+            <p className="settings-note">
+              {narrationReady
+                ? `מותקן, תופס ${(narrationFootprint / 1024 / 1024).toFixed(0)}MB בדיסק.`
+                : `לא מותקן, אבל נשארו בדיסק ${(narrationFootprint / 1024 / 1024).toFixed(0)}MB של קבצי מנוע.`}
+            </p>
+            {narrationSaveNotice && <p className="settings-note active-note">{narrationSaveNotice}</p>}
+            <button
+              className="btn-secondary btn-danger-outline"
+              onClick={deleteNarrationEngine}
+              disabled={narrationDeleting}
+            >
+              {narrationDeleting ? "מוחק…" : "מחק את מנוע הקריינות"}
+            </button>
+            <p className="settings-note">
+              אפשר להתקין מחדש בכל רגע ממסך "צור קריינות". קבצי קריינות שכבר נשמרו לא מושפעים.
+            </p>
+          </div>
+        )}
 
         {/* About */}
         <div className="settings-section about-section">

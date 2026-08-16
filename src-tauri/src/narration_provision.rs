@@ -23,6 +23,55 @@ pub fn get_narration_dir() -> PathBuf {
     app_data.join("hebrew-dictation").join("narration")
 }
 
+/// Bytes the engine occupies on disk, 0 when nothing is installed.
+///
+/// Reads the directory rather than the marker deliberately: after a delete
+/// that failed partway, the marker is gone but hundreds of megabytes remain.
+/// The settings screen keys its "delete engine" affordance off THIS, so those
+/// leftovers stay reachable instead of becoming invisible junk.
+pub fn narration_dir_size() -> u64 {
+    fn dir_size(path: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => dir_size(&e.path()),
+                Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+    dir_size(&get_narration_dir())
+}
+
+/// `remove_dir_all` with a short retry.
+///
+/// Windows releases a dead process's file handles asynchronously, so a delete
+/// issued immediately after killing the holder can still hit a sharing
+/// violation on a file whose owner is already gone. Retrying turns that race
+/// into a non-event.
+///
+/// This is NOT a substitute for stopping the holders first — retrying against
+/// a process that is still alive just fails five times instead of once.
+pub async fn remove_dir_all_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..5 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            // Already gone (or a previous attempt got there): success, not an
+            // error — `remove_dir_all` reports NotFound for a missing path.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => last_error = Some(e),
+        }
+        if attempt < 4 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Err(last_error.expect("the loop only exits here after storing an error"))
+}
+
 fn get_uv_zip_path() -> PathBuf {
     get_narration_dir().join(format!("uv-{UV_VERSION}.zip"))
 }
@@ -396,6 +445,18 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         ("UV_CACHE_DIR", narration_dir.join("uv-cache").to_string_lossy().to_string()),
     ];
 
+    // `--clear` below DELETES the existing venv, so it fails on exactly the
+    // files a leftover sidecar holds open — its own `python.exe`. That is not
+    // hypothetical: a delete that failed partway leaves the venv behind with
+    // the process that blocked it still running, and every reinstall attempt
+    // then dies here. Stop anything running out of our directory first.
+    let survivors = crate::narration_process::kill_processes_under_narration_dir().await;
+    if let Some(first) = survivors.first() {
+        return Err(format!(
+            "לא ניתן להתקין את מנוע הקריינות כי תהליך קודם שלו עדיין פועל ולא ניתן לסגור אותו: {first}. סגור את האפליקציה, פתח מחדש, ונסה שוב."
+        ));
+    }
+
     // `uv venv --python 3.11` may need to download an entire Python build
     // (~30-60MB from astral.sh) on first run — 300s covers a slow/stalled
     // connection without hanging the provisioning UI forever.
@@ -563,6 +624,26 @@ mod tests {
     fn narration_dir_is_under_app_data_narration_subfolder() {
         let dir = get_narration_dir();
         assert!(dir.ends_with(Path::new("hebrew-dictation").join("narration")));
+    }
+
+    /// Deleting a directory that is already gone is the SUCCESS case, not a
+    /// failure: the delete command runs this after killing the engine's
+    /// processes, and a partially-completed earlier attempt can legitimately
+    /// have removed it already. Reporting `NotFound` as an error there would
+    /// tell the user their cleanup failed when it had in fact finished.
+    #[tokio::test]
+    async fn remove_dir_all_with_retry_removes_a_tree_and_treats_absent_as_done() {
+        let base = std::env::temp_dir().join(format!("hd-narration-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("venv").join("Scripts")).unwrap();
+        std::fs::write(base.join("venv").join("Scripts").join("python.exe"), b"not really").unwrap();
+
+        remove_dir_all_with_retry(&base).await.expect("a tree nothing holds open must delete");
+        assert!(!base.exists());
+
+        remove_dir_all_with_retry(&base)
+            .await
+            .expect("an already-absent directory is done, not an error");
     }
 
     #[test]
