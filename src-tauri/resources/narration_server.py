@@ -51,6 +51,39 @@ def build_phonemizer(phonikud_model_path: str, tokenizer_path: str):
 # predictable rather than dependent on a locale-aware splitter.
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
+# Hard caps on request input. The Rust client already clamps every one of
+# these, but this server listens on a real TCP port that any local process --
+# including a web page doing fetch('http://127.0.0.1:5758/...') -- can reach,
+# so it cannot assume its caller validated anything. Measured before adding
+# these: sentence_silence=1e9 made numpy attempt a 40 TiB allocation,
+# a negative value raised on negative dimensions, and length_scale=0 returned
+# HTTP 200 with 0.01s of garbage.
+MAX_BODY_BYTES = 1_000_000  # ~1MB of JSON is far more text than is sensible
+LIMITS = {
+    # name: (low, high, default_attr_or_none)
+    "length_scale": (0.8, 1.8),
+    "sentence_silence": (0.0, 2.0),
+    "noise_scale": (0.0, 1.2),
+    "noise_w": (0.0, 1.2),
+}
+
+
+def clamp_param(name: str, raw, fallback: float) -> float:
+    """Coerce one request parameter into a range that still produces speech.
+
+    Falls back rather than erroring on junk: a bad tuning value should not cost
+    the caller their synthesis, and the ranges here mirror
+    NarrationParams::clamped on the Rust side.
+    """
+    low, high = LIMITS[name]
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+        return fallback
+    return max(low, min(high, value))
+
 
 def split_sentences(text: str):
     return [s for s in (p.strip() for p in _SENTENCE_SPLIT.split(text)) if s]
@@ -106,6 +139,10 @@ class Synthesizer:
         if self.num_speakers > 1:
             inputs["sid"] = np.array([0], dtype=np.int64)
         audio = self.session.run(None, inputs)[0].squeeze()
+        # `.max()` raises on a zero-size array, so check size before peak:
+        # input that maps to no known phonemes can yield an empty result.
+        if audio.size == 0:
+            return np.zeros(0, dtype=np.int16)
         peak = float(np.abs(audio).max())
         if peak > 0:
             audio = audio / peak * 0.95
@@ -172,20 +209,33 @@ def make_handler(synth: Synthesizer, args):
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                # Refuse an oversized body BEFORE reading it, so a bogus
+                # Content-Length cannot make us allocate on a caller's say-so.
+                if length > MAX_BODY_BYTES:
+                    self.send_error(413, "request body too large")
+                    return
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict):
+                    self.send_error(400, "body must be a JSON object")
+                    return
                 text = (payload.get("text") or "").strip()
                 if not text:
                     self.send_error(400, "empty text")
                     return
-                # Every knob is per-request with the startup flag as fallback.
-                # sentence_silence in particular could not be per-request under
-                # piper's server, which is why it used to be fixed.
-                length_scale = float(payload.get("length_scale", args.length_scale))
-                sentence_silence = float(
-                    payload.get("sentence_silence", args.sentence_silence)
+                # Every knob is per-request with the startup flag as fallback,
+                # and every one is clamped — see LIMITS for why.
+                length_scale = clamp_param(
+                    "length_scale", payload.get("length_scale"), args.length_scale
                 )
-                noise_scale = float(payload.get("noise_scale", synth.noise_scale))
-                noise_w = float(payload.get("noise_w", synth.noise_w))
+                sentence_silence = clamp_param(
+                    "sentence_silence",
+                    payload.get("sentence_silence"),
+                    args.sentence_silence,
+                )
+                noise_scale = clamp_param(
+                    "noise_scale", payload.get("noise_scale"), synth.noise_scale
+                )
+                noise_w = clamp_param("noise_w", payload.get("noise_w"), synth.noise_w)
                 wav = synth.synthesize(
                     text, length_scale, sentence_silence, noise_scale, noise_w
                 )
