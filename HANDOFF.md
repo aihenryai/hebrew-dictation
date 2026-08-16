@@ -62,17 +62,83 @@ real — see the spike-findings addendum.
   alive (the script catches synthesis errors and keeps serving) and a timeout usually just
   means the text was long; restarting on those killed a healthy engine and paid a full cold
   start to fail identically.
+- The sidecar script must validate its own input — it listens on a real TCP port any local
+  process can reach. Before this was added, `sentence_silence: 1e9` made numpy attempt a
+  **40 TiB allocation**, a negative value crashed on negative dimensions, and `length_scale: 0`
+  returned HTTP 200 with 0.01s of garbage presented as success. All four now clamp/fall back.
 
-**Verification status.** 99 unit tests plus 4 `#[ignore]` integration tests that hit the real
-network and a real engine (`cargo test -- --ignored`), including one that provisions the entire
-engine end to end and asserts all 7 stage events fire in order. A multi-agent review of the
-whole feature was run; it produced 82 raw findings but **hit a session limit partway**, so only
-the lifecycle dimension was fully adversarially verified — provisioning, frontend, sidecar and
-docs findings are **unverified** and worth re-running (`Workflow` script saved under
-`workflows/scripts/narration-final-review-*.js`).
+## 🔴 2026-08-15 — OPEN BUG: delete-engine button fails with "Access is denied (os error 5)"
 
-**What Henry still has not confirmed:** the delete-engine button and the reworked install
-screen. Everything else he has used and approved.
+**Reported by Henry, with a screenshot, right at session end — not yet investigated in depth.**
+Live repro captured at the moment it happened:
+
+```
+PID 37508 (parent 30676, the running dev app) = venv\Scripts\python.exe narration_server.py --port 5919 …
+PID 28224 (parent 37508)                       = python\cpython-3.11-…\python.exe narration_server.py --port 5919 …
+```
+
+Both processes were **still alive** after the failed delete, and the error is the raw
+`remove_dir_all` OS error — not the "מנוע הקריינות פועל מתהליך קודם…" refusal message that
+`delete_narration_engine` now sends for an `Unmanaged` (unkillable) sidecar. So the code
+believed it *could* shut this down (`Owned`, took the mutex, called `shutdown()`), but a
+process still ended up holding a file open in the directory anyway.
+
+**Leading hypothesis, not yet confirmed:** the venv's `python.exe` (37508) is a **shim that
+re-execs into a second, real interpreter** (28224) — this was already known and is why
+`spawn_owned`'s readiness poll has to wait for the *second* process to bind the port. If
+`child.kill()` in `shutdown()` only terminates the direct child (37508) and the Windows Job
+Object's `KILL_ON_JOB_CLOSE` does **not** propagate to 28224 (e.g. if the shim re-execs via a
+mechanism that breaks away from the job, or the job handle was assigned to the wrong PID),
+the real interpreter — which is the one that actually `mmap`s `michael.onnx` and
+`phonikud-1.0.int8.onnx` — survives the kill and keeps the directory locked. This is exactly
+the "does the Job Object cover the grandchild" question the incomplete review flagged but
+never got to verify.
+
+**Next-session starting point:**
+1. Reproduce, then check with Task Manager / `Get-CimInstance Win32_Process` whether `shutdown()`
+   actually leaves the grandchild (28224-equivalent) alive.
+2. If so, the fix is almost certainly in `narration_process.rs::spawn_owned` — either the
+   `raw_handle()` used for `job.assign_process()` needs to target the right process, or
+   `shutdown()` needs to walk and kill the process tree explicitly rather than trusting job
+   propagation.
+3. Note port 5919, not 5758: `settings.narration_port` may have been changed during testing, or
+   something is choosing a different port — worth confirming this isn't a second, separate bug.
+
+**Feature request from Henry (same message):** add a way to delete the narration engine from
+the **Settings** screen too, not only from the narration screen itself (useful precisely
+because the narration screen requires the engine to be in a working state to even show the
+delete button in some flows — check `narrationReady` gating in `App.tsx` before assuming the
+button is always reachable).
+
+**Verification status of the review.** 99 unit tests pass; 4 `#[ignore]` integration tests hit
+the real network and a real engine (`cargo test -- --ignored`), including one that provisions
+the entire engine end to end and asserts all 7 stage events fire in order. A multi-agent
+adversarial review was attempted **twice** and both times hit the session's usage limit before
+finishing:
+- Round 1 (5 dimensions, 82 raw findings): only **lifecycle** was fully verified → 5 real bugs
+  found and fixed (mutex race on delete, restart-on-any-error, hardcoded error message,
+  shutdown no-op on Unmanaged, settings-mutation ordering).
+- Round 2 (3 dimensions — sidecar/provisioning/frontend, the ones round 1 never verified):
+  **zero agents ran** before the limit hit again.
+- The **sidecar** (`narration_server.py`) was reviewed by hand instead (no agent needed): live
+  input-fuzzing found it trusted the caller completely (see the trap above) — fixed and
+  re-verified with the identical probe script.
+- **Provisioning** and **frontend** dimensions remain genuinely unreviewed. Round 1's raw
+  findings for them exist but are unverified guesses, not confirmed bugs — see
+  `workflows/scripts/narration-final-review-*.js` (round 1, resumable only within its
+  original session) and `narration-review-round2-*.js` (round 2, never ran — rerun this one
+  fresh, not resumed, since `resumeFromRunId` doesn't work across sessions).
+
+**What Henry still has not confirmed:** the reworked install screen (never tested). The
+delete-engine button **was** tested and **failed** — see the bug above.
+
+## ⚠️ 2026-08-15 — 49 commits sitting local-only, never pushed
+
+Everything in this section (and the narration feature's entire implementation history) is on
+local `main`, **49 commits ahead of `origin/main`**, never pushed. `git push` was never run
+this session. Confirm with Henry before pushing — this repo's own convention is direct-to-main
+commits with no PR gate, but that is not the same as auto-push, and 49 commits landing on
+GitHub at once is worth a deliberate decision, not an assumption.
 
 ---
 
