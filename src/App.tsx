@@ -509,6 +509,13 @@ function App() {
   const [narrationProvisioning, setNarrationProvisioning] = useState(false);
   const [narrationProvisionProgress, setNarrationProvisionProgress] = useState(0);
   const [narrationSaveNotice, setNarrationSaveNotice] = useState<string | null>(null);
+  // Separate from narrationSaveNotice on purpose: that one is a WAV-save
+  // confirmation shown on the narration screen. Reusing it for engine-delete
+  // also made the settings-screen delete confirmation contextually confusing
+  // if a save notice from a moment ago was still live, and — the bug this
+  // was introduced to fix — tied the notice's visibility to the same
+  // narrationFootprint gate that controls whether the section renders at all.
+  const [narrationEngineNotice, setNarrationEngineNotice] = useState<string | null>(null);
   // Speed slider position, 0 (slowest) to NARRATION_RATE_STEPS (fastest).
   // Stored as an integer step rather than the float it maps to: the value the
   // backend wants is length_scale (phoneme duration, so higher = SLOWER),
@@ -1165,12 +1172,12 @@ function App() {
   const deleteNarrationEngine = useCallback(async () => {
     setNarrationDeleting(true);
     setError("");
-    setNarrationSaveNotice(null);
+    setNarrationEngineNotice(null);
     try {
       const freed = await invoke<number>("delete_narration_engine");
       setNarrationReady(false);
-      setNarrationSaveNotice(`✅ המנוע נמחק, פונו ${(freed / 1024 / 1024).toFixed(0)}MB`);
-      window.setTimeout(() => setNarrationSaveNotice(null), 8000);
+      setNarrationEngineNotice(`✅ המנוע נמחק, פונו ${(freed / 1024 / 1024).toFixed(0)}MB`);
+      window.setTimeout(() => setNarrationEngineNotice(null), 8000);
     } catch (e) {
       setError(`מחיקת המנוע נכשלה: ${e}`);
     } finally {
@@ -2657,26 +2664,36 @@ function App() {
             delete that failed partway removes the install marker and leaves
             ~600MB behind, and the narration screen's own delete button is
             inside a `narrationReady` branch, so it disappears at that moment.
-            Keying off the footprint keeps the leftovers reachable. */}
-        {narrationFootprint > 0 && (
+            Keying off the footprint keeps the leftovers reachable.
+
+            Also kept mounted while `narrationEngineNotice` is set: a
+            successful delete drives the footprint to 0, and gating the whole
+            section on `narrationFootprint > 0` alone would unmount it (and
+            the confirmation inside it) in the same render pass the user was
+            supposed to read it in. */}
+        {(narrationFootprint > 0 || narrationEngineNotice) && (
           <div className="settings-section">
             <h3>מנוע קריינות</h3>
-            <p className="settings-note">
-              {narrationReady
-                ? `מותקן, תופס ${(narrationFootprint / 1024 / 1024).toFixed(0)}MB בדיסק.`
-                : `לא מותקן, אבל נשארו בדיסק ${(narrationFootprint / 1024 / 1024).toFixed(0)}MB של קבצי מנוע.`}
-            </p>
-            {narrationSaveNotice && <p className="settings-note active-note">{narrationSaveNotice}</p>}
-            <button
-              className="btn-secondary btn-danger-outline"
-              onClick={deleteNarrationEngine}
-              disabled={narrationDeleting}
-            >
-              {narrationDeleting ? "מוחק…" : "מחק את מנוע הקריינות"}
-            </button>
-            <p className="settings-note">
-              אפשר להתקין מחדש בכל רגע ממסך "צור קריינות". קבצי קריינות שכבר נשמרו לא מושפעים.
-            </p>
+            {narrationEngineNotice && <p className="settings-note active-note">{narrationEngineNotice}</p>}
+            {narrationFootprint > 0 && (
+              <>
+                <p className="settings-note">
+                  {narrationReady
+                    ? `מותקן, תופס ${(narrationFootprint / 1024 / 1024).toFixed(0)}MB בדיסק.`
+                    : `לא מותקן, אבל נשארו בדיסק ${(narrationFootprint / 1024 / 1024).toFixed(0)}MB של קבצי מנוע.`}
+                </p>
+                <button
+                  className="btn-secondary btn-danger-outline"
+                  onClick={deleteNarrationEngine}
+                  disabled={narrationDeleting || narrationGenerating}
+                >
+                  {narrationDeleting ? "מוחק…" : "מחק את מנוע הקריינות"}
+                </button>
+                <p className="settings-note">
+                  אפשר להתקין מחדש בכל רגע ממסך "צור קריינות". קבצי קריינות שכבר נשמרו לא מושפעים.
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -3093,6 +3110,15 @@ function App() {
 
         {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
 
+        {/* Rendered here, OUTSIDE the narrationReady branch below, on purpose:
+            a successful delete flips narrationReady to false in the same
+            update that sets this notice, which would unmount it instantly if
+            it lived inside that branch — the same bug the settings-screen
+            engine section had before this was pulled out into its own state. */}
+        {narrationEngineNotice && (
+          <p className="settings-note active-note">{narrationEngineNotice}</p>
+        )}
+
         {!narrationReady && !narrationProvisioning && (
           <div className="narration-setup-prompt">
             <p>מנוע הקריינות עדיין לא הותקן. ההתקנה חד-פעמית, פועלת ברקע, ולא דורשת ידע טכני.</p>
@@ -3296,7 +3322,12 @@ function App() {
             <button
               className="btn-primary"
               onClick={generateNarration}
-              disabled={!narrationText.trim() || narrationGenerating}
+              // Also blocked while the engine is being deleted or the voice is
+              // switching (a multi-second download) — either can leave the
+              // sidecar mid-teardown or mid-restart, so a generate racing
+              // against it can hit a half-deleted engine or synthesize with
+              // the wrong voice.
+              disabled={!narrationText.trim() || narrationGenerating || narrationDeleting || narrationSwitchingVoice !== null}
             >
               {narrationGenerating ? "יוצר…" : "צור קריינות"}
             </button>
@@ -3338,7 +3369,10 @@ function App() {
               <button
                 className="btn-secondary btn-danger-outline"
                 onClick={deleteNarrationEngine}
-                disabled={narrationDeleting}
+                // Also blocked mid-generate: deleting out from under an
+                // in-flight synthesis is the same race as above, the other
+                // direction.
+                disabled={narrationDeleting || narrationGenerating}
               >
                 {narrationDeleting ? "מוחק…" : "מחק את מנוע הקריינות"}
               </button>

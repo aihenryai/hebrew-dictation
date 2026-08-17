@@ -58,7 +58,20 @@ pub fn narration_dir_size() -> u64 {
 pub async fn remove_dir_all_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
     let mut last_error = None;
     for attempt in 0..5 {
-        match std::fs::remove_dir_all(dir) {
+        // The engine directory holds hundreds of package files (~700MB) —
+        // walking and unlinking all of it is real wall-clock time on Windows
+        // NTFS, not a cheap syscall. `spawn_blocking` moves that off the
+        // async worker thread this future is polled on, so it doesn't stall
+        // whatever else is scheduled on the same tokio runtime for the
+        // duration (this command already holds the narration_server mutex,
+        // so other narration commands are blocked either way, but the
+        // runtime's OTHER worker threads — unrelated commands, timers —
+        // should not pay for this one delete).
+        let owned = dir.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&owned))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("spawn_blocking panicked: {e}"))));
+        match result {
             Ok(()) => return Ok(()),
             // Already gone (or a previous attempt got there): success, not an
             // error — `remove_dir_all` reports NotFound for a missing path.
@@ -404,9 +417,25 @@ fn tail_stderr(stderr: &[u8]) -> String {
 /// `ensure_uv_available`: it makes the whole flow testable against
 /// `tauri::test::mock_app()`. The real call site passes a plain `&AppHandle`
 /// and infers `Wry`, so this is not a breaking change.
+/// Serializes the whole provisioning flow. Two concurrent calls (a double
+/// click, two windows, a retry racing the original attempt) would otherwise
+/// both run `uv venv --clear` against the same directory and both download
+/// into the same fixed `<dest>.tmp` path — two writers on one file handle,
+/// each hashing only the bytes it wrote, so the verified rename can succeed
+/// with content that is actually an interleaving of both downloads. The
+/// frontend already prevents this in the common case (the install button is
+/// hidden while `narrationProvisioning` is true), so this is defense for the
+/// cases it can't cover — a second app window, or a caller other than the UI.
+fn provision_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub async fn provision_narration_engine<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
+    let _guard = provision_lock().lock().await;
+
     if narration_engine_state() == NarrationEngineState::Ready {
         // Refresh the sidecar script even on the already-provisioned path.
         // It ships inside the binary, so an app update can carry a fixed or
