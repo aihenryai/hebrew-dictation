@@ -67,78 +67,78 @@ real — see the spike-findings addendum.
   **40 TiB allocation**, a negative value crashed on negative dimensions, and `length_scale: 0`
   returned HTTP 200 with 0.01s of garbage presented as success. All four now clamp/fall back.
 
-## 🔴 2026-08-15 — OPEN BUG: delete-engine button fails with "Access is denied (os error 5)"
+## ✅ 2026-08-17 — RESOLVED: delete-engine "Access is denied (os error 5)" + settings-screen delete + review round 2
 
-**Reported by Henry, with a screenshot, right at session end — not yet investigated in depth.**
-Live repro captured at the moment it happened:
+**The 2026-08-15 leading hypothesis (Job Object not covering the re-exec'd grandchild) was
+WRONG.** Root cause, confirmed live on Henry's machine before writing any code: the two
+processes from the bug report (PID 37508/28224, port 5919) were **still alive two days later**,
+parented by `bash.exe`, not the app. They'd been started **by hand from a shell** while fuzzing
+`narration_server.py` (see the sidecar-hardening entry above) — the app's
+`AppState.narration_server` handle was `None`, so `delete_narration_engine` skipped its shutdown
+step entirely and called `remove_dir_all` directly on a directory a live process had open. The
+Job Object was never involved because the app never spawned that process.
 
-```
-PID 37508 (parent 30676, the running dev app) = venv\Scripts\python.exe narration_server.py --port 5919 …
-PID 28224 (parent 37508)                       = python\cpython-3.11-…\python.exe narration_server.py --port 5919 …
-```
+**The fix (`f1ba6a4`):** `delete_narration_engine` no longer trusts the in-memory handle as the
+sole authority. It now sweeps the whole engine directory for any live process by **executable
+path** (never by process name — a `python.exe` name-match would kill Henry's other MCP servers),
+kills what it finds, verifies death by polling, and only then deletes. `shutdown()` got the same
+treatment: it now kills the sidecar's re-exec'd grandchild via the process tree, not just the
+direct child, fixing a related bug in `synthesize_with_restart` where the Job Object's drop-timing
+could let a "restarted" sidecar health-check the still-alive old process. `provision_narration_engine`
+runs the same sweep before `uv venv --clear`, so a reinstall after a partial delete isn't blocked
+by the same locked venv that blocked the delete.
 
-Both processes were **still alive** after the failed delete, and the error is the raw
-`remove_dir_all` OS error — not the "מנוע הקריינות פועל מתהליך קודם…" refusal message that
-`delete_narration_engine` now sends for an `Unmanaged` (unkillable) sidecar. So the code
-believed it *could* shut this down (`Owned`, took the mutex, called `shutdown()`), but a
-process still ended up holding a file open in the directory anyway.
+**Settings-screen delete button — shipped (`f1ba6a4`).** New `narration_engine_footprint` command
++ a "מנוע קריינות" settings section, deliberately gated on **bytes-on-disk**, not the
+`narrationReady` marker — the narration screen's own delete button lives inside a `narrationReady`
+branch and disappears exactly when a half-deleted engine (marker gone, ~600MB still on disk) most
+needs a way to clear it. This was the actual trap in Henry's original bug: after the failed
+delete, there was no reachable button to try again.
 
-**Leading hypothesis, not yet confirmed:** the venv's `python.exe` (37508) is a **shim that
-re-execs into a second, real interpreter** (28224) — this was already known and is why
-`spawn_owned`'s readiness poll has to wait for the *second* process to bind the port. If
-`child.kill()` in `shutdown()` only terminates the direct child (37508) and the Windows Job
-Object's `KILL_ON_JOB_CLOSE` does **not** propagate to 28224 (e.g. if the shim re-execs via a
-mechanism that breaks away from the job, or the job handle was assigned to the wrong PID),
-the real interpreter — which is the one that actually `mmap`s `michael.onnx` and
-`phonikud-1.0.int8.onnx` — survives the kill and keeps the directory locked. This is exactly
-the "does the Job Object cover the grandchild" question the incomplete review flagged but
-never got to verify.
+**Review round 2 — the one that never ran, now complete (`3341105`).** Three independent agents,
+one per dimension, all with zero prior review history:
+- **Provisioning** (`narration_provision.rs`, first-ever review): 0 Critical, 3 Important. Fixed:
+  `remove_dir_all_with_retry` now runs inside `spawn_blocking` (was blocking a tokio worker
+  thread for the multi-second delete of ~700MB); `provision_narration_engine` gained a
+  module-level async mutex against concurrent double-provisioning corrupting the shared
+  `<dest>.tmp` download path. **Deliberately NOT fixed:** `ensure_uv_available` only checks
+  whether `uv.exe` exists, not its version — a future `UV_VERSION` bump would silently keep using
+  the old binary on any already-provisioned machine. Real bug, but `UV_VERSION` has never been
+  bumped since ship and the fix needs a small version-sidecar-file design better made against an
+  actual version bump to test with, not invented under review-fix pressure. Two Minor findings
+  (placeholder-guard only covers 2 of 6 hash constants; the uv zip is deleted before the
+  extraction success check) skipped as non-user-facing.
+- **Frontend** (first-ever review): 0 Critical, 3 Important. Fixed: Generate/voice-switch/
+  delete-engine buttons on the narration screen now cross-disable (Generate was missing
+  `narrationDeleting`/`narrationSwitchingVoice` in its guard; Delete was missing
+  `narrationGenerating`) — each gap let a synthesis call race a sidecar mid-teardown or
+  mid-restart. Split `narrationEngineNotice` out of the shared `narrationSaveNotice` state: both
+  the settings-screen and narration-screen delete confirmations lived inside the exact
+  conditional block their own success turns false (`narrationFootprint > 0` /
+  `narrationReady`), so a successful delete unmounted the confirmation in the same render pass
+  it was meant to be read in.
+- **The fix itself, adversarially** (commit `f1ba6a4`): 0 Critical, 1 Medium (the delete command
+  holds the `narration_server` mutex across the whole sweep+kill+size+delete sequence — up to
+  20-40s on slow disks with no progress feedback; judged intentionally correct, not fixed here —
+  a real fix needs a cancellation token or progress event, not a quick patch), 1 Minor
+  (`remove_dir_all_with_retry` retries blindly on any IO error kind, not just lock-race errors —
+  low risk since the sweep already confirmed the directory is process-free by the time it runs).
+  **Confirmed: the fix resolves the actual reported incident** — verified against a new `#[ignore]`d
+  regression test that reproduces the exact incident shape (spawns an untracked sidecar by hand
+  the way that shell did, proves the running exe is undeletable, proves the sweep clears both
+  the shim and the re-exec'd grandchild).
 
-**Next-session starting point:**
-1. Reproduce, then check with Task Manager / `Get-CimInstance Win32_Process` whether `shutdown()`
-   actually leaves the grandchild (28224-equivalent) alive.
-2. If so, the fix is almost certainly in `narration_process.rs::spawn_owned` — either the
-   `raw_handle()` used for `job.assign_process()` needs to target the right process, or
-   `shutdown()` needs to walk and kill the process tree explicitly rather than trusting job
-   propagation.
-3. Note port 5919, not 5758: `settings.narration_port` may have been changed during testing, or
-   something is choosing a different port — worth confirming this isn't a second, separate bug.
+Tests: **103 pass** (was 99 at the 2026-08-15 handoff), 5 ignored (network/full-engine, run with
+`--ignored`). `tsc`/`vite build`/`clippy` all clean, same 7 pre-existing clippy warnings as
+before this session, zero new ones.
 
-**Feature request from Henry (same message):** add a way to delete the narration engine from
-the **Settings** screen too, not only from the narration screen itself (useful precisely
-because the narration screen requires the engine to be in a working state to even show the
-delete button in some flows — check `narrationReady` gating in `App.tsx` before assuming the
-button is always reachable).
+**What Henry still has not confirmed:** the reworked install screen (never tested — unrelated to
+this bug, carried over from the 2026-08-15 handoff). Everything about the delete flow itself —
+the original bug, the settings-screen button, the cross-disable races — was fixed and covered by
+tests this session, but not yet clicked through live by Henry.
 
-**Verification status of the review.** 99 unit tests pass; 4 `#[ignore]` integration tests hit
-the real network and a real engine (`cargo test -- --ignored`), including one that provisions
-the entire engine end to end and asserts all 7 stage events fire in order. A multi-agent
-adversarial review was attempted **twice** and both times hit the session's usage limit before
-finishing:
-- Round 1 (5 dimensions, 82 raw findings): only **lifecycle** was fully verified → 5 real bugs
-  found and fixed (mutex race on delete, restart-on-any-error, hardcoded error message,
-  shutdown no-op on Unmanaged, settings-mutation ordering).
-- Round 2 (3 dimensions — sidecar/provisioning/frontend, the ones round 1 never verified):
-  **zero agents ran** before the limit hit again.
-- The **sidecar** (`narration_server.py`) was reviewed by hand instead (no agent needed): live
-  input-fuzzing found it trusted the caller completely (see the trap above) — fixed and
-  re-verified with the identical probe script.
-- **Provisioning** and **frontend** dimensions remain genuinely unreviewed. Round 1's raw
-  findings for them exist but are unverified guesses, not confirmed bugs — see
-  `workflows/scripts/narration-final-review-*.js` (round 1, resumable only within its
-  original session) and `narration-review-round2-*.js` (round 2, never ran — rerun this one
-  fresh, not resumed, since `resumeFromRunId` doesn't work across sessions).
-
-**What Henry still has not confirmed:** the reworked install screen (never tested). The
-delete-engine button **was** tested and **failed** — see the bug above.
-
-## ⚠️ 2026-08-15 — 49 commits sitting local-only, never pushed
-
-Everything in this section (and the narration feature's entire implementation history) is on
-local `main`, **49 commits ahead of `origin/main`**, never pushed. `git push` was never run
-this session. Confirm with Henry before pushing — this repo's own convention is direct-to-main
-commits with no PR gate, but that is not the same as auto-push, and 49 commits landing on
-GitHub at once is worth a deliberate decision, not an assumption.
+**Pushed to `origin/main` this session** (see below) — the local-only backlog from 2026-08-15
+is resolved.
 
 ---
 
