@@ -4,6 +4,39 @@
 
 ---
 
+## 🚀 v2.13.0 — RELEASED 2026-08-25
+
+Everything in the two 2026-08-25 sections below shipped here, plus the whole narration feature
+(56 commits that had reached `main` on 08-17 but were never cut as a release). Minor, not patch:
+narration is a new user-facing feature.
+
+Release commit `0824935` · [v2.13.0](https://github.com/aihenryai/hebrew-dictation/releases/tag/v2.13.0) = Latest · signed exe + `.sig` + `latest.json`.
+
+Verified live, not assumed: updater endpoint returns `2.13.0` → the new Windows asset; installer
+URL 200; `darwin-aarch64` block asserted byte-identical **in code before writing** (still v2.10.1,
+mac auto-update intact); website shows the new link, `softwareVersion 2.13.0`, and narration both
+in `featureList` and in the prerendered `content`, with zero stale `2.12.1` strings.
+
+**Two things the documented release recipe gets wrong — fix the recipe, not just the symptom:**
+
+1. **The version lives in THREE website places, not two.** The recipe says "tsx + prerender
+   JSON-LD". There is also the prerendered human-readable `content` block, which said
+   "הורידו את הגרסה האחרונה (v2.12.1)" and described the app as transcription-only long after
+   the other two were correct. It is exactly what AI answer engines read. **Grep the DEPLOYED
+   HTML for the previous version string before calling a release done** — the source tree looked
+   complete while the live page was stale.
+2. **Deploy-verification polls need a marker unique to the commit being verified.** The first
+   poll matched a phrase the *previous* commit had already shipped inside `featureList`, so it
+   reported success on attempt 1 against the old build. A substring that predates your change is
+   not a deploy check.
+
+**Known gap, disclosed to Henry before he approved the release:** the local-mode P0 is
+test-covered but was never exercised live by a human who actually picked local mode — Henry
+structurally cannot (he always has a Deepgram key). If a user reports local mode broken on
+2.13.0, start there.
+
+---
+
 ## 🔧 2026-08-25 (later) — narration playback + terminal window — UNCOMMITTED
 
 Three reports from Henry about the narration screen. All three resolved.
