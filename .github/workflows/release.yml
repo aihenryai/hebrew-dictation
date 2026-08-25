@@ -1,0 +1,92 @@
+name: Release
+
+# Builds and signs the Windows and macOS bundles and attaches them to a GitHub
+# Release, including the `latest.json` the in-app updater reads.
+#
+# Two ways in:
+#   - push a `v*` tag  -> builds that tag
+#   - Run workflow     -> builds a tag that already exists (used to add a
+#                         missing platform to a release that already shipped)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build (e.g. v2.13.0)'
+        required: true
+        type: string
+
+jobs:
+  release:
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      # DO NOT raise this. Each matrix job finishes by downloading the
+      # release's current `latest.json`, merging its own platform into it, and
+      # re-uploading. That is a read-modify-write against one shared file, so
+      # two jobs finishing together would each merge into the same pre-merge
+      # copy and the second upload would silently drop the first platform —
+      # producing a release whose updater only serves one OS. Running the
+      # matrix serially is what makes the merge safe.
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: 'windows-latest'
+            args: ''
+            rust-target: ''
+          # macos-latest is Apple Silicon; the target is named explicitly so a
+          # future runner-image change cannot silently start producing x86_64
+          # bundles under an `-aarch64` filename.
+          - platform: 'macos-latest'
+            args: '--target aarch64-apple-darwin'
+            rust-target: 'aarch64-apple-darwin'
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater artifacts. Without these the build still produces
+          # an installer but no `.sig`, and the in-app updater rejects the
+          # release — a silent-looking success that breaks auto-update.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # The key has no password, but the variable must still be set: Tauri
+          # prompts interactively when it is absent, which hangs a CI run until
+          # it times out rather than failing with a useful message.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: ${{ inputs.tag || github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+          # Tauri names bundles after the product name, which here is Hebrew
+          # ("הכתבה בעברית_2.13.0_x64-setup.exe"). A non-ASCII asset name gets
+          # percent-encoded in the GitHub asset URL, which breaks the download
+          # link recorded in `latest.json`. This pattern forces ASCII names.
+          releaseAssetNamePattern: 'hebrew-dictation-v[version]-[arch][ext]'
