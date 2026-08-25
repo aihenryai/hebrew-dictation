@@ -240,6 +240,25 @@ button {
   margin-top: 1rem;
 }
 
+.error p {
+  margin: 0;
+}
+
+/* Raw technical detail (e.g. uv/pip stderr) appended after the Hebrew
+   summary line — Latin command output, so it gets its own LTR block instead
+   of being folded into the RTL paragraph above it. */
+.error-detail {
+  margin: 0.4rem 0 0;
+  padding: 0.4rem 0.5rem;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 6px;
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 0.7rem;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  text-align: left;
+}
+
 /* Devices */
 .devices-section {
   margin-top: 1.5rem;

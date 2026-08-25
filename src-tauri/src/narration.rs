@@ -47,8 +47,12 @@ pub struct ServerPaths<'a> {
 /// vowels but not stress.
 ///
 /// `--host` is security-mandatory: binding all interfaces would expose the
-/// synthesis endpoint to the LAN.
-pub fn build_server_args(paths: &ServerPaths<'_>, host: &str, port: u16) -> Vec<String> {
+/// synthesis endpoint to the LAN. `--nonce` is a shared secret this launch's
+/// requests must present (see `health_check`/`synthesize`) — without it, any
+/// local process that answers first on the port gets silently adopted and
+/// trusted with whatever text this app later sends it, and any web page can
+/// blind-POST /synthesize to burn CPU (see `spawn_or_adopt`'s doc comment).
+pub fn build_server_args(paths: &ServerPaths<'_>, host: &str, port: u16, nonce: &str) -> Vec<String> {
     vec![
         paths.script.to_string(),
         "--model".to_string(),
@@ -63,6 +67,8 @@ pub fn build_server_args(paths: &ServerPaths<'_>, host: &str, port: u16) -> Vec<
         host.to_string(),
         "--port".to_string(),
         port.to_string(),
+        "--nonce".to_string(),
+        nonce.to_string(),
         // Startup fallbacks only: every real request carries its own values,
         // so these just keep the sidecar sane if one ever omits them.
         "--sentence-silence".to_string(),
@@ -71,6 +77,12 @@ pub fn build_server_args(paths: &ServerPaths<'_>, host: &str, port: u16) -> Vec<
         DEFAULT_LENGTH_SCALE.to_string(),
     ]
 }
+
+/// Header carrying the sidecar nonce — a shared secret, not a bearer
+/// credential for a multi-user system, so a plain custom header (rather than
+/// `Authorization: Bearer`) keeps it visibly distinct from the local-API
+/// token in logs/captures.
+const NONCE_HEADER: &str = "X-Narration-Nonce";
 
 /// Minimal structural check that `bytes` looks like a WAV file: starts with
 /// the "RIFF" and "WAVE" magic bytes and has more than just the 44-byte
@@ -181,11 +193,13 @@ pub async fn synthesize(
     port: u16,
     text: &str,
     params: NarrationParams,
+    nonce: &str,
 ) -> Result<Vec<u8>, NarrationError> {
     let p = params.clamped();
     let url = format!("http://127.0.0.1:{port}/synthesize");
     let resp = client
         .post(&url)
+        .header(NONCE_HEADER, nonce)
         .json(&SynthesizeRequest {
             text,
             length_scale: p.length_scale,
@@ -228,11 +242,22 @@ pub async fn synthesize(
     Ok(bytes)
 }
 
-/// GET /info on the sidecar. Returns true only on a reachable 2xx response —
-/// used both as a readiness probe (Chunk 3) and for user-facing diagnostics.
-pub async fn health_check(client: &reqwest::Client, port: u16) -> bool {
+/// GET /info on the sidecar, presenting `nonce`. Returns true only on a
+/// reachable 2xx response — used both as a readiness probe (Chunk 3) and, in
+/// `spawn_or_adopt`, as the actual verification that a process already
+/// listening on the port is this app's own sidecar: the server rejects any
+/// request whose nonce doesn't match what it was launched with (401), so a
+/// coincidental or malicious listener on the port simply cannot pass this
+/// check no matter what it answers.
+pub async fn health_check(client: &reqwest::Client, port: u16, nonce: &str) -> bool {
     let url = format!("http://127.0.0.1:{port}/info");
-    match client.get(&url).timeout(Duration::from_secs(2)).send().await {
+    match client
+        .get(&url)
+        .header(NONCE_HEADER, nonce)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
         Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
@@ -254,7 +279,7 @@ mod tests {
 
     #[test]
     fn build_server_args_includes_host_flag_explicitly() {
-        let args = build_server_args(&test_paths(), "127.0.0.1", 5758);
+        let args = build_server_args(&test_paths(), "127.0.0.1", 5758, "test-nonce");
         let host_idx = args.iter().position(|a| a == "--host").unwrap();
         assert_eq!(args[host_idx + 1], "127.0.0.1");
     }
@@ -264,7 +289,7 @@ mod tests {
         // All five paths are mandatory and are easy to transpose; a missing
         // one surfaces as a confusing Python argparse error at spawn time
         // rather than here.
-        let args = build_server_args(&test_paths(), "127.0.0.1", 5758);
+        let args = build_server_args(&test_paths(), "127.0.0.1", 5758, "test-nonce");
         assert_eq!(args[0], "C:\\app\\narration_server.py", "script must be argv[0]");
         for (flag, expected) in [
             ("--model", "C:\\app\\michael.onnx"),
@@ -272,6 +297,7 @@ mod tests {
             ("--phonikud", "C:\\app\\phonikud-1.0.int8.onnx"),
             ("--tokenizer", "C:\\app\\tokenizer.json"),
             ("--port", "5758"),
+            ("--nonce", "test-nonce"),
         ] {
             let idx = args
                 .iter()
@@ -286,7 +312,7 @@ mod tests {
         // The pause between sentences is startup-only — unlike length_scale
         // there is no per-request fallback, so losing this flag silently
         // reintroduces the run-together delivery.
-        let args = build_server_args(&test_paths(), "127.0.0.1", 5758);
+        let args = build_server_args(&test_paths(), "127.0.0.1", 5758, "test-nonce");
         let idx = args
             .iter()
             .position(|a| a == "--sentence-silence")
@@ -398,10 +424,26 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let result = synthesize(&client, port, "שלום עולם", NarrationParams::default()).await;
+        let result = synthesize(&client, port, "שלום עולם", NarrationParams::default(), "test-nonce").await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), fake_wav);
+    }
+
+    #[tokio::test]
+    async fn synthesize_sends_the_nonce_header() {
+        let port = spawn_fake_sidecar(|req| {
+            let sent = req
+                .headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(NONCE_HEADER))
+                .map(|h| h.value.as_str().to_string());
+            assert_eq!(sent.as_deref(), Some("secret-nonce"));
+            (200, b"error".to_vec())
+        });
+
+        let client = reqwest::Client::new();
+        let _ = synthesize(&client, port, "טקסט", NarrationParams::default(), "secret-nonce").await;
     }
 
     #[tokio::test]
@@ -409,7 +451,7 @@ mod tests {
         let port = spawn_fake_sidecar(|_req| (500, b"error".to_vec()));
 
         let client = reqwest::Client::new();
-        let result = synthesize(&client, port, "טקסט", NarrationParams::default()).await;
+        let result = synthesize(&client, port, "טקסט", NarrationParams::default(), "test-nonce").await;
 
         assert!(matches!(result, Err(NarrationError::BadResponse(_))));
     }
@@ -419,7 +461,7 @@ mod tests {
         let port = spawn_fake_sidecar(|_req| (200, b"<html>not audio</html>".to_vec()));
 
         let client = reqwest::Client::new();
-        let result = synthesize(&client, port, "טקסט", NarrationParams::default()).await;
+        let result = synthesize(&client, port, "טקסט", NarrationParams::default(), "test-nonce").await;
 
         assert!(matches!(result, Err(NarrationError::InvalidAudio)));
     }
@@ -435,7 +477,7 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let result = synthesize(&client, 1, "טקסט", NarrationParams::default()).await;
+        let result = synthesize(&client, 1, "טקסט", NarrationParams::default(), "test-nonce").await;
 
         assert!(matches!(result, Err(NarrationError::Unreachable(_))));
     }
@@ -449,12 +491,62 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        assert!(health_check(&client, port).await);
+        assert!(health_check(&client, port, "test-nonce").await);
+    }
+
+    #[tokio::test]
+    async fn health_check_sends_the_nonce_header() {
+        let port = spawn_fake_sidecar(|req| {
+            let sent = req
+                .headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(NONCE_HEADER))
+                .map(|h| h.value.as_str().to_string());
+            assert_eq!(sent.as_deref(), Some("secret-nonce"));
+            (200, b"{}".to_vec())
+        });
+
+        let client = reqwest::Client::new();
+        assert!(health_check(&client, port, "secret-nonce").await);
     }
 
     #[tokio::test]
     async fn health_check_false_when_unreachable() {
         let client = reqwest::Client::new();
-        assert!(!health_check(&client, 1).await);
+        assert!(!health_check(&client, 1, "test-nonce").await);
+    }
+
+    /// Narration clips are handed to `<audio>` as `blob:` URLs built by
+    /// `URL.createObjectURL` in `App.tsx`. CSP resolves `media-src` from
+    /// `default-src` when it is absent, and `'self'` does NOT cover `blob:` —
+    /// so shipping without an explicit `media-src … blob:` silently disables
+    /// the player on every generated clip (`MEDIA_ELEMENT_ERROR: Media load
+    /// rejected by URL safety check`), while "save as WAV" keeps working
+    /// because it goes through `invoke`, not the blob URL. That asymmetry is
+    /// exactly what makes the regression easy to ship unnoticed, so pin it here.
+    #[test]
+    fn csp_allows_blob_media_so_narration_clips_can_play() {
+        let conf: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+                .expect("tauri.conf.json should be readable"),
+        )
+        .expect("tauri.conf.json should be valid JSON");
+
+        let csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("app.security.csp should be a string");
+
+        let media_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("media-src"))
+            .unwrap_or_else(|| {
+                panic!("CSP has no `media-src`; it falls back to default-src and blocks blob: audio. CSP was: {csp}")
+            });
+
+        assert!(
+            media_src.split_whitespace().any(|t| t == "blob:"),
+            "`media-src` must list `blob:` or narration playback is dead. Got: {media_src}"
+        );
     }
 }

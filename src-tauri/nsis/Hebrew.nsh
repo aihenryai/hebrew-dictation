@@ -19,7 +19,13 @@ LangString appRunningOkKill ${LANG_HEBREW} "{{product_name}} פעיל!$\nלחץ 
 LangString chooseMaintenanceOption ${LANG_HEBREW} "בחר את פעולת התחזוקה לביצוע."
 LangString choowHowToInstall ${LANG_HEBREW} "בחר כיצד להתקין את ${PRODUCTNAME}."
 LangString createDesktop ${LANG_HEBREW} "צור קיצור דרך בשולחן העבודה"
-LangString deleteAppData ${LANG_HEBREW} "מחק גם את נתוני האפליקציה: ההגדרות, היסטוריית ההכתבות ומודלים מקומיים שהורדו. השאר לא מסומן אם בכוונתך להתקין שוב ולשמור אותם. (מפתחות ה-API שמורים בנפרד במנהל האישורים של Windows ולא יימחקו.)"
+; Kept close in length to the upstream English string on purpose — this is a
+; single-line NSIS checkbox label, not a wrapping text area. A ~240-char
+; version here (settings/history/models/API-key explanation) overflowed the
+; fixed-width control and rendered visually cut off — confirmed live by
+; Henry running the installer. If the longer explanation is wanted again, it
+; needs a different UI surface (e.g. a MessageBox), not this checkbox.
+LangString deleteAppData ${LANG_HEBREW} "מחק גם את נתוני האפליקציה"
 LangString dontUninstall ${LANG_HEBREW} "אל תסיר — התקן מעל הגרסה הקיימת"
 LangString dontUninstallDowngrade ${LANG_HEBREW} "אל תסיר (שדרוג-לאחור בלי הסרה מושבת במתקין זה)"
 LangString failedToKillApp ${LANG_HEBREW} "לא ניתן לסגור את {{product_name}}. סגור אותו תחילה ונסה שוב"

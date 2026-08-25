@@ -183,7 +183,27 @@ def make_handler(synth: Synthesizer, args):
         def log_message(self, *_args):
             pass
 
+        def _nonce_ok(self) -> bool:
+            """Reject any request that doesn't present the launch-time nonce.
+
+            Without this, ANY local process that reaches this port could be
+            silently adopted by the Rust app as "our own sidecar" (see
+            spawn_or_adopt's doc comment on the Rust side), and a web page
+            could blind-POST /synthesize (a CORS-simple request needs no
+            preflight) to burn CPU with no way for the caller to read a
+            response back. `--nonce` is empty only if the launcher omitted
+            the flag entirely (should not happen in practice, since the Rust
+            side always generates and passes one) — fail OPEN only in that
+            explicit "security not configured" case, never silently.
+            """
+            if not args.nonce:
+                return True
+            return self.headers.get("X-Narration-Nonce") == args.nonce
+
         def do_GET(self):
+            if not self._nonce_ok():
+                self.send_error(401, "unauthorized")
+                return
             if self.path.split("?")[0] != "/info":
                 self.send_error(404)
                 return
@@ -204,6 +224,14 @@ def make_handler(synth: Synthesizer, args):
             self.wfile.write(body)
 
         def do_POST(self):
+            if not self._nonce_ok():
+                # Reject before reading the body (never trust/allocate on an
+                # unauthenticated request), and close rather than keep-alive:
+                # the body bytes were never drained, so reusing this
+                # connection for a next request would desync the framing.
+                self.close_connection = True
+                self.send_error(401, "unauthorized")
+                return
             if self.path.split("?")[0] != "/synthesize":
                 self.send_error(404)
                 return
@@ -261,6 +289,8 @@ def main():
     parser.add_argument("--port", type=int, default=5758)
     parser.add_argument("--sentence-silence", type=float, default=0.45)
     parser.add_argument("--length-scale", type=float, default=1.0)
+    # Shared secret the Rust launcher generates per spawn — see Handler._nonce_ok.
+    parser.add_argument("--nonce", default="")
     args = parser.parse_args()
 
     synth = Synthesizer(args.model, args.config, args.phonikud, args.tokenizer)

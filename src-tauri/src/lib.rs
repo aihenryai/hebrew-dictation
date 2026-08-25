@@ -253,23 +253,6 @@ fn set_pause_hotkey(
     Ok(())
 }
 
-/// Stop the floating toolbar AND show the main window — used when the user
-/// clicks the toolbar's stop button (vs. pressing the hotkey from another app).
-#[tauri::command]
-fn stop_via_toolbar(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    if let Some(t) = app.get_webview_window("toolbar") {
-        let _ = t.hide();
-    }
-    state
-        .main_was_visible_before_toolbar
-        .store(false, Ordering::Relaxed);
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
-    Ok(())
-}
-
 /// Localized location where the user grants microphone permission, used in the
 /// "no audio captured" hint. Split per-OS so each platform build points at its
 /// own settings path (macOS TCC lives somewhere completely different from the
@@ -1674,7 +1657,7 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
         std::thread::sleep(std::time::Duration::from_millis(80));
     }
 
-    let result = injector::inject_text(text, &injector::InjectionMethod::Clipboard);
+    let result = injector::inject_text(text);
 
     if main_was_visible {
         if let Some(w) = &main_window {
@@ -1861,6 +1844,16 @@ fn get_audio_devices() -> Result<Vec<String>, String> {
     Ok(devices)
 }
 
+/// Applies the "always on top" toggle to the MAIN window only. Deliberately
+/// does NOT touch the toolbar window — the floating bar must always stay on
+/// top while recording (confirmed by Henry live: it's the one thing that
+/// makes it usable — a recording bar that can silently drop behind whatever
+/// app you're dictating into defeats its whole purpose). An earlier version
+/// of this made the toggle also flip the toolbar, on the theory that the
+/// toggle's own label ("show the recording window above everything") was
+/// promising toolbar coverage it never delivered — that was reverted: the
+/// toolbar's own always-on-top is unconditional (see `show_toolbar_window`/
+/// `show_idle_button_inner`), and this toggle is main-window-only.
 #[tauri::command]
 fn set_window_always_on_top(app: AppHandle, enabled: bool) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
@@ -1943,6 +1936,7 @@ fn show_idle_button_inner(app: &AppHandle, saved_pos: Option<settings::ToolbarPo
         let _ = toolbar.set_position(tauri::LogicalPosition::new(x, y));
     }
     let _ = toolbar.set_size(tauri::LogicalSize::new(IDLE_W, IDLE_H));
+    // Unconditional — see set_window_always_on_top's doc comment.
     let _ = toolbar.set_always_on_top(true);
     let _ = app.emit("toolbar-mode", "idle");
     let _ = toolbar.show();
@@ -2067,6 +2061,7 @@ fn show_toolbar_window(
         // Grow from idle-circle size back to the full recording bar and tell
         // the webview to render the recording layout.
         let _ = toolbar.set_size(tauri::LogicalSize::new(TOOLBAR_W, TOOLBAR_H));
+        // Unconditional — see set_window_always_on_top's doc comment.
         let _ = toolbar.set_always_on_top(true);
         let _ = app.emit("toolbar-mode", "recording");
         let _ = toolbar.show();
@@ -2441,7 +2436,6 @@ pub fn run() {
             set_preferred_audio_device,
             set_hotkey,
             set_pause_hotkey,
-            stop_via_toolbar,
             transcribe,
             start_streaming_transcription,
             stop_streaming_transcription,

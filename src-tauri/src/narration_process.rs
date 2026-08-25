@@ -10,6 +10,14 @@ use crate::narration_provision::get_venv_dir;
 use std::path::Path;
 use std::time::Duration;
 
+/// `CREATE_NO_WINDOW`. This app is a GUI (windows-subsystem) process, so it owns
+/// no console: every console-subsystem child it spawns makes Windows allocate a
+/// *fresh, visible* console window. For the narration sidecar that meant a black
+/// terminal flashing up on top of whatever the user was working in — alarming to
+/// a non-technical user, and easy to misread as the app crashing.
+#[cfg(target_os = "windows")]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[cfg(target_os = "windows")]
 use win32job::{ExtendedLimitInfo, Job};
 
@@ -30,11 +38,63 @@ pub enum NarrationServer {
         /// rather than silently reverting to the default mid-session.
         voice_id: String,
         client: reqwest::Client,
+        /// This launch's shared secret — see `spawn_or_adopt`'s doc comment.
+        nonce: String,
     },
     Unmanaged {
         port: u16,
         client: reqwest::Client,
+        /// The nonce that verified this WAS our own process (see
+        /// `spawn_or_adopt`) — every later request needs to keep presenting it.
+        nonce: String,
     },
+}
+
+/// Read the persisted nonce from a previous spawn, if any. `None` when
+/// nothing has ever been provisioned/spawned yet (fresh install), or the file
+/// is unreadable/empty — either way, `spawn_or_adopt` then has nothing to
+/// verify a listening process against and falls through to `spawn_owned`,
+/// which is the correct, fail-closed default rather than trusting it anyway.
+fn read_nonce_file() -> Option<String> {
+    std::fs::read_to_string(crate::narration_provision::get_nonce_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist THIS launch's nonce so a future `spawn_or_adopt` call — this
+/// session recovering from a crash, or a later app launch — can verify a
+/// still-running process is genuinely the one this call is about to spawn.
+/// Best-effort: a write failure only means a legitimate future adoption of
+/// THIS exact process will fail closed and fall through to spawning a new
+/// one instead — an annoyance, never a silent trust of the wrong process.
+fn write_nonce_file(nonce: &str) {
+    let path = crate::narration_provision::get_nonce_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("narration: failed to create nonce dir {}: {}", parent.display(), e);
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, nonce) {
+        eprintln!("narration: failed to write nonce file {}: {}", path.display(), e);
+    }
+}
+
+/// Verifies a process on `port` is provably enforcing OUR nonce, not merely
+/// "some process that answers 2xx to anything". A single "200 with the right
+/// header" is not proof: an unrelated local service (some other dev server,
+/// a static file host) can easily return 200 regardless of headers, and
+/// would otherwise be silently trusted the moment its port happened to match
+/// ours. Requiring the negative case too — a WRONG nonce must be REJECTED —
+/// rules that out: only a process actually running our own nonce-check code
+/// can pass both halves.
+async fn is_verifiably_ours(client: &reqwest::Client, port: u16, nonce: &str) -> bool {
+    if !health_check(client, port, nonce).await {
+        return false;
+    }
+    let wrong_nonce = format!("{nonce}-wrong");
+    !health_check(client, port, &wrong_nonce).await
 }
 
 impl NarrationServer {
@@ -52,15 +112,45 @@ impl NarrationServer {
         }
     }
 
+    fn nonce(&self) -> &str {
+        match self {
+            NarrationServer::Owned { nonce, .. } => nonce,
+            NarrationServer::Unmanaged { nonce, .. } => nonce,
+        }
+    }
+
     /// Get a running sidecar on `port`: adopt an already-healthy one if
     /// present, otherwise spawn a fresh one and wait for it to become ready.
     /// This is both the normal "start the engine" path AND the stale-sweep
     /// concept from the design — there is deliberately no separate sweep
     /// function; see the module-level design note above.
+    ///
+    /// "Already-healthy" is no longer just "answers 2xx on /info" — that used
+    /// to mean ANY local process that happened to bind the port first got
+    /// silently adopted and trusted with every narration text the user later
+    /// generated, and whatever WAV bytes it returned got played back
+    /// unquestioned. Adoption now requires the process to answer with THIS
+    /// app's own nonce from a previous spawn (`read_nonce_file`) — a process
+    /// that doesn't know that secret cannot be ours, real or coincidental.
     pub async fn spawn_or_adopt(port: u16, voice_id: &str) -> Result<Self, String> {
+        Self::spawn_or_adopt_with_nonce_source(port, voice_id, read_nonce_file()).await
+    }
+
+    /// Same as `spawn_or_adopt`, but with the "what nonce would a legitimate
+    /// prior spawn have left behind" question answered by the caller instead
+    /// of read from disk — lets tests exercise the match/mismatch decision
+    /// against a fake sidecar without touching the real, shared app-data file
+    /// (which a parallel test run could race, or a real running app could own).
+    async fn spawn_or_adopt_with_nonce_source(
+        port: u16,
+        voice_id: &str,
+        expected_nonce: Option<String>,
+    ) -> Result<Self, String> {
         let client = reqwest::Client::new();
-        if health_check(&client, port).await {
-            return Ok(NarrationServer::Unmanaged { port, client });
+        if let Some(expected_nonce) = expected_nonce {
+            if is_verifiably_ours(&client, port, &expected_nonce).await {
+                return Ok(NarrationServer::Unmanaged { port, client, nonce: expected_nonce });
+            }
         }
         Self::spawn_owned(port, voice_id, client).await
     }
@@ -70,12 +160,27 @@ impl NarrationServer {
         voice_id: &str,
         client: reqwest::Client,
     ) -> Result<Self, String> {
+        let nonce = crate::local_api::generate_token();
+        write_nonce_file(&nonce);
         let venv_dir = get_venv_dir();
-        let python_exe = venv_dir.join("Scripts").join("python.exe");
+        // Prefer `pythonw.exe` — the GUI-subsystem interpreter, which can never
+        // own a console at all. `CREATE_NO_WINDOW` below already suppresses the
+        // window, but the venv's `python.exe` is a *shim* that launches the real
+        // uv-managed interpreter; belt-and-braces here means a console can't
+        // reappear if that hand-off ever stops inheriting our creation flags.
+        // Fall back to `python.exe` rather than failing: an engine provisioned
+        // by an older build is still perfectly usable.
+        let console_python = venv_dir.join("Scripts").join("python.exe");
+        let windowless_python = venv_dir.join("Scripts").join("pythonw.exe");
+        let python_exe = if windowless_python.exists() {
+            windowless_python
+        } else {
+            console_python.clone()
+        };
         if !python_exe.exists() {
             return Err(format!(
                 "מנוע הקריינות לא מותקן כראוי — python.exe לא נמצא בנתיב הצפוי ({}).",
-                python_exe.display()
+                console_python.display()
             ));
         }
 
@@ -91,19 +196,23 @@ impl NarrationServer {
             phonikud: &phonikud.to_string_lossy(),
             tokenizer: &tokenizer.to_string_lossy(),
         };
-        let args = build_server_args(&paths, "127.0.0.1", port);
+        let args = build_server_args(&paths, "127.0.0.1", port, &nonce);
 
         // Pin the child's CWD to the engine directory. Paths are absolute so
         // this is not strictly required today, but the previous engine
         // resolved its voice relative to CWD and failed in any real
         // deployment because of it — keeping this makes that class of bug
         // impossible to reintroduce.
-        let mut child = tokio::process::Command::new(&python_exe)
+        let mut command = tokio::process::Command::new(&python_exe);
+        command
             .args(&args)
             .current_dir(crate::narration_provision::get_narration_dir())
             .kill_on_drop(true) // layer (a): clean-exit teardown
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let mut child = command
             .spawn()
             .map_err(|e| format!("הפעלת מנוע הקריינות נכשלה. (פרטים טכניים: {e})"))?;
 
@@ -133,7 +242,7 @@ impl NarrationServer {
         // instead of the real cause.
         let mut attempts = 0;
         loop {
-            if health_check(&client, port).await {
+            if health_check(&client, port, &nonce).await {
                 break;
             }
             if let Ok(Some(status)) = child.try_wait() {
@@ -156,6 +265,7 @@ impl NarrationServer {
             port,
             voice_id: voice_id.to_string(),
             client,
+            nonce,
         })
     }
 
@@ -183,7 +293,7 @@ impl NarrationServer {
         text: &str,
         params: NarrationParams,
     ) -> Result<Vec<u8>, NarrationError> {
-        let first_error = match synthesize(self.client(), self.port(), text, params).await {
+        let first_error = match synthesize(self.client(), self.port(), text, params, self.nonce()).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => e,
         };
@@ -210,8 +320,14 @@ impl NarrationServer {
 
         match Self::spawn_owned(port, &voice_id, reqwest::Client::new()).await {
             Ok(restarted) => {
-                let result =
-                    synthesize(restarted.client(), restarted.port(), text, params).await;
+                let result = synthesize(
+                    restarted.client(),
+                    restarted.port(),
+                    text,
+                    params,
+                    restarted.nonce(),
+                )
+                .await;
                 *self = restarted;
                 result
             }
@@ -500,12 +616,26 @@ mod tests {
         );
     }
 
-    fn spawn_fake_healthy_sidecar() -> u16 {
+    /// A fake sidecar that mimics the real server's nonce check: 200 on a
+    /// matching `X-Narration-Nonce`, 401 on anything else (missing header,
+    /// wrong value) — exactly what `spawn_or_adopt` must be able to tell apart
+    /// as "this is provably my own process" vs. "something else is listening".
+    fn spawn_fake_healthy_sidecar(expected_nonce: &'static str) -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         std::thread::spawn(move || {
             for request in server.incoming_requests() {
-                let response = tiny_http::Response::from_data(b"{}".to_vec());
+                let sent = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Narration-Nonce"))
+                    .map(|h| h.value.as_str().to_string());
+                let response = if sent.as_deref() == Some(expected_nonce) {
+                    tiny_http::Response::from_data(b"{}".to_vec())
+                } else {
+                    tiny_http::Response::from_data(b"unauthorized".to_vec())
+                        .with_status_code(401)
+                };
                 let _ = request.respond(response);
             }
         });
@@ -513,16 +643,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_or_adopt_returns_unmanaged_when_port_already_healthy() {
-        let port = spawn_fake_healthy_sidecar();
+    async fn spawn_or_adopt_returns_unmanaged_when_the_nonce_matches() {
+        let port = spawn_fake_healthy_sidecar("correct-nonce");
 
-        let result = NarrationServer::spawn_or_adopt(port, crate::narration_provision::DEFAULT_VOICE).await;
+        let result = NarrationServer::spawn_or_adopt_with_nonce_source(
+            port,
+            crate::narration_provision::DEFAULT_VOICE,
+            Some("correct-nonce".to_string()),
+        )
+        .await;
 
         assert!(
             matches!(result, Ok(NarrationServer::Unmanaged { .. })),
-            "expected Unmanaged (adopted) when something already answers /info, got {:?}",
+            "expected Unmanaged (adopted) when the process proves it knows the nonce, got {:?}",
             result.is_ok()
         );
+    }
+
+    /// The actual security property: a process that answers 2xx to EVERY
+    /// request (never checks the nonce at all — the exact shape of "some
+    /// unrelated local process happens to be listening on this port") must
+    /// NOT be adopted just because our nonce doesn't happen to be wrong for
+    /// it. Also covers "no nonce on file yet" (fresh install) via `None`.
+    #[tokio::test]
+    async fn spawn_or_adopt_does_not_adopt_a_process_that_ignores_the_nonce() {
+        // Always answers 200, regardless of headers — a process with no idea
+        // this app's nonce concept exists, not a hostile impersonator.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let _ = request.respond(tiny_http::Response::from_data(b"{}".to_vec()));
+            }
+        });
+
+        let result = NarrationServer::spawn_or_adopt_with_nonce_source(
+            port,
+            crate::narration_provision::DEFAULT_VOICE,
+            Some("expected-nonce".to_string()),
+        )
+        .await;
+
+        // Falls through to spawn_owned, which fails fast in a test env with no
+        // provisioned engine — the important assertion is what it did NOT
+        // return: Unmanaged pointing at that unverified process.
+        assert!(
+            !matches!(result, Ok(NarrationServer::Unmanaged { .. })),
+            "must never adopt a process that doesn't present the expected nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_or_adopt_does_not_adopt_when_no_nonce_is_on_file() {
+        // A process IS healthily listening, but there's nothing to verify it
+        // against (e.g. a fresh install that never wrote a nonce file) — must
+        // not trust it just because it's there.
+        let port = spawn_fake_healthy_sidecar("whatever");
+
+        let result = NarrationServer::spawn_or_adopt_with_nonce_source(
+            port,
+            crate::narration_provision::DEFAULT_VOICE,
+            None,
+        )
+        .await;
+
+        assert!(!matches!(result, Ok(NarrationServer::Unmanaged { .. })));
     }
 
     /// `Unmanaged` failures must never trigger a respawn attempt (see the
@@ -540,7 +725,7 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let mut server = NarrationServer::Unmanaged { port: 1, client };
+        let mut server = NarrationServer::Unmanaged { port: 1, client, nonce: "test-nonce".to_string() };
 
         let result = server.synthesize_with_restart("שלום עולם", NarrationParams::default()).await;
 
@@ -551,10 +736,12 @@ mod tests {
         );
     }
 
-    /// A fake sidecar that answers `/info` healthily (so `spawn_or_adopt`
-    /// adopts it as `Unmanaged`) but fails `/synthesize` specifically —
-    /// exercises the "adopted process is alive but flaky" case.
-    fn spawn_fake_healthy_info_failing_synthesize() -> u16 {
+    /// A fake sidecar that properly nonce-checks `/info` (so `spawn_or_adopt`
+    /// can verify and adopt it as `Unmanaged` — see `is_verifiably_ours`) but
+    /// fails `/synthesize` specifically, regardless of its nonce — exercises
+    /// the "adopted process is alive but flaky" case, which is orthogonal to
+    /// nonce enforcement.
+    fn spawn_fake_healthy_info_failing_synthesize(expected_nonce: &'static str) -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         std::thread::spawn(move || {
@@ -564,7 +751,17 @@ mod tests {
                         .with_status_code(tiny_http::StatusCode(500));
                     let _ = request.respond(response);
                 } else {
-                    let response = tiny_http::Response::from_data(b"{}".to_vec());
+                    let sent = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Narration-Nonce"))
+                        .map(|h| h.value.as_str().to_string());
+                    let response = if sent.as_deref() == Some(expected_nonce) {
+                        tiny_http::Response::from_data(b"{}".to_vec())
+                    } else {
+                        tiny_http::Response::from_data(b"unauthorized".to_vec())
+                            .with_status_code(401)
+                    };
                     let _ = request.respond(response);
                 }
             }
@@ -574,10 +771,17 @@ mod tests {
 
     #[tokio::test]
     async fn synthesize_with_restart_on_adopted_process_surfaces_synthesize_failure() {
-        let port = spawn_fake_healthy_info_failing_synthesize();
+        let port = spawn_fake_healthy_info_failing_synthesize("any-nonce");
 
-        // Adopts (Unmanaged) because /info answers healthily.
-        let mut server = NarrationServer::spawn_or_adopt(port, crate::narration_provision::DEFAULT_VOICE).await.unwrap();
+        // Adopts (Unmanaged) because /info correctly nonce-checks and matches —
+        // the nonce-matching decision itself is covered by the tests above.
+        let mut server = NarrationServer::spawn_or_adopt_with_nonce_source(
+            port,
+            crate::narration_provision::DEFAULT_VOICE,
+            Some("any-nonce".to_string()),
+        )
+        .await
+        .unwrap();
         assert!(matches!(server, NarrationServer::Unmanaged { .. }));
 
         // /synthesize fails on the adopted process — must surface as an
@@ -685,7 +889,7 @@ mod tests {
             .expect("spawn_owned should succeed against a real provisioned engine");
 
         // Real proof #1: it actually generates audio, not just "the process started."
-        let audio = synthesize(server.client(), server.port(), "בדיקה", NarrationParams::default())
+        let audio = synthesize(server.client(), server.port(), "בדיקה", NarrationParams::default(), server.nonce())
             .await
             .expect("a live, healthy sidecar should synthesize real audio");
         assert!(looks_like_valid_wav(&audio));
@@ -702,7 +906,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         assert!(
-            !health_check(&client, port).await,
+            !health_check(&client, port, server.nonce()).await,
             "the sidecar should be unreachable after shutdown() — if this fails, \
              either kill_on_drop or the explicit kill() call isn't actually \
              terminating the process, which is the exact orphan bug this whole \

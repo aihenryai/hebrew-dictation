@@ -1,8 +1,125 @@
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
+
+/// A single download attempt failed. `Retryable` covers connectivity problems
+/// (connect failure, non-success status, a stream that drops mid-transfer) —
+/// the next attempt in `download_and_verify_core`'s loop resumes from where
+/// this one stopped. `Fatal` covers content/config problems retrying can't
+/// fix (response bigger than the size tolerance allows, local disk I/O) —
+/// the caller must not retry and must clean up the partial `.tmp` file.
+enum DownloadFailure {
+    Retryable(String),
+    Fatal(String),
+}
+
+/// Automatic retry ceiling for a single `download_and_verify_core` call. Each
+/// retry resumes via HTTP `Range` from the bytes already on disk rather than
+/// starting over — a dropped connection at 90% used to delete the `.tmp` file
+/// and force the user to click "download" again from zero; now up to 3 more
+/// attempts happen automatically, and only genuinely exhausted retries (or a
+/// server that doesn't support `Range` at all) fall back to a full restart.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
+
+/// One HTTP attempt of the streaming download, appending to (or, on a fresh
+/// attempt / a server that ignores `Range`, (re)creating) `tmp_path`.
+/// `downloaded`/`hasher` carry state across attempts within the same
+/// `download_and_verify_core` call — on a clean resume the hasher already
+/// reflects every byte written by earlier attempts, so only the new bytes
+/// from this attempt get hashed here.
+async fn download_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    tmp_path: &Path,
+    expected_size: u64,
+    component_label: &str,
+    downloaded: &mut u64,
+    hasher: &mut Sha256,
+    on_progress: &mut impl FnMut(u64, u64),
+) -> Result<(), DownloadFailure> {
+    let resume_from = *downloaded;
+    let mut request = client.get(url);
+    if resume_from > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+    }
+    let response = request.send().await.map_err(|e| {
+        DownloadFailure::Retryable(format!(
+            "הורדת {component_label} נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})"
+        ))
+    })?;
+
+    // A server that doesn't support Range answers 200 (full content) instead
+    // of 206 — fall back to a clean restart rather than corrupting the file
+    // by appending a second copy of the start on top of the partial one.
+    let resumed = resume_from > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if resume_from > 0 && !resumed {
+        *downloaded = 0;
+        *hasher = Sha256::new();
+    }
+
+    if !response.status().is_success() {
+        return Err(DownloadFailure::Retryable(format!(
+            "{component_label}: שגיאת שרת {} — בדוק את כתובת ההורדה. (URL: {})",
+            response.status(),
+            url
+        )));
+    }
+
+    // A resumed response's Content-Length is the REMAINING bytes, not the
+    // total file size — report the known total instead so the progress bar
+    // doesn't jump backward.
+    let total_size = if resumed {
+        expected_size
+    } else {
+        response.content_length().unwrap_or(expected_size)
+    };
+
+    let mut file = if resumed {
+        tokio::fs::OpenOptions::new().append(true).open(tmp_path).await
+    } else {
+        tokio::fs::File::create(tmp_path).await
+    }
+    .map_err(|e| {
+        DownloadFailure::Fatal(format!(
+            "יצירת קובץ זמני עבור {component_label} נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"
+        ))
+    })?;
+
+    let mut stream = response.bytes_stream();
+    let max_size = expected_size + (expected_size / 10); // 10% tolerance, same as the original
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            DownloadFailure::Retryable(format!(
+                "ההורדה של {component_label} נקטעה — בדוק את החיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})"
+            ))
+        })?;
+
+        *downloaded += chunk.len() as u64;
+
+        if *downloaded > max_size {
+            return Err(DownloadFailure::Fatal(
+                "ההורדה חרגה מהגודל הצפוי — בוטלה לצורך אבטחה. נסה שוב.".to_string(),
+            ));
+        }
+
+        hasher.update(&chunk);
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| {
+                DownloadFailure::Fatal(format!(
+                    "כתיבה לדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"
+                ))
+            })?;
+
+        on_progress(*downloaded, total_size);
+    }
+
+    Ok(())
+}
 
 /// Core download+verify: no Tauri dependency, so it's directly unit-testable.
 /// Downloads `url` to `dest_path` via an atomic temp-file-then-rename, verifying
@@ -29,22 +146,9 @@ async fn download_and_verify_core(
     // Connect timeout only — body/read is intentionally unbounded, since large
     // model downloads legitimately take a long time once the connection is up.
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default();
-    let response = client.get(url).send().await.map_err(|e| {
-        format!("הורדת {component_label} נכשלה — בדוק שיש חיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
-    })?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "{component_label}: שגיאת שרת {} — בדוק את כתובת ההורדה. (URL: {})",
-            response.status(),
-            url
-        ));
-    }
-
-    let total_size = response.content_length().unwrap_or(expected_size);
 
     // Append ".tmp" to the whole filename rather than replacing the extension
     // (the original whisper-only code did `.with_extension("bin.tmp")`, which
@@ -54,35 +158,48 @@ async fn download_and_verify_core(
     tmp_name.push(".tmp");
     let tmp_path = PathBuf::from(tmp_name);
 
-    let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-        format!("יצירת קובץ זמני עבור {component_label} נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})")
-    })?;
-
     let mut downloaded: u64 = 0;
     let mut hasher = Sha256::new();
-    let mut stream = response.bytes_stream();
-    let max_size = expected_size + (expected_size / 10); // 10% tolerance, same as the original
+    let mut last_err: Option<String> = None;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            format!("ההורדה של {component_label} נקטעה — בדוק את החיבור לאינטרנט ונסה שוב. (פרטים טכניים: {e})")
-        })?;
-
-        downloaded += chunk.len() as u64;
-
-        if downloaded > max_size {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(format!(
-                "ההורדה של {component_label} חרגה מהגודל הצפוי — בוטלה לצורך אבטחה. נסה שוב."
-            ));
+    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        match download_attempt(
+            &client,
+            url,
+            &tmp_path,
+            expected_size,
+            component_label,
+            &mut downloaded,
+            &mut hasher,
+            &mut on_progress,
+        )
+        .await
+        {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(DownloadFailure::Fatal(msg)) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(msg);
+            }
+            Err(DownloadFailure::Retryable(msg)) => {
+                last_err = Some(msg);
+                if attempt < MAX_DOWNLOAD_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
         }
+    }
 
-        hasher.update(&chunk);
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| format!("כתיבה לדיסק נכשלה. בדוק שיש מקום פנוי. (פרטים טכניים: {e})"))?;
-
-        on_progress(downloaded, total_size);
+    if let Some(msg) = last_err {
+        // All in-call retries exhausted (a longer outage than the ~6s of total
+        // backoff covers). A future manual re-click starts a brand new call to
+        // this function, whose first attempt always truncates the file anyway
+        // (`resume_from` starts at 0), so there is nothing worth keeping here —
+        // clean up, same as before this change.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(format!("{msg} (בוצעו {MAX_DOWNLOAD_ATTEMPTS} ניסיונות)"));
     }
 
     let hash_result = format!("{:x}", hasher.finalize());
@@ -348,6 +465,30 @@ mod tests {
         port
     }
 
+    // Fails the first `fail_count` requests with 503 (simulating a dropped
+    // connection / transient server error), then serves `body` normally —
+    // exercises the automatic-retry path added for P7 ("a dropped connection
+    // used to delete the .tmp file and force a manual re-click").
+    fn spawn_flaky_then_ok_server(body: Vec<u8>, fail_count: usize) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            let mut seen = 0usize;
+            for request in server.incoming_requests() {
+                if seen < fail_count {
+                    seen += 1;
+                    let response = tiny_http::Response::from_string("service unavailable")
+                        .with_status_code(503);
+                    let _ = request.respond(response);
+                } else {
+                    let response = tiny_http::Response::from_data(body.clone());
+                    let _ = request.respond(response);
+                }
+            }
+        });
+        port
+    }
+
     #[tokio::test]
     async fn download_and_verify_core_writes_file_on_hash_match() {
         let body = b"pretend this is a downloaded file".to_vec();
@@ -427,6 +568,67 @@ mod tests {
         assert!(!dest.exists());
         let tmp_path = dest.with_file_name("downloaded.bin.tmp");
         assert!(!tmp_path.exists(), "temp file must be cleaned up after an oversize abort");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_retries_a_transient_failure_and_succeeds() {
+        let body = b"pretend this is a downloaded file, but the server is flaky today".to_vec();
+        let expected_hash = format!("{:x}", Sha256::digest(&body));
+        // Fails fewer times than MAX_DOWNLOAD_ATTEMPTS allows — must still succeed.
+        let port = spawn_flaky_then_ok_server(body.clone(), 2);
+
+        let tmp_dir = std::env::temp_dir().join(format!("model-test-flaky-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            body.len() as u64,
+            &expected_hash,
+            "קובץ בדיקה",
+            |_, _| {},
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected eventual success, got {result:?}");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_core_fails_after_exhausting_all_retries() {
+        let body = b"never actually served".to_vec();
+        // Fails MORE times than MAX_DOWNLOAD_ATTEMPTS allows — must give up and
+        // clean up, not hang or loop forever.
+        let port = spawn_flaky_then_ok_server(body, MAX_DOWNLOAD_ATTEMPTS as usize + 5);
+
+        let tmp_dir = std::env::temp_dir().join(format!("model-test-exhausted-{}", port));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dest = tmp_dir.join("downloaded.bin");
+
+        let result = download_and_verify_core(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            10,
+            "irrelevant",
+            "קובץ בדיקה",
+            |_, _| {},
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains(&MAX_DOWNLOAD_ATTEMPTS.to_string()),
+            "error should report how many attempts were made: {err}"
+        );
+        assert!(!dest.exists());
+        let tmp_path = dest.with_file_name("downloaded.bin.tmp");
+        assert!(!tmp_path.exists(), "temp file must be cleaned up once retries are exhausted");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

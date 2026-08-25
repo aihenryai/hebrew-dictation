@@ -9,6 +9,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
+#[cfg(target_os = "windows")]
+use crate::narration_process::CREATE_NO_WINDOW;
+/// Needed for `.creation_flags()` on the blocking `std::process::Command`;
+/// `tokio::process::Command` exposes its own inherent method on Windows.
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 /// Pinned `uv` release facts (verified against github.com/astral-sh/uv/releases).
 /// Bump deliberately, not casually — a new `uv` version changes the exact
 /// bytes this hash-checks.
@@ -129,15 +136,18 @@ pub async fn ensure_uv_available<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -
     let zip_path_for_blocking = zip_path.clone();
     let extract_dir_for_blocking = extract_dir.clone();
     let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Expand-Archive -LiteralPath $env:HD_UV_ZIP -DestinationPath $env:HD_UV_DIR -Force",
-            ])
-            .env("HD_UV_ZIP", &zip_path_for_blocking)
-            .env("HD_UV_DIR", &extract_dir_for_blocking)
-            .status()
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            "Expand-Archive -LiteralPath $env:HD_UV_ZIP -DestinationPath $env:HD_UV_DIR -Force",
+        ])
+        .env("HD_UV_ZIP", &zip_path_for_blocking)
+        .env("HD_UV_DIR", &extract_dir_for_blocking);
+        // Otherwise a PowerShell console window flashes over the installer UI.
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.status()
     })
     .await
     .map_err(|e| format!("חילוץ מנוע הקריינות נכשל להתחיל (task panic). (פרטים טכניים: {e})"))?
@@ -185,12 +195,28 @@ const MARKER_VERSION: u32 = 2;
 /// Python packages the sidecar imports. `piper-tts` is deliberately gone: we
 /// run our own server and inference now, so its dependency tree (including
 /// espeak-ng) is no longer installed.
+///
+/// All five pinned to exact versions — until this, 4 of 5 were left
+/// unpinned while every OTHER artifact this module fetches (uv itself, the
+/// voice, the diacritizer) is SHA-256-verified. An unpinned `pip install`
+/// silently picks up whatever the next release of a small, low-profile
+/// package happens to be — a real supply-chain gap for `phonikud`/
+/// `phonikud-onnx` specifically, which are exactly the kind of niche package
+/// a typosquat or a compromised maintainer account targets.
+///
+/// `numpy` is pinned to 2.4.6, NOT numpy's own latest (2.5.2 at the time of
+/// writing) — 2.5.x ships wheels for cp312+ only, no cp311, and this venv is
+/// created with `--python 3.11` (see `provision_venv`). Pinning to a version
+/// with no matching wheel would force a from-source build with no C
+/// toolchain guaranteed on the user's machine, i.e. would break provisioning
+/// outright. Re-verify wheel availability for the target Python version
+/// before ever bumping this, not just "is it the newest release".
 const PIP_PACKAGES: [&str; 5] = [
     "onnxruntime==1.28.0",
-    "numpy",
-    "phonikud",
-    "phonikud-onnx",
-    "tokenizers",
+    "numpy==2.4.6",
+    "phonikud==0.4.1",
+    "phonikud-onnx==1.0.6",
+    "tokenizers==0.23.1",
 ];
 
 /// A selectable narration voice. All are VITS models trained on Phonikud's
@@ -320,6 +346,13 @@ pub fn get_server_script_path() -> PathBuf {
     get_narration_dir().join("narration_server.py")
 }
 
+/// Where the CURRENT sidecar's nonce lives — see `narration_process::spawn_owned`
+/// (writes it on every spawn) and `spawn_or_adopt` (reads it to decide whether a
+/// process already listening on the port is verifiably ours before trusting it).
+pub fn get_nonce_path() -> PathBuf {
+    get_narration_dir().join("current_nonce")
+}
+
 fn get_marker_path() -> PathBuf {
     get_narration_dir().join("engine.json")
 }
@@ -431,6 +464,55 @@ fn provision_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Minimum free space required to START provisioning. The final install is
+/// ~695MB (measured, see HANDOFF.md), but that number is the STEADY STATE —
+/// mid-provisioning also briefly holds the `uv` zip, the managed Python
+/// download, and pip's wheel cache alongside the unpacked venv, so this asks
+/// for meaningfully more headroom than the final footprint alone.
+const MIN_FREE_SPACE_BYTES: u64 = 1_200 * 1024 * 1024; // 1200MB
+
+/// Fails fast, before any download starts, if the drive holding app-data
+/// doesn't have room for the engine. Without this, a low-disk machine burns
+/// however much of the ~600MB it can fetch before failing deep inside a
+/// download or extraction step, with an error naming THAT step rather than
+/// the actual cause — the same "close programs to free memory"-style
+/// confusion the whisper model loader's error text was written to avoid.
+fn check_disk_space() -> Result<(), String> {
+    let dir = get_narration_dir();
+    // The directory may not exist yet on a first-ever install — walk up to
+    // the nearest existing ancestor so the disk lookup still finds a mount
+    // point instead of silently checking nothing.
+    let mut probe = dir.as_path();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => return Ok(()), // nothing on this system resolves — don't block on a check we can't perform
+        }
+    }
+
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let available = disks
+        .iter()
+        .filter(|d| probe.starts_with(d.mount_point()))
+        // Longest matching mount point wins (e.g. a drive mounted inside
+        // another drive) — shortest-first iteration order isn't guaranteed.
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space());
+
+    match available {
+        Some(bytes) if bytes < MIN_FREE_SPACE_BYTES => Err(format!(
+            "אין מספיק שטח פנוי בדיסק להתקנת מנוע הקריינות. פנוי: {}MB, נדרש לפחות {}MB.",
+            bytes / 1024 / 1024,
+            MIN_FREE_SPACE_BYTES / 1024 / 1024
+        )),
+        // No matching disk found (unusual mount setup) — don't block
+        // provisioning on a check that couldn't resolve; the download/extract
+        // steps still fail with their own honest errors if space really is
+        // the problem.
+        _ => Ok(()),
+    }
+}
+
 pub async fn provision_narration_engine<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<(), String> {
@@ -457,6 +539,8 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
                 .to_string(),
         );
     }
+
+    check_disk_space()?;
 
     emit_stage(app, 1, "מוריד את מנהל הסביבה");
     let uv_exe = ensure_uv_available(app).await?;
@@ -513,6 +597,9 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
             "--clear",
         ])
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
+    // uv is a console program; without this it gets its own visible window.
+    #[cfg(target_os = "windows")]
+    venv_cmd.creation_flags(CREATE_NO_WINDOW);
     let venv_output = match tokio::time::timeout(Duration::from_secs(300), venv_cmd.output()).await {
         Err(_) => {
             return Err(
@@ -541,6 +628,8 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         .args(["pip", "install", "--python", &venv_dir.to_string_lossy()])
         .args(PIP_PACKAGES)
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
+    #[cfg(target_os = "windows")]
+    pip_cmd.creation_flags(CREATE_NO_WINDOW);
     let pip_output = match tokio::time::timeout(Duration::from_secs(600), pip_cmd.output()).await {
         Err(_) => {
             return Err(
@@ -653,6 +742,15 @@ mod tests {
     fn narration_dir_is_under_app_data_narration_subfolder() {
         let dir = get_narration_dir();
         assert!(dir.ends_with(Path::new("hebrew-dictation").join("narration")));
+    }
+
+    /// A real-environment smoke test: whatever CI/dev machine runs this has
+    /// nowhere near a 1.2GB-free disk being the reason a test fails, so this
+    /// mainly proves the mount-point resolution and disk lookup don't panic
+    /// or return a false positive against a real filesystem.
+    #[test]
+    fn check_disk_space_passes_on_a_normal_dev_machine() {
+        assert!(check_disk_space().is_ok());
     }
 
     /// Deleting a directory that is already gone is the SUCCESS case, not a

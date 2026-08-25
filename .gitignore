@@ -48,3 +48,4 @@ Thumbs.db
 
 # Build artifacts (release zips packaged at repo root, e.g. v2_8_1.zip)
 /*.zip
+__pycache__/

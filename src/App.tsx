@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { check, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
@@ -9,6 +10,17 @@ import "./App.css";
 /* ----------- אפליקציה: קבועים ----------- */
 const APP_VERSION = "v2.11.0";
 const APP_LICENSE = "MIT";
+
+// Main window's steady-state size — must match `tauri.conf.json`'s `main`
+// window. The onboarding wizard temporarily grows past this (see the
+// view-driven resize effect below); every other view was designed for it.
+const MAIN_WINDOW_SIZE = { width: 300, height: 260 };
+// The wizard's 3rd step (engine choice: 3 cards, each with a header,
+// description, bullet facts and — once selected — a numbered guide, key
+// input and test button) does not fit in 300×260 without becoming 8-10
+// screens of scroll with no scroll affordance. This is comfortably enough
+// for that step while still being a small, unobtrusive utility window.
+const ONBOARDING_WINDOW_SIZE = { width: 480, height: 640 };
 
 // System-audio capture (WASAPI loopback) is Windows-only, so System/Call are
 // hidden off-Windows — non-Windows users only ever see Mic (zero regression).
@@ -405,10 +417,62 @@ function playStopTone() {
   setTimeout(() => playTone(550, 0.10), 70); // C#5
 }
 
+/**
+ * Persist a settings correction discovered while loading `get_settings` in `initApp`,
+ * BEFORE the loaded values have been written into React state. `persistSettings` (the
+ * component-scoped helper below) reads its object from React state, so calling it from
+ * inside `initApp` would serialize the pre-load defaults for every field except the one
+ * override — silently wiping the user's real settings back to factory values. This
+ * variant builds the full object from the just-fetched `base` instead of from state.
+ */
+async function persistLoadedSettings(base: RedactedSettings, overrides: Partial<AppSettings> = {}) {
+  const settings: AppSettings = {
+    transcription_mode: base.transcription_mode,
+    api_provider: base.api_provider,
+    preferred_model: base.preferred_model,
+    language: base.language,
+    vad_enabled: base.vad_enabled,
+    always_on_top: base.always_on_top,
+    autostart_enabled: base.autostart_enabled,
+    streaming_enabled: base.streaming_enabled,
+    floating_toolbar_enabled: base.floating_toolbar_enabled,
+    hotkey: base.hotkey,
+    pause_hotkey: base.pause_hotkey,
+    vad_silence_secs: base.vad_silence_secs,
+    max_recording_secs: base.max_recording_secs,
+    unlimited_recording: base.unlimited_recording,
+    preferred_audio_device: base.preferred_audio_device,
+    audio_feedback_enabled: base.audio_feedback_enabled,
+    idle_button_enabled: base.idle_button_enabled,
+    audio_volume: base.audio_volume,
+    enhance_enabled: base.enhance_enabled,
+    ...overrides,
+  };
+  try {
+    await invoke("update_settings", { newSettings: settings });
+  } catch (e) {
+    console.error("persistLoadedSettings failed:", e);
+  }
+}
+
 let historyIdCounter = 0;
 function App() {
   const [status, setStatus] = useState<AppStatus>("idle");
   const [view, setView] = useState<AppView>("main");
+  // Grow the main window for the onboarding wizard, and shrink it back to the
+  // steady-state size on the way out — see MAIN_WINDOW_SIZE/ONBOARDING_WINDOW_SIZE.
+  // The main window is `resizable: true` (tauri.conf.json), so this is a plain
+  // runtime resize, not a config change to the app's normal footprint.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const target = view === "onboarding" ? ONBOARDING_WINDOW_SIZE : MAIN_WINDOW_SIZE;
+    win.setSize(new LogicalSize(target.width, target.height)).catch((e) =>
+      console.error("window resize failed:", e)
+    );
+    if (view === "onboarding") {
+      win.center().catch(() => {});
+    }
+  }, [view]);
   // Which view "חזור" from settings returns to — so settings opened from the batch
   // screen returns there, not to main. Each settings entry point sets it.
   const [settingsReturn, setSettingsReturn] = useState<AppView>("main");
@@ -550,6 +614,11 @@ function App() {
   const transcriptionModeRef = useRef(transcriptionMode);
   const streamingEnabledRef = useRef(streamingEnabled);
   const liveFinalRef = useRef("");
+  // Mirrors `canRecord` (computed further down, after whisperLoaded/apiKeyConfigured
+  // exist) for the hotkey handler below, which is declared earlier in the component
+  // and needs a fresh read without re-subscribing the Tauri event listener on every
+  // key/model status change.
+  const canRecordRef = useRef(false);
 
   useEffect(() => { statusRef.current = status; }, [status]);
   useEffect(() => { batchRecordingRef.current = batchRecording; }, [batchRecording]);
@@ -557,6 +626,16 @@ function App() {
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { transcriptionModeRef.current = transcriptionMode; }, [transcriptionMode]);
   useEffect(() => { streamingEnabledRef.current = streamingEnabled; }, [streamingEnabled]);
+  // Streaming (the Deepgram live websocket) must never engage in local mode — local
+  // mode promises no cloud calls, and a stuck `streaming_enabled` flag (e.g. left over
+  // from a provider switch that never cleared it, see the initApp self-heal below) would
+  // otherwise silently break every local dictation with a "Deepgram key not configured"
+  // error instead of using whisper-rs. beginRecording and stopAndTranscribe both call
+  // this — not just streamingEnabledRef directly — so they can never disagree about
+  // which path a given recording actually used.
+  const isStreamingSession = useCallback(() => {
+    return streamingEnabledRef.current && transcriptionModeRef.current !== "local";
+  }, []);
   const audioFeedbackEnabledRef = useRef(audioFeedbackEnabled);
   useEffect(() => { audioFeedbackEnabledRef.current = audioFeedbackEnabled; }, [audioFeedbackEnabled]);
   const enhanceEnabledRef = useRef(enhanceEnabled);
@@ -616,10 +695,11 @@ function App() {
     // toolbar button (the user is looking at the app); on Alt+D from another app
     // we hide the bar without stealing focus. The main window's status carries
     // the wait either way.
-    await invoke("hide_toolbar_window", { forceShowMain: fromToolbar }).catch(() => {});
+    await invoke("hide_toolbar_window", { forceShowMain: fromToolbar })
+      .catch((e) => console.error("hide_toolbar_window failed:", e));
 
     try {
-      if (streamingEnabledRef.current) {
+      if (isStreamingSession()) {
         // Streaming mode: each final segment was injected incrementally via
         // the streaming receive task (live dictation). The accumulated text is
         // returned here only for UI display (editable transcript + history).
@@ -670,7 +750,7 @@ function App() {
     // Toolbar was already hidden at the top of this function (snappy on every path).
     setStatus("idle");
     setRecordingTime(0);
-  }, [stopVadPolling, stopTimer, injectText]);
+  }, [stopVadPolling, stopTimer, injectText, isStreamingSession]);
 
 
   // Start recording helper — sets always-on-top
@@ -679,7 +759,8 @@ function App() {
     try {
       await invoke("set_vad_enabled", { enabled: vadEnabledRef.current });
       await invoke("set_max_recording_secs", { secs: getMaxRecordingSecs() });
-      if (streamingEnabledRef.current) {
+      const streamingSession = isStreamingSession();
+      if (streamingSession) {
         setLivePreview("");
         liveFinalRef.current = "";
         await invoke("start_streaming_transcription", { language: languageRef.current });
@@ -690,8 +771,9 @@ function App() {
       if (audioFeedbackEnabledRef.current) playStartTone();
       // Only swap to the toolbar once the backend accepted the start — avoids
       // leaving the main window hidden behind a toolbar if start_* fails.
-      await emit("toolbar-reset").catch(() => {});
-      await invoke("show_toolbar_window", { streaming: streamingEnabledRef.current }).catch(() => {});
+      await emit("toolbar-reset").catch((e) => console.error("toolbar-reset emit failed:", e));
+      await invoke("show_toolbar_window", { streaming: streamingSession })
+        .catch((e) => console.error("show_toolbar_window failed:", e));
       setStatus("recording");
       setRecordingTime(0);
       timerRef.current = window.setInterval(() => {
@@ -711,7 +793,7 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, [stopAndTranscribe]);
+  }, [stopAndTranscribe, isStreamingSession]);
 
   // Hotkey handler
   useEffect(() => {
@@ -725,12 +807,24 @@ function App() {
       if (currentStatus === "recording") {
         stopAndTranscribe(fromToolbar);
       } else if (currentStatus === "idle") {
+        if (!canRecordRef.current) {
+          // No API key and no downloaded model — beginRecording would otherwise fail
+          // deep inside a Tauri invoke, and setError writes into a window the user
+          // can't see (the app is normally closed to tray). Surface the real window
+          // with a clear message instead of a silent no-op.
+          setError("לא הוגדר מנוע תמלול — הגדר מפתח API או הורד מודל מקומי בהגדרות.");
+          await invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
+          return;
+        }
         await beginRecording();
-      } else if (currentStatus === "transcribing" && fromToolbar) {
-        // Race condition: VAD/timeout auto-stopped recording the same instant
-        // the user clicked Stop on the toolbar. Status is already "transcribing"
-        // and the toolbar would otherwise stay visible because the listener used
-        // to no-op here. Force the toolbar away and surface the main window.
+      } else {
+        // Busy (transcribing / enhancing / downloading / loading-model). There is
+        // nothing to start or stop here, but the app is normally closed to tray —
+        // without this, a press landing here is a silent dead key with zero
+        // feedback (this also covers the VAD/timeout auto-stop race with a toolbar
+        // click that used to be handled only for "transcribing"). Surface the main
+        // window so the user sees the in-progress status instead of concluding the
+        // hotkey "just doesn't work".
         await invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
       }
     });
@@ -916,7 +1010,13 @@ function App() {
       const lang = (settings.language === "auto" ? "he" : settings.language) as Language;
       setLanguage(lang);
       if (settings.language === "auto") {
-        persistSettings({ language: "he" });
+        // Was `persistSettings({ language: "he" })` — but persistSettings reads its
+        // object from React state, and at this point in initApp the state setters
+        // above haven't been applied yet (they're batched, not synchronous). That
+        // wrote factory defaults over every OTHER field the user had configured.
+        // persistLoadedSettings builds the full object from `settings` (what was
+        // actually just loaded) instead of from stale state.
+        persistLoadedSettings(settings, { language: "he" });
       }
       setVadEnabled(settings.vad_enabled);
       // Keys are redacted — just track whether they exist on the backend.
@@ -926,10 +1026,17 @@ function App() {
       if (typeof settings.always_on_top === "boolean") setAlwaysOnTop(settings.always_on_top);
       if (typeof settings.autostart_enabled === "boolean") setAutostartEnabled(settings.autostart_enabled);
       if (typeof settings.streaming_enabled === "boolean") {
-        const streamingStale = settings.streaming_enabled && settings.api_provider !== "deepgram";
+        // Stale if streaming was left on for a provider/mode that can no longer use
+        // it — either the API provider isn't Deepgram, or the user is in local mode
+        // (which must never open a Deepgram socket at all). beginRecording/
+        // stopAndTranscribe also guard against this independently via
+        // isStreamingSession(), so a stuck flag here can no longer break dictation —
+        // this just keeps the persisted setting honest.
+        const streamingStale = settings.streaming_enabled &&
+          (settings.api_provider !== "deepgram" || settings.transcription_mode === "local");
         setStreamingEnabled(streamingStale ? false : settings.streaming_enabled);
         if (streamingStale) {
-          invoke("update_settings", { patch: { streaming_enabled: false } }).catch(() => {});
+          persistLoadedSettings(settings, { streaming_enabled: false });
         }
       }
       if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
@@ -1618,6 +1725,7 @@ function App() {
   const activeApiKey = apiProvider === "groq" ? groqKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
+  useEffect(() => { canRecordRef.current = canRecord; }, [canRecord]);
   const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית" };
   const modeLabel = transcriptionMode === "api" ? "API" : transcriptionMode === "local" ? "מקומי" : "אוטומטי";
 
@@ -1683,7 +1791,12 @@ function App() {
         overrides.streaming_enabled = false;
       } else if (wizardChoice === "local") {
         setTranscriptionMode("local");
+        // Local mode must never leave streaming on — it would otherwise open a
+        // Deepgram websocket with no key configured, and beginRecording would fail
+        // on every dictation with a Deepgram error the user never asked for.
+        setStreamingEnabled(false);
         overrides.transcription_mode = "local";
+        overrides.streaming_enabled = false;
       }
 
       // ALWAYS persist onboarding_completed=true — even if setApiKey above
@@ -1985,7 +2098,36 @@ function App() {
               ) : wizardChoice === "groq" && wizardApiKey ? (
                 <p className="wizard-success">Groq מוגדר — תמלול מהיר וזול</p>
               ) : wizardChoice === "local" ? (
-                <p className="wizard-note">מצב מקומי — הורד מודל בהגדרות כדי להתחיל</p>
+                (() => {
+                  // Until this fix, the wizard's local branch left the user with a
+                  // disabled record button and a single line of text — the model
+                  // download itself only happened, if ever, from a separate trip to
+                  // Settings. Offer it right here, reusing the same download command
+                  // and progress state the settings screen uses.
+                  const smallModel = models.find((m) => m.name === "small");
+                  if (smallModel?.downloaded) {
+                    return <p className="wizard-success">מודל תמלול מקומי מותקן — מוכן להכתבה.</p>;
+                  }
+                  if (status === "downloading" && downloadingModel === "small") {
+                    return (
+                      <div className="wizard-note">
+                        <p>מוריד מודל תמלול... {downloadProgress}%</p>
+                        <div className="progress-bar"><div className="progress-fill" style={{ width: `${downloadProgress}%` }} /></div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="wizard-note">
+                      <p>מצב מקומי דורש מודל תמלול על המחשב — הורדה חד-פעמית.</p>
+                      <button
+                        className="btn-primary btn-small"
+                        onClick={() => handleDownloadModel("small")}
+                      >
+                        הורד עכשיו{smallModel ? ` (${smallModel.size_label})` : ""}
+                      </button>
+                    </div>
+                  );
+                })()
               ) : (
                 <p className="wizard-note">הגדר מפתח API או הורד מודל בהגדרות</p>
               )}
@@ -2065,7 +2207,18 @@ function App() {
               <button
                 key={mode}
                 className={`btn-option btn-option-stack ${transcriptionMode === mode ? "active" : ""}`}
-                onClick={() => { setTranscriptionMode(mode); persistSettings({ transcription_mode: mode }); }}
+                onClick={() => {
+                  setTranscriptionMode(mode);
+                  // Local mode must never leave streaming on (see the wizard's local
+                  // branch for why) — clear it here too so switching mode mid-session
+                  // doesn't leave a stale streaming_enabled behind.
+                  const overrides: Partial<AppSettings> = { transcription_mode: mode };
+                  if (mode === "local" && streamingEnabled) {
+                    setStreamingEnabled(false);
+                    overrides.streaming_enabled = false;
+                  }
+                  persistSettings(overrides);
+                }}
                 title={sub}
               >
                 <span className="btn-option-label">{label}</span>
@@ -2445,8 +2598,11 @@ function App() {
                 persistSettings({ always_on_top: v });
               }}
             />
-            <span className="toggle-text">הצג את חלון ההקלטה מעל כל התוכנות (כדי לראות סטטוס)</span>
+            <span className="toggle-text">הצג את החלון הראשי מעל כל התוכנות</span>
           </label>
+          <p className="settings-hint">
+            הפס הצף בזמן הקלטה נשאר תמיד מעל כל התוכנות בלי קשר להגדרה הזו — אחרת אי אפשר לראות שההקלטה פעילה.
+          </p>
         </div>
 
         {/* Floating toolbar */}
@@ -3108,7 +3264,19 @@ function App() {
           </button>
         </div>
 
-        {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
+        {/* narration_provision.rs embeds raw uv/pip stderr after a "\n" on a
+            provisioning failure — the only error text in the app that isn't a
+            single Hebrew sentence. Rendering it inline used to dump Latin
+            command output into a narrow RTL box, unreadable. Split it into
+            the Hebrew summary line plus an explicit dir="ltr" detail block. */}
+        {error && (
+          <div className="error" onClick={() => setError("")}>
+            <p>❌ {error.split("\n")[0]}</p>
+            {error.includes("\n") && (
+              <pre className="error-detail" dir="ltr">{error.split("\n").slice(1).join("\n")}</pre>
+            )}
+          </div>
+        )}
 
         {/* Rendered here, OUTSIDE the narrationReady branch below, on purpose:
             a successful delete flips narrationReady to false in the same
@@ -3601,6 +3769,13 @@ export function ToolbarApp() {
   // Pending single-click timer — lets us tell a single click (start dictation)
   // from a double click (open the full window).
   const idleClickTimerRef = useRef<number | null>(null);
+  // Pending handleStop() fallback-hide timer (see handleStop below). Cancelled
+  // by the "toolbar-reset" listener when a NEW recording starts in the same
+  // window — otherwise a fast re-trigger (quick re-press, VAD auto-stop
+  // immediately followed by a new dictation) races the old stop's delayed
+  // hide, which fires after the fresh bar is already showing and yanks it
+  // away — the "toolbar sometimes doesn't appear" report.
+  const stopFallbackTimerRef = useRef<number | null>(null);
 
   // Mount-time mode detection. The backend emits `toolbar-mode` when it shows
   // the window, but on a cold autostart-minimized launch that emit can fire
@@ -3619,6 +3794,9 @@ export function ToolbarApp() {
     return () => {
       if (idleClickTimerRef.current !== null) {
         window.clearTimeout(idleClickTimerRef.current);
+      }
+      if (stopFallbackTimerRef.current !== null) {
+        window.clearTimeout(stopFallbackTimerRef.current);
       }
     };
   }, []);
@@ -3643,6 +3821,13 @@ export function ToolbarApp() {
       setLivePreview("");
       setPaused(false);
       setAudioLevel(0);
+      // A new recording just started — any fallback-hide timer left over from
+      // a previous handleStop() is now stale and would hide THIS session's bar
+      // instead of the one it was meant for. See stopFallbackTimerRef above.
+      if (stopFallbackTimerRef.current !== null) {
+        window.clearTimeout(stopFallbackTimerRef.current);
+        stopFallbackTimerRef.current = null;
+      }
     });
     const unlistenLevel = listen<number>("audio-level", (event) => {
       setAudioLevel(event.payload);
@@ -3691,7 +3876,11 @@ export function ToolbarApp() {
     //    paths), the toolbar would have stayed visible forever. Force-hide it
     //    after a short window. If main already handled the click, this call
     //    is a no-op (window is already hidden).
-    setTimeout(() => {
+    if (stopFallbackTimerRef.current !== null) {
+      window.clearTimeout(stopFallbackTimerRef.current);
+    }
+    stopFallbackTimerRef.current = window.setTimeout(() => {
+      stopFallbackTimerRef.current = null;
       invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
     }, 400);
   }, []);

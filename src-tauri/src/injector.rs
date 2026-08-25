@@ -28,7 +28,7 @@ fn accessibility_permission_hint() -> &'static str {
 /// because `GetKeyState` returns negative values while any modifier is held. Typing the
 /// characters as Unicode WM_CHAR events bypasses the modifier path entirely and works in
 /// every text field we target (chat inputs, text editors, browsers).
-pub fn inject_text(text: &str, _method: &InjectionMethod) -> Result<(), String> {
+pub fn inject_text(text: &str) -> Result<(), String> {
     // On macOS, keystroke injection is silently dropped without Accessibility
     // permission — bail out with guidance instead of typing nothing.
     #[cfg(target_os = "macos")]
@@ -44,10 +44,6 @@ pub fn inject_text(text: &str, _method: &InjectionMethod) -> Result<(), String> 
         .text(text)
         .map_err(|e| format!("Text input error: {}", e))?;
     Ok(())
-}
-
-pub enum InjectionMethod {
-    Clipboard,
 }
 
 #[cfg(test)]

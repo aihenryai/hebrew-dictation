@@ -1,6 +1,6 @@
 [package]
 name = "hebrew-dictation"
-version = "2.12.1"
+version = "2.13.0"
 description = "הכתבה בעברית — Hebrew Voice Dictation by BinTech AI"
 authors = ["Henry Stauber <henrystauber22@gmail.com>"]
 edition = "2021"
@@ -27,7 +27,6 @@ reqwest = { version = "0.12", features = ["stream", "multipart", "json"] }
 futures-util = "0.3"
 dirs = "6"
 whisper-rs = "0.16"
-arboard = "3"
 sysinfo = "0.33"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 url = "2"

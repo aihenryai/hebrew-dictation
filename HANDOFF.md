@@ -4,6 +4,208 @@
 
 ---
 
+## 🔧 2026-08-25 (later) — narration playback + terminal window — UNCOMMITTED
+
+Three reports from Henry about the narration screen. All three resolved.
+
+### 1. Play button dead on every generated clip (`0:00 / 0:00`, greyed out)
+
+Root cause: `src-tauri/tauri.conf.json` -> `app.security.csp` had **no `media-src`
+directive**. CSP falls `media-src` back to `default-src`, which was `'self'` — and `'self'`
+does not cover `blob:`. `App.tsx` feeds `<audio src>` from `URL.createObjectURL(blob)`, so the
+webview rejected every clip with `MEDIA_ELEMENT_ERROR: Media load rejected by URL safety check`
+and rendered the control disabled.
+
+Fix: appended `media-src 'self' blob:` to the CSP. `data:` left blocked on purpose — the app
+only ever uses blob URLs, so there is no reason to widen further.
+
+Triage note for the future: "save as WAV" kept working the whole time because
+`saveNarrationWav` passes `clip.bytes` through `invoke` — an entirely separate path from
+`clip.url`. **Save works but playback doesn't = look at the webview/CSP layer, not the engine.**
+
+### 2. A terminal window appears whenever narration runs
+
+Root cause: the crate set `CREATE_NO_WINDOW` **nowhere**. A windows-subsystem (GUI) process owns
+no console, so every console-subsystem child it spawns gets a brand-new *visible* console.
+
+Fixed at all four production spawn sites — the remaining three `Command::new` hits in the crate
+are inside `#[cfg(test)]`:
+- `narration_process.rs` — python sidecar (the one Henry actually sees)
+- `narration_provision.rs` — powershell `Expand-Archive`, `uv venv`, `uv pip install`
+
+Constant is `pub(crate) const CREATE_NO_WINDOW` in `narration_process.rs`.
+**Rule going forward: every new `Command::new` in this crate sets it.**
+
+Second layer on the sidecar only: prefer `Scripts\pythonw.exe` (GUI-subsystem interpreter — can
+never own a console), falling back to `python.exe` when absent so engines provisioned by older
+builds still start. The reason for the belt-and-braces: the venv's `python.exe` is a *shim* that
+re-execs the real uv-managed interpreter, and that hand-off isn't guaranteed to inherit our
+creation flags.
+
+### 3. "Will narration work for someone without Python/Node installed?" — yes, verified
+
+Nothing was changed here; this is the audit result, checked in code rather than assumed:
+- WebView2 ships **inside** the installer (`webviewInstallMode: offlineInstaller`).
+- `uv venv --python 3.11 --managed-python` — `--managed-python` is the flag that guarantees it.
+  Without it uv would happily satisfy `3.11` from a system install, silently making the engine
+  depend on the user's Python.
+- `uv` itself: downloaded pinned + SHA256-verified (0.12.1), unpacked via Windows' built-in
+  `Expand-Archive`.
+- Pip deps pinned exact: `onnxruntime==1.28.0`, `numpy==2.4.6`, `phonikud==0.4.1`,
+  `phonikud-onnx==1.0.6`, `tokenizers==0.23.1`.
+- Everything under app-data. No PATH edits, no registry writes.
+
+**Only genuine requirement: an internet connection during first-time narration setup (~300MB+).**
+
+### ⚠️ Verification lesson (cost most of this session)
+
+The CSP hypothesis was "confirmed" three times by a broken harness before it was actually proven:
+- **The agent's built-in browser pane and claude-in-chrome both refuse blob media
+  unconditionally** — they reported "blocked" even with *no CSP at all*. Only a no-CSP negative
+  control exposed this. Use `agent-browser` (unmanaged headless Chromium) for media testing.
+- The synthetic test WAV was **8-bit PCM**, which Chromium won't decode — the control was failing
+  for an unrelated reason. Fixtures must match the real artifact (the engine emits 16-bit PCM).
+- Serving the fixed CSP verbatim kept `script-src 'self'`, which blocked the test page's own
+  inline script — assertions hung on "running", readable as neither pass nor fail.
+
+Final proof: same page, same 16-bit WAV — `LOADED dur=0.50` + **enabled** play button under the
+fixed CSP; `ERR code=4` + disabled button under the original.
+
+**Takeaway: a failing test means nothing until a passing case is demonstrated in the same harness.**
+
+### State
+
+`cargo check` + `clippy` clean (1 pre-existing warning at `narration.rs:106`), **122 tests pass,
+0 fail**, `tsc --noEmit` clean. Uncommitted, stacked on the earlier 2026-08-25 pile in the same
+working tree. Version deliberately not bumped.
+
+Regression test added: `narration::tests::csp_allows_blob_media_so_narration_clips_can_play`
+parses `tauri.conf.json` and asserts `media-src` lists `blob:`. Verified it actually fails when
+the directive is removed and passes when restored — a test that can only ever pass would not
+have been worth adding.
+
+Local unsigned test installer (224MB, 2026-08-25 22:13):
+`src-tauri	arget
+eleaseundle
+sis\הכתבה בעברית_2.12.1_x64-setup.exe`
+The fixed CSP was confirmed present in the built `hebrew-dictation.exe` by byte-searching the
+binary — a config change that silently fails to reach the bundle looks identical in source.
+`npm run tauri build` exits 0 and then prints a signing error: expected, `TAURI_SIGNING_PRIVATE_KEY`
+is intentionally unset because this is a local test artifact, not a release.
+
+✅ **Live-verified by Henry 2026-08-25** — he installed this build and confirmed narration plays
+in-app and no terminal window appears. Both bugs closed behaviorally.
+
+**Open — needs Henry, not code:** whether to cut a real release. Worth weighing: the published
+2.12.1 does not have these fixes, so every current user still hits the dead play button and the
+popup console. The code side is done; only the release decision remains.
+
+---
+
+## 🔧 2026-08-25 — End-to-end audit + fix pass (5 waves) — UNCOMMITTED, locally tested only
+
+Henry asked for a full scan (efficiency, bugs, security, design, UX, install flow) after
+getting reports that the app "works on my machine" but not for some users, plus two symptoms
+he sees himself: the floating bar is always on top, and it sometimes doesn't appear at all
+despite being enabled in settings. Full findings are in the plan file
+`C:\Users\אורח\.claude\plans\cosmic-popping-candy.md` (not part of this repo) — this entry is
+the durable summary.
+
+**Root cause of "works on my machine, not for users" — P0, highest confidence:** the
+onboarding wizard's "local" branch left `streaming_enabled` at its default `true` without
+disabling it (unlike the Groq branch, which does). `beginRecording` branched on
+`streaming_enabled` alone, ignoring `transcription_mode` — so anyone who picked local mode
+still tried to open a Deepgram websocket and failed with "מפתח Deepgram לא מוגדר" on every
+single dictation. Henry always has a Deepgram key, so he never reproduced it. Fixed with a
+single source of truth, `isStreamingSession()` (`App.tsx`), used by both start and stop so
+they can never disagree — plus the wizard/settings-picker fixes so the flag doesn't get left
+stale in the first place.
+
+**Five waves, all verified (`cargo test --lib` 121 passed / 0 failed, `npx tsc --noEmit` clean,
+`hebrew-dictation-mcp` vitest 17 passed):**
+1. **P0 above** + `update_settings({patch})` binding bug (silently no-oped, `App.tsx:932`) +
+   a settings-clobber bug in `initApp` that wrote factory defaults over real settings on the
+   legacy `language:"auto"` migration path + Alt+D no longer a silent dead key when no
+   engine is configured or the app is mid-transcribe (`canRecordRef` guard).
+2. Floating-bar fixes — see the live-testing correction below, this wave's approach was
+   **partially reverted** same day.
+3. Install/first-run: onboarding wizard now resizes the main window (300×260 → 480×640) for
+   the engine-choice step; local-mode wizard offers an actual model-download button+progress
+   instead of a dead-end message; `model.rs` downloads now retry (up to 4 attempts) with real
+   HTTP Range resume instead of restarting from zero on a dropped connection.
+4. Security: local API (`local_api.rs`, port 5757) now requires a bearer token
+   (`local_api_token` file in app-data, regenerated per launch) + `Host` header validation
+   against DNS rebinding — `hebrew-dictation-mcp`'s `client.ts` updated to read and send it,
+   backward-compatible with older app builds. Narration sidecar (port 5758) adoption now
+   requires proving knowledge of a per-launch nonce (`current_nonce` file) via a
+   double-check (`is_verifiably_ours` — must accept the right nonce AND reject a wrong one;
+   a single accept-check would have passed for any process that ignores auth entirely, this
+   was caught writing the test for it). `POST /synthesize` and `GET /info` on the Python
+   sidecar both enforce the same nonce now. `narration_provision.rs`'s pip packages pinned to
+   exact versions (`numpy==2.4.6` — deliberately NOT numpy's own latest 2.5.2, which has no
+   Python-3.11 Windows wheel and would have broken provisioning outright; verified against
+   PyPI before picking the number).
+5. Hygiene: removed dead code (`InjectionMethod` enum, unused `arboard` dep, unreachable
+   `stop_via_toolbar` command). Narration-setup failure messages split the Hebrew summary
+   from raw uv/pip stderr into a separate `dir="ltr"` block instead of dumping Latin text into
+   an RTL paragraph. Added a disk-space precheck (`check_disk_space`, 1200MB floor) before
+   provisioning starts. **Explicitly deferred, on purpose:** a cancel button for narration
+   setup (needs real subprocess-abort support), splitting the 3,861-line `App.tsx` monolith
+   (high regression risk with no live visual QA pass), and a light-mode palette (the app is
+   NOT "light-only" as one finding claimed — `App.css:1` is dark by default always; what's
+   missing is an optional light variant for `prefers-color-scheme: light` users, which is a
+   product decision, not a bug).
+
+**Live-testing findings, from Henry actually clicking through the wave-1-4 dev build
+(`npm run tauri dev`) — these are corrections ON TOP of the waves above, same day:**
+- **Floating-bar always-on-top: wave 2's fix was wrong, reverted.** Wave 2 made the toolbar's
+  always-on-top follow the same "חלון מעל הכל" setting as the main window. Henry tested it:
+  turning the toggle off made the bar invisible DURING an active recording (it fell behind
+  whatever app has focus — expected Windows z-order behavior for a non-topmost,
+  non-focus-stealing window, but useless for a status bar you need to see while dictating).
+  **Confirmed product decision: the floating bar must always stay on top, unconditionally,
+  independent of the toggle.** Reverted `set_window_always_on_top` back to main-window-only;
+  `show_toolbar_window`/`show_idle_button_inner` back to hardcoded
+  `set_always_on_top(true)`. The settings toggle's Hebrew label was also rewritten — it used
+  to say "show the RECORDING window above everything," which is what caused the confusion in
+  the first place, since it never actually controlled the recording window even before wave 2.
+- **Global hotkey registration does not retry.** `setup_global_shortcuts` runs once at Tauri
+  startup; if it loses the race (e.g. an old installed instance is still holding `alt+d`), the
+  NEW instance's Alt+D is dead until that instance is fully restarted — closing the
+  conflicting process afterward does not help an already-running instance. Not code-fixed
+  (would need explicit retry-on-focus or similar); worth knowing if "Alt+D doesn't work" comes
+  up again — check for a second `hebrew-dictation.exe` process first.
+- **NSIS `deleteAppData` checkbox text was visually truncated in the live installer/uninstaller.**
+  Screenshot evidence from Henry. Root cause: the upstream English string is a short label
+  ("Delete the application data", 28 chars); a past session expanded the Hebrew translation
+  into a ~240-char paragraph explaining what gets deleted and that API keys are safe in
+  Credential Manager. NSIS checkboxes are fixed-width, non-wrapping — the paragraph overflowed
+  and rendered cut off. Fixed in `src-tauri/nsis/Hebrew.nsh` by shortening back to a label
+  matching the English original's length; the detailed explanation was dropped from this
+  control entirely (no safe way to preserve it in a single-line checkbox — would need a
+  different UI surface, e.g. a MessageBox, if wanted back). **Only takes effect in an
+  uninstaller generated by a build AFTER this fix** — an already-installed old version's
+  `uninstall.exe` still has the old text until it's replaced by installing a new build.
+  `scripts/check-nsis-translations.py` still passes (24/24 coverage).
+
+**Current state — nothing committed, nothing pushed, nothing released:**
+- All changes above are uncommitted local modifications (`git status` — 11 modified files
+  under `src/` and `src-tauri/`, `Cargo.lock`/`Cargo.toml` for the `arboard` removal).
+- Henry has a **local unsigned installer** built and tested at
+  `src-tauri\target\release\bundle\nsis\הכתבה בעברית_2.12.1_x64-setup.exe` (built twice —
+  second build picks up the NSIS string fix). This is NOT a GitHub release: `npm run tauri
+  build` was run without `TAURI_SIGNING_PRIVATE_KEY`, so the updater `.sig` step fails
+  (harmless — the bundle itself builds fine before that step; existing installs' auto-updater
+  is untouched and unaware this build exists). Version number was deliberately NOT bumped —
+  this is a same-version local test artifact, not a release candidate.
+- **Still open / needs Henry's decision, not code:** whether to do a real release (version
+  bump, sign with `~/.tauri/hebrew-dictation.key`, GitHub release, website update — the full
+  recipe below) once he's satisfied with local testing; code signing (Authenticode, cost
+  decision); full hash-pinning (`--require-hashes`) for the narration pip deps, beyond the
+  version-pinning done in wave 4; whether a light color-scheme variant is wanted at all.
+
+---
+
 ## ✅ 2026-08-15 — SHIPPED (unreleased): Hebrew narration — "צור קריינות", local, free, offline
 
 Text → Hebrew speech, entirely on-device. Reachable from the home screen ("🔊 צור קריינות").
