@@ -3592,11 +3592,16 @@ function App() {
             onClick={() => setView("batch")}
             aria-label="הקלט ותמלל או תמלול קבצי שמע"
           >🎧 הקלט ותמלל</button>
-          <button
-            className="btn-batch-nav btn-mode-narration"
-            onClick={() => setView("narration")}
-            aria-label="צור קריינות"
-          >🔊 צור קריינות</button>
+          {/* Windows-only, same as the system-audio and meeting modes above:
+              every narration backend command is a `Err("… רק ב-Windows")` stub
+              off Windows, so an ungated button is a door to a guaranteed error. */}
+          {IS_WINDOWS && (
+            <button
+              className="btn-batch-nav btn-mode-narration"
+              onClick={() => setView("narration")}
+              aria-label="צור קריינות"
+            >🔊 צור קריינות</button>
+          )}
         </div>
       </div>
 
