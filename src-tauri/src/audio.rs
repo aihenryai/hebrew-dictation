@@ -11,6 +11,11 @@ const SILENCE_THRESHOLD: f32 = 0.002;
 const DEFAULT_SILENCE_DURATION_SECS: f32 = 4.5;
 const MIN_SPEECH_DURATION_SECS: f32 = 0.5;
 const VAD_CHECK_INTERVAL_MS: u64 = 100;
+/// How long to wait for the first captured frame before telling the user the
+/// device isn't delivering audio. Long enough that a slow Bluetooth profile
+/// switch (A2DP -> HFP on AirPods) isn't reported as a failure, short enough
+/// that nobody talks into a dead mic for a whole dictation.
+const NO_INPUT_GRACE: Duration = Duration::from_secs(3);
 
 /// Default maximum recording duration in seconds. Configurable from Settings via
 /// `set_max_recording_secs`. Effective ceiling is enforced in the setter.
@@ -194,6 +199,14 @@ impl AudioRecorder {
         let is_recording_clone = self.is_recording.clone();
         let is_paused_clone = self.is_paused.clone();
         let chunk_callback_clone = self.chunk_callback.clone();
+        // Needed so the stream's error callback can reach the UI. Without it a
+        // runtime stream failure only ever reached stderr, which is invisible in
+        // a bundled app — the user just saw a recording that never captured.
+        let err_app_handle = self
+            .app_handle
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
         // Capture the chosen device name so the stream-owner thread picks the same one.
         // `Device` itself isn't `Send`, so we re-resolve by name inside the thread.
         let chosen_device_name = device.name().ok();
@@ -263,8 +276,14 @@ impl AudioRecorder {
                         cb(&resampled);
                     }
                 },
-                |err| {
+                move |err| {
+                    // Surface it: this fires for device disconnects and format
+                    // changes mid-capture (e.g. a Bluetooth headset switching
+                    // profile), which otherwise present as a silent dead mic.
                     eprintln!("Audio stream error: {}", err);
+                    if let Some(app) = &err_app_handle {
+                        let _ = app.emit("audio-stream-error", err.to_string());
+                    }
                 },
                 None,
             ) {
@@ -326,6 +345,14 @@ impl AudioRecorder {
         let handle = std::thread::spawn(move || {
             let mut silence_start: Option<Instant> = None;
             let mut had_speech = false;
+            // A device that opens successfully but never delivers a single frame
+            // used to hang here forever: the `total < samples_per_check` guard
+            // below `continue`s, so the max-recording timeout under it was never
+            // reached and no level was ever emitted. The user saw "recording"
+            // with a dead meter and no error, indefinitely. Reported on macOS
+            // with AirPods on a Mac mini (no built-in mic to fall back to).
+            let capture_started = Instant::now();
+            let mut reported_no_input = false;
             // Throttle UI emits — VAD wakes every 100ms but we don't need to spam
             // the webview that often. ~10 emits/sec is plenty for a smooth bar.
             let mut last_level_emit = Instant::now();
@@ -361,6 +388,20 @@ impl AudioRecorder {
                     if let Ok(samples_guard) = samples.lock() {
                         let total = samples_guard.len();
                         if total < samples_per_check {
+                            // Still nothing at all after the grace period means the
+                            // device is not actually capturing — not that the user
+                            // is quiet. Silence still produces frames (RMS ~0); zero
+                            // frames means no capture. Tell the user once, instead of
+                            // spinning here for the rest of the session.
+                            if total == 0
+                                && !reported_no_input
+                                && capture_started.elapsed() >= NO_INPUT_GRACE
+                            {
+                                reported_no_input = true;
+                                if let Some(app) = &app_handle {
+                                    let _ = app.emit("audio-no-input", ());
+                                }
+                            }
                             continue;
                         }
                         let start = total.saturating_sub(samples_per_check);

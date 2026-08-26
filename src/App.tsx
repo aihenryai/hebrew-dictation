@@ -960,6 +960,21 @@ function App() {
       setNarrationStage(data);
       setNarrationProvisionProgress(0);
     });
+    // A device can open cleanly and then never deliver a frame — reported on
+    // macOS with AirPods on a Mac mini, where there is no built-in mic to fall
+    // back to. Previously this looked identical to "recording, user is quiet":
+    // no error, no meter, no timeout. Say plainly that no audio is arriving and
+    // name the fix, because the app cannot switch the OS input device itself.
+    const unlistenNoInput = listen("audio-no-input", () => {
+      setError(
+        "לא מתקבל שום קול מהמיקרופון. אם אתם על אוזניות Bluetooth (AirPods וכדומה), " +
+          "פתחו את הגדרות המערכת ← צליל ← קלט ובחרו אותן שם, ואז התחילו הקלטה מחדש. " +
+          "כדאי גם לוודא שנתתם לאפליקציה הרשאת מיקרופון בהגדרות הפרטיות.",
+      );
+    });
+    const unlistenStreamError = listen<string>("audio-stream-error", (event) => {
+      setError(`ההקלטה נקטעה: ${event.payload}`);
+    });
     const unlistenClose = listen("window-close-attempted", async () => {
       pendingCloseTipRef.current = true;
     });
@@ -988,6 +1003,8 @@ function App() {
       unlistenNarrationEngineProgress.then((fn) => fn());
       unlistenNarrationVoiceProgress.then((fn) => fn());
       unlistenNarrationStage.then((fn) => fn());
+      unlistenNoInput.then((fn) => fn());
+      unlistenStreamError.then((fn) => fn());
       unlistenClose.then((fn) => fn());
       unlistenFocus.then((fn) => fn());
       unlistenMigration.then((fn) => fn());

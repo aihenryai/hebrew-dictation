@@ -597,14 +597,37 @@ mod tests {
     /// against a real child process rather than trusting the sysinfo docs.
     #[test]
     fn descendants_of_finds_a_real_child_process() {
-        let mut child = std::process::Command::new("cmd.exe")
-            .args(["/c", "ping", "-n", "6", "127.0.0.1"])
+        // Absolute path, not a bare "ping" resolved through PATH. Under a shell
+        // whose PATH lacks System32 the child died instantly with "'ping' is not
+        // recognized", so it was gone before the sweep ran and the test failed
+        // for a reason that had nothing to do with what it checks.
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let ping = std::path::Path::new(&system_root)
+            .join("System32")
+            .join("ping.exe");
+        assert!(ping.exists(), "expected ping.exe at {}", ping.display());
+
+        let mut child = std::process::Command::new(&ping)
+            .args(["-n", "6", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
-            .expect("cmd.exe is always present on Windows");
+            .expect("ping.exe is always present on Windows");
 
-        let tree = descendants_of(&refreshed_system(), std::process::id());
-        let found = tree.contains(&child.id());
+        // Poll rather than sampling once. `spawn` returns as soon as the OS has
+        // created the process, but sysinfo reads a snapshot of the process table
+        // and the new entry is not always visible on the very next refresh — a
+        // single immediate check failed roughly one run in three, which would
+        // break CI releases at random. Retrying only changes how long a PASS
+        // takes; a genuinely missing parent link still fails after the timeout.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            if descendants_of(&refreshed_system(), std::process::id()).contains(&child.id()) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
         let _ = child.kill();
         let _ = child.wait();
