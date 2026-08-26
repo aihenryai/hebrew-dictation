@@ -248,9 +248,12 @@ pub const VOICES: [NarrationVoice; 1] = [
     },
 ];
 
-/// Voice installed by the initial provisioning run, and the fallback whenever
-/// a stored setting names a voice this build no longer ships.
-pub const DEFAULT_VOICE: &str = "michael";
+/// Re-exported from `narration`, which is compiled on every platform. The
+/// constant cannot live here: `settings.rs` needs it for a serde default and
+/// is cross-platform, while this whole module is `#[cfg(target_os = "windows")]`
+/// — so defining it here breaks the macOS build (E0433). Re-exporting keeps
+/// every `narration_provision::DEFAULT_VOICE` call site working unchanged.
+pub use crate::narration::DEFAULT_VOICE;
 
 /// Look a voice up by id, falling back to the default rather than failing:
 /// a settings file naming a removed voice must degrade to working audio, not

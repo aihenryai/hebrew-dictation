@@ -259,7 +259,7 @@ fn default_local_api_port() -> u16 {
 }
 
 fn default_narration_voice() -> String {
-    crate::narration_provision::DEFAULT_VOICE.to_string()
+    crate::narration::DEFAULT_VOICE.to_string()
 }
 
 fn default_narration_port() -> u16 {

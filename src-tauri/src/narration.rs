@@ -3,6 +3,15 @@
 //! this module only knows how to build its launch args and call its API.
 
 use serde::Serialize;
+
+/// Voice installed by the initial provisioning run, and the fallback whenever
+/// a stored setting names a voice this build no longer ships.
+///
+/// Lives here rather than in `narration_provision` because that module is
+/// Windows-only while `settings.rs` — which uses this for a serde default —
+/// is not. `narration_provision` re-exports it, so the provisioning code
+/// still refers to it by its original path.
+pub const DEFAULT_VOICE: &str = "michael";
 use std::time::Duration;
 
 /// Default seconds of silence between sentences. Piper's server defaulted
