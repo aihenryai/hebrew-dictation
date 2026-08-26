@@ -97,9 +97,18 @@ jobs:
       # because the release path checks out the TAG, so a fix sitting on main
       # cannot be verified by re-running a release — the run would rebuild the
       # old code and fail identically, which is exactly what happened while
-      # setting this up. Signing is intentionally omitted: nothing is uploaded,
-      # so an unsigned artifact cannot escape.
+      # setting this up.
+      #
+      # The signing key IS provided here. Omitting it looks safer but simply
+      # breaks the build: tauri.conf.json carries an updater `pubkey`, and
+      # Tauri refuses to bundle when it finds a public key with no private one
+      # ("A public key has been found, but no private key"). Nothing is
+      # published on this path regardless, because no tagName is passed — that,
+      # not the absence of a key, is what keeps a dry run from shipping.
       - uses: tauri-apps/tauri-action@v1
         if: inputs.tag == ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
           args: ${{ matrix.args }}
