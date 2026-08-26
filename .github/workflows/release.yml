@@ -70,7 +70,7 @@ jobs:
 
       # Release path: tag given -> build, sign, and publish to that tag.
       - uses: tauri-apps/tauri-action@v1
-        if: inputs.tag != ''
+        if: github.event_name == 'push' || inputs.tag != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Signs the updater artifacts. Without these the build still produces
@@ -98,7 +98,7 @@ jobs:
       # installer). There is no action input to change that, so rewrite them
       # here. See .github/scripts/fix_updater_urls.py for the full reasoning.
       - name: Point latest.json at public download URLs
-        if: inputs.tag != ''
+        if: github.event_name == 'push' || inputs.tag != ''
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -124,7 +124,7 @@ jobs:
       # published on this path regardless, because no tagName is passed — that,
       # not the absence of a key, is what keeps a dry run from shipping.
       - uses: tauri-apps/tauri-action@v1
-        if: inputs.tag == ''
+        if: github.event_name == 'workflow_dispatch' && inputs.tag == ''
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
