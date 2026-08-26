@@ -15,8 +15,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build (e.g. v2.13.0)'
-        required: true
+        description: 'Existing tag to build. Leave EMPTY to test-build the current main without releasing anything.'
+        required: false
         type: string
 
 jobs:
@@ -68,7 +68,9 @@ jobs:
 
       - run: npm ci
 
+      # Release path: tag given -> build, sign, and publish to that tag.
       - uses: tauri-apps/tauri-action@v1
+        if: inputs.tag != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Signs the updater artifacts. Without these the build still produces
@@ -90,3 +92,14 @@ jobs:
           # percent-encoded in the GitHub asset URL, which breaks the download
           # link recorded in `latest.json`. This pattern forces ASCII names.
           releaseAssetNamePattern: 'hebrew-dictation-v[version]-[arch][ext]'
+
+      # Dry-run path: no tag -> compile only, publish nothing. This exists
+      # because the release path checks out the TAG, so a fix sitting on main
+      # cannot be verified by re-running a release — the run would rebuild the
+      # old code and fail identically, which is exactly what happened while
+      # setting this up. Signing is intentionally omitted: nothing is uploaded,
+      # so an unsigned artifact cannot escape.
+      - uses: tauri-apps/tauri-action@v1
+        if: inputs.tag == ''
+        with:
+          args: ${{ matrix.args }}
