@@ -93,6 +93,24 @@ jobs:
           # link recorded in `latest.json`. This pattern forces ASCII names.
           releaseAssetNamePattern: 'hebrew-dictation-v[version]-[arch][ext]'
 
+      # tauri-action records API asset URLs in latest.json, which the updater
+      # cannot download on a public repo (it gets JSON metadata instead of the
+      # installer). There is no action input to change that, so rewrite them
+      # here. See .github/scripts/fix_updater_urls.py for the full reasoning.
+      - name: Point latest.json at public download URLs
+        if: inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets' > assets.json
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | select(.name=="latest.json") | .id')
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$id" -H "Accept: application/octet-stream" > latest.json
+          python .github/scripts/fix_updater_urls.py latest.json assets.json
+          gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
+
       # Dry-run path: no tag -> compile only, publish nothing. This exists
       # because the release path checks out the TAG, so a fix sitting on main
       # cannot be verified by re-running a release — the run would rebuild the
