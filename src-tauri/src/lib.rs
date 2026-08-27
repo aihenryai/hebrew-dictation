@@ -553,6 +553,36 @@ fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> Result<(), Str
     Ok(())
 }
 
+/// Write this dictation's audio + raw transcript to
+/// `<app-data>/hebrew-dictation/samples/<unix-ms>.{wav,deepgram.txt}` for offline
+/// re-transcription against other engines (see the transcription-quality handoff).
+/// Opt-in via `settings::AppSettings::debug_save_audio` (default false) — callers
+/// must check that flag before calling this. Every failure is logged and
+/// swallowed: a debug sample must never be able to affect the real dictation flow.
+fn save_debug_sample(samples: &[f32], text: &str) {
+    let dir = settings::get_settings_dir().join("samples");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[debug_save_audio] couldn't create samples dir: {}", e);
+        return;
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let wav_path = dir.join(format!("{}.wav", stamp));
+    if let Err(e) = write_wav_16k_mono(&wav_path, samples) {
+        eprintln!("[debug_save_audio] couldn't write {}: {}", wav_path.display(), e);
+        return;
+    }
+
+    let txt_path = dir.join(format!("{}.deepgram.txt", stamp));
+    if let Err(e) = std::fs::write(&txt_path, text) {
+        eprintln!("[debug_save_audio] couldn't write {}: {}", txt_path.display(), e);
+    }
+}
+
 /// Restore the recorder's VAD/timeout settings from the persisted user config.
 /// Called after a batch recording ends so the short-dictation flow resumes correctly.
 fn restore_recorder_settings(state: &State<AppState>) {
@@ -1423,10 +1453,10 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
     // of WASAPI-buffered audio is delivered via the callback into `audio_tx` before the
     // stream is dropped. clear_chunk_callback AFTER ensures nothing further is queued.
     // This prevents the "last words cut off" bug.
-    {
+    let samples = {
         let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        let _ = recorder.stop_recording();
-    }
+        recorder.stop_recording().unwrap_or_default()
+    };
     {
         let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
         recorder.clear_chunk_callback();
@@ -1450,6 +1480,19 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
 
     // One seq bump per streaming session = the whole utterance, not per segment.
     local_api::record_utterance(&state.last_transcript, &text);
+
+    // Diagnostic opt-in (default off, see settings::AppSettings::debug_save_audio):
+    // save this dictation's audio + raw transcript to disk for re-running against
+    // other transcription engines. Errors are logged and swallowed — the sample
+    // is a diagnostic aid, never allowed to affect the real dictation flow.
+    let debug_save = state
+        .settings
+        .lock()
+        .map(|s| s.debug_save_audio)
+        .unwrap_or(false);
+    if debug_save {
+        save_debug_sample(&samples, &text);
+    }
 
     Ok(text)
 }

@@ -1,11 +1,48 @@
 # Handoff — Hebrew transcription quality (missed words, wrong words)
 
-**Opened:** 2026-08-26 · **Status:** not started, this is a brief
+**Opened:** 2026-08-26 · **Status:** 2026-08-27 — Step 0 infra built, waiting on Henry's real
+dictations. Full plan: `~/.claude/plans/c-users-claude-dev-ai-tools-mcp-dev-hebr-shimmering-crescent.md`.
 **Raised by Henry:** dictation drops words and produces wrong ones. His idea: add automatic
 correction, or a second model that reads the transcript and fixes words using sentence context.
 
 Read this before proposing anything. A large part of the idea already exists in the codebase,
 and the reason it does not solve the problem is specific and fixable.
+
+## 2026-08-27 session — what's built, what's still open
+
+Henry decided: **measure before deciding** on any fix, keep researching the keyterm/vocabulary
+angle before building it, and keep Groq→Gemini frozen unless the measurement points at it.
+
+**Built (code, tested, not yet exercised on real data):**
+- `settings::AppSettings.debug_save_audio` (default `false`, settings.json-only, no frontend
+  toggle — same pattern as `local_api_enabled`) + `merge_frontend_update` preservation + test.
+- `save_debug_sample()` in `lib.rs`, called from `stop_streaming_transcription`: when the flag
+  is on, writes the dictation's audio (`write_wav_16k_mono`, already existed) and Deepgram's raw
+  text to `%APPDATA%/hebrew-dictation/samples/<unix-ms>.{wav,deepgram.txt}`. All failures are
+  logged and swallowed — can't affect the real dictation path. `cargo test`: 123 passed.
+- `benchmark/run_benchmark.py` extended with two backends the Phase-0-era script didn't have:
+  **Deepgram streaming** (`transcribe_deepgram_streaming`, mirrors `streaming.rs`'s
+  accumulate-`is_final`-segments logic) and **Deepgram batch + keyterm**
+  (`--keyterms "term1,term2"`). Both smoke-tested offline (WAV parsing, URL-encoding of Hebrew
+  keyterms) — not yet run against real Deepgram, no `.env` configured on this machine.
+  `--local-model ivrit-ai/whisper-large-v3-turbo-ct2` documented as the Hebrew-tuned faster-whisper
+  build (found via research, distinct from the ggml build the app itself uses).
+- `docs/research/2026-08-27-vocabulary-mechanisms.md` — keyterm/replace/prompt comparison across
+  all three engines, verified against live Deepgram/Groq docs. Research only, nothing implemented;
+  Hebrew's prefix-attachment (ב/ו/ה/כ/ל/מ/ש) is flagged as the reason `replace=` alone won't
+  scale and why classifying Henry's actual errors (below) has to come first.
+
+**Still open — needs Henry, not code:**
+1. **Step 0א (no code, ~20 min):** 5 real dictations, compare intended text vs on-screen text vs
+   `mcp__hebrew-dictation__get_last_transcript`. This is the fork in the road — if screen ≠ MCP,
+   the bug is injection (`injector.rs`) and none of the ASR work below is relevant.
+2. Turn on `debug_save_audio: true` in settings.json (no UI yet) for those 5 dictations so the
+   samples land in `%APPDATA%/hebrew-dictation/samples/` for benchmark re-use.
+3. Copy those samples into `benchmark/samples/sample_NN/` with `reference.txt` (what Henry meant
+   to say), fill `benchmark/.env` from `.env.example`, run
+   `python run_benchmark.py --keyterms "..."` — produces `results.md` with WER per engine.
+4. Only after that data exists: decide whether keyterm/replace/engine-switch/Gemini-unfreeze is
+   worth building, per the research doc above.
 
 ---
 

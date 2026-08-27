@@ -128,6 +128,13 @@ pub struct AppSettings {
     /// Cleanup profile. Default "he_general". Unknown values fall back via EnhanceMode::from_str.
     #[serde(default = "default_enhance_mode")]
     pub enhance_mode: String,
+    /// Diagnostic opt-in: save each streaming dictation's audio (WAV) + the raw
+    /// Deepgram transcript (TXT) to samples/ under the app data dir, for
+    /// re-running against other engines later. Default false -- never write
+    /// voice recordings to disk without explicit consent. No frontend toggle;
+    /// enable via settings.json.
+    #[serde(default)]
+    pub debug_save_audio: bool,
     /// Opt-in local-only HTTP API (127.0.0.1) exposing the last dictated transcript
     /// for other local tools/scripts to read. Default false — a new listener
     /// should never appear silently. No frontend UI yet; enable via settings.json.
@@ -175,6 +182,7 @@ pub struct RedactedSettings {
     pub audio_volume: f32,
     pub enhance_enabled: bool,
     pub enhance_mode: String,
+    pub debug_save_audio: bool,
     pub local_api_enabled: bool,
     pub local_api_port: u16,
     pub narration_port: u16,
@@ -210,6 +218,7 @@ impl AppSettings {
             audio_volume: self.audio_volume,
             enhance_enabled: self.enhance_enabled,
             enhance_mode: self.enhance_mode.clone(),
+            debug_save_audio: self.debug_save_audio,
             local_api_enabled: self.local_api_enabled,
             local_api_port: self.local_api_port,
             narration_port: self.narration_port,
@@ -295,6 +304,7 @@ impl Default for AppSettings {
             audio_volume: default_audio_volume(),
             enhance_enabled: false,
             enhance_mode: default_enhance_mode(),
+            debug_save_audio: false,
             local_api_enabled: false,
             local_api_port: default_local_api_port(),
             narration_port: default_narration_port(),
@@ -312,7 +322,7 @@ impl AppSettings {
     }
 }
 
-fn get_settings_dir() -> PathBuf {
+pub fn get_settings_dir() -> PathBuf {
     let app_data = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     app_data.join("hebrew-dictation")
 }
@@ -498,6 +508,7 @@ impl AppSettings {
         incoming.local_api_port = self.local_api_port;
         incoming.narration_port = self.narration_port;
         incoming.narration_voice = self.narration_voice.clone();
+        incoming.debug_save_audio = self.debug_save_audio;
         incoming
     }
 }
@@ -543,5 +554,13 @@ mod merge_tests {
         let incoming = AppSettings::default(); // simulates a frontend payload that never carries this field
         let merged = current.merge_frontend_update(incoming);
         assert_eq!(merged.narration_port, 9999, "a settings-json-only field must survive a frontend save");
+    }
+
+    #[test]
+    fn merge_frontend_update_preserves_debug_save_audio_not_exposed_to_frontend_yet() {
+        let current = AppSettings { debug_save_audio: true, ..AppSettings::default() };
+        let incoming = AppSettings::default(); // simulates a frontend payload that never carries this field
+        let merged = current.merge_frontend_update(incoming);
+        assert!(merged.debug_save_audio, "a settings-json-only field must survive a frontend save");
     }
 }

@@ -3,19 +3,25 @@
 > **Phase 0** של תכנית v2.0 Freemium. Gate שמחליט איזה backend לתמלול ענן נבחר ל-Cloudflare Worker.
 
 ## מה זה עושה
-משווה עד 3 מנועי תמלול לעברית על אותן דגימות אודיו:
+משווה עד 5 מנועי תמלול לעברית על אותן דגימות אודיו:
 
 | Backend | תפקיד | עלות משוערת |
 |---|---|---|
 | **Groq whisper-large-v3-turbo** | מועמד עיקרי — זול פי ~6 מ-Deepgram | ~$0.04/שעת אודיו |
-| **Deepgram Nova-3** | baseline (v1.0) | ~$0.26/שעת אודיו |
-| **Local faster-whisper large-v3-turbo** | אופציונלי, reference לעקביות עם מודל L-2 | $0 (CPU) |
+| **Deepgram Nova-3 (batch)** | baseline (v1.0) | ~$0.26/שעת אודיו |
+| **Deepgram Nova-3 (streaming)** | המסלול שהאפליקציה משתמשת בו בפועל כברירת מחדל — פחות הקשר ימני מ-batch, מדד שונה בפועל | כמו batch |
+| **Deepgram Nova-3 + keyterm** | עם `--keyterms`, לבדיקת Keyterm Prompting לפני החלטה אם לממש | כמו batch |
+| **Local faster-whisper** | אופציונלי; ל-`--local-model ivrit-ai/whisper-large-v3-turbo-ct2` נתונים ייעודיים לעברית | $0 (CPU) |
 
 המדד: **WER** (Word Error Rate). סף החלטה:
 
 - WER **< 15%** → ✅ ממשיכים עם Groq
 - WER **15-25%** → בודקים `whisper-large-v3` הרגיל (לא turbo)
 - WER **> 25%** → fallback ל-Deepgram, עדכון תמחור
+
+> ⚠️ Streaming ו-keyterm נוספו 2026-08-27 עבור עבודת איכות התמלול
+> (`HANDOFF-TRANSCRIPTION-QUALITY.md`) — לא חלק מהחלטת ה-Phase-0 המקורית. לפני בחירת מונחי
+> keyterm, לקרוא `docs/research/2026-08-27-vocabulary-mechanisms.md`.
 
 ---
 
@@ -31,6 +37,13 @@ pip install -r requirements.txt
 אופציונלי — תמלול לוקאלי (יוריד ~1.6GB מודל בהרצה ראשונה):
 ```bash
 pip install faster-whisper
+```
+לעברית עדיף `--local-model ivrit-ai/whisper-large-v3-turbo-ct2` (בניית CTranslate2, לא ה-ggml
+שהאפליקציה עצמה משתמשת בו) על פני ברירת המחדל הכללית `large-v3-turbo`.
+
+אופציונלי — Deepgram streaming (המסלול שהאפליקציה משתמשת בו בפועל כברירת מחדל):
+```bash
+pip install websocket-client
 ```
 
 ## מפתחות
@@ -56,6 +69,10 @@ samples/
     reference.txt
 ```
 
+⚠️ ל-backend ה-streaming: **mono 16kHz 16-bit PCM חובה, לא רק מועדף** — פורמט אחר נכשל עם הודעה
+שכוללת פקודת `ffmpeg` להמרה. זה בדיוק הפורמט שהאפליקציה עצמה כותבת עם `debug_save_audio` (ראה
+`HANDOFF-TRANSCRIPTION-QUALITY.md`), כך שדגימה אמיתית מהאפליקציה נכנסת ישירות בלי המרה.
+
 **המלצה: 8-10 דגימות מגוונות:**
 1. משפט רגיל, קצב נורמלי
 2. משפטים עם מונחים טכניים באנגלית בתוך עברית (API, ChatGPT, email)
@@ -74,9 +91,11 @@ python run_benchmark.py
 
 דילוגים אופציונליים:
 ```bash
-python run_benchmark.py --skip-local       # ללא faster-whisper
-python run_benchmark.py --skip-deepgram    # רק Groq vs Local
-python run_benchmark.py --skip-groq        # רק Deepgram vs Local
+python run_benchmark.py --skip-local                 # ללא faster-whisper
+python run_benchmark.py --skip-deepgram               # רק Groq vs Local
+python run_benchmark.py --skip-groq                    # רק Deepgram vs Local
+python run_benchmark.py --skip-deepgram-streaming      # רק batch, בלי streaming
+python run_benchmark.py --keyterms "בינטק,הכתבה בעברית" # מוסיף Deepgram + keyterm
 ```
 
 ## פלט
