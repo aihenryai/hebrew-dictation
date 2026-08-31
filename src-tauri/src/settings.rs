@@ -496,7 +496,15 @@ impl AppSettings {
     pub fn merge_frontend_update(&self, mut incoming: AppSettings) -> AppSettings {
         incoming.deepgram_api_key = self.deepgram_api_key.clone();
         incoming.groq_api_key = self.groq_api_key.clone();
-        incoming.onboarding_completed = self.onboarding_completed;
+        // LATCH, don't overwrite: the onboarding wizard's completion payload
+        // legitimately carries onboarding_completed:true while the in-memory
+        // value is still false. A plain `= self.onboarding_completed` silently
+        // discarded that true, so keyless/local-model users were re-onboarded
+        // on EVERY launch — which read as "my model selection didn't stick"
+        // (real macOS user report, 2026-08). `||` lets an explicit true through
+        // while a normal save (field absent → serde default false) still can't
+        // un-complete onboarding.
+        incoming.onboarding_completed = self.onboarding_completed || incoming.onboarding_completed;
         incoming.terms_accepted = self.terms_accepted;
         incoming.close_notification_shown = self.close_notification_shown;
         incoming.toolbar_position = self.toolbar_position;
@@ -562,5 +570,26 @@ mod merge_tests {
         let incoming = AppSettings::default(); // simulates a frontend payload that never carries this field
         let merged = current.merge_frontend_update(incoming);
         assert!(merged.debug_save_audio, "a settings-json-only field must survive a frontend save");
+    }
+
+    /// The wizard's completion payload carries onboarding_completed:true while
+    /// the in-memory value is still false. Overwriting instead of latching
+    /// re-onboarded keyless users on every launch (macOS user report, 2026-08).
+    #[test]
+    fn merge_lets_wizard_set_onboarding_completed_true() {
+        let current = AppSettings::default(); // onboarding_completed: false
+        let incoming = AppSettings { onboarding_completed: true, ..AppSettings::default() };
+        let merged = current.merge_frontend_update(incoming);
+        assert!(merged.onboarding_completed, "an explicit true from the wizard must survive the merge");
+    }
+
+    /// The latch only goes one way: a routine save (field absent → serde
+    /// default false) must never un-complete onboarding.
+    #[test]
+    fn merge_never_downgrades_onboarding_completed() {
+        let current = AppSettings { onboarding_completed: true, ..AppSettings::default() };
+        let incoming = AppSettings::default(); // routine save, field not carried
+        let merged = current.merge_frontend_update(incoming);
+        assert!(merged.onboarding_completed, "a routine save must not resurrect the wizard");
     }
 }

@@ -28,6 +28,10 @@ pub struct StreamingSession {
     recv_task: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Per-session latch so a repeating per-segment injection failure (e.g. missing
+/// macOS Accessibility permission) surfaces exactly once, not once per segment.
+type InjectErrReported = Arc<std::sync::atomic::AtomicBool>;
+
 impl StreamingSession {
     /// Open a WebSocket connection to Deepgram streaming and start a receive task
     /// that emits `transcription-interim` events for each message.
@@ -61,11 +65,14 @@ impl StreamingSession {
 
         let final_text_rx = final_text.clone();
         let app_clone = app.clone();
+        let inject_err_reported: InjectErrReported =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
         let recv_task = tokio::spawn(async move {
             while let Some(msg) = reader.next().await {
                 match msg {
                     Ok(Message::Text(txt)) => {
-                        handle_message(&txt, &final_text_rx, &app_clone).await;
+                        handle_message(&txt, &final_text_rx, &app_clone, &inject_err_reported)
+                            .await;
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
@@ -125,7 +132,12 @@ impl StreamingSession {
     }
 }
 
-async fn handle_message(raw: &str, final_text: &Arc<Mutex<String>>, app: &AppHandle) {
+async fn handle_message(
+    raw: &str,
+    final_text: &Arc<Mutex<String>>,
+    app: &AppHandle,
+    inject_err_reported: &InjectErrReported,
+) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
     };
@@ -159,8 +171,17 @@ async fn handle_message(raw: &str, final_text: &Arc<Mutex<String>>, app: &AppHan
         // non-streaming `inject_text` command already gets.
         let to_inject = format!("{} ", transcript);
         let app_for_inject = app.clone();
+        let app_for_err = app.clone();
+        let reported = inject_err_reported.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = crate::inject_text_defocused(&app_for_inject, &to_inject);
+            if let Err(e) = crate::inject_text_defocused(&app_for_inject, &to_inject) {
+                // Surface the failure to the UI ONCE per session — previously it
+                // was discarded, so a Mac without Accessibility permission
+                // streamed an entire dictation into nothing with zero feedback.
+                if !reported.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = app_for_err.emit("injection-error", e);
+                }
+            }
         })
         .await;
 

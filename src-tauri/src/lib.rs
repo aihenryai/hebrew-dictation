@@ -1501,23 +1501,35 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
 fn load_whisper_model(state: State<AppState>, model_name: String) -> Result<(), String> {
     model::validate_model_name(&model_name)?;
 
-    let required_mb = match model_name.as_str() {
-        "tiny" => 400,
-        "base" => 700,
-        "small" => 1500,
-        "medium" => 3500,
-        "large-v3-turbo" => 6000,
-        "ivrit-large-v3-turbo" => 6000,
-        _ => 1000,
-    };
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    let available_mb = sys.available_memory() / (1024 * 1024);
-    if available_mb < required_mb {
-        return Err(format!(
-            "אין מספיק זיכרון RAM. נדרש: ~{}MB, זמין: {}MB. סגור תוכנות אחרות או בחר מודל קטן יותר.",
-            required_mb, available_mb
-        ));
+    // RAM pre-flight — Windows only. On macOS, sysinfo's available_memory
+    // subtracts the memory compressor (free+inactive+purgeable−compressor), so
+    // a healthy Mac that has been up a while routinely reports well under
+    // 1500MB even though the OS would satisfy a ~500MB model load instantly by
+    // evicting cache. That false rejection blocked the "small" model FOREVER on
+    // memory-pressured Macs — the exact "no model loads no matter how many
+    // times I re-select it" a real user reported (2026-08). macOS handles
+    // memory pressure via compression/swap, and a genuinely impossible load
+    // still fails loudly through WhisperEngine::new's error path below.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let required_mb = match model_name.as_str() {
+            "tiny" => 400,
+            "base" => 700,
+            "small" => 1500,
+            "medium" => 3500,
+            "large-v3-turbo" => 6000,
+            "ivrit-large-v3-turbo" => 6000,
+            _ => 1000,
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let available_mb = sys.available_memory() / (1024 * 1024);
+        if available_mb < required_mb {
+            return Err(format!(
+                "אין מספיק זיכרון RAM. נדרש: ~{}MB, זמין: {}MB. סגור תוכנות אחרות או בחר מודל קטן יותר.",
+                required_mb, available_mb
+            ));
+        }
     }
 
     let model_path = model::get_model_path(&model_name);
@@ -1541,6 +1553,13 @@ fn is_whisper_loaded(state: State<AppState>) -> bool {
         .lock()
         .map(|e| e.is_some())
         .unwrap_or(false)
+}
+
+/// macOS: whether keystroke injection can reach other apps (Accessibility
+/// trust). Always true elsewhere, so the frontend calls it unconditionally.
+#[tauri::command]
+fn is_accessibility_trusted() -> bool {
+    injector::is_accessibility_trusted()
 }
 
 #[tauri::command]
@@ -1672,7 +1691,61 @@ fn accept_terms(state: State<AppState>) -> Result<(), String> {
 ///
 /// Blocking (uses `std::thread::sleep`) — callers on the async runtime must
 /// run this via `spawn_blocking` (see `streaming::handle_message`).
+/// macOS only: true while the whole app is hidden at the NSApp level by the
+/// injection dance below. Lets window-show paths know they must unhide the
+/// app first (a window of an NSApp-hidden app won't actually appear).
+#[cfg(target_os = "macos")]
+static MACOS_APP_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// macOS only: if the injection dance left the app NSApp-hidden, unhide it.
+/// Activation moving to this app is the unavoidable cost of unhiding —
+/// callers are paths where the user is deliberately summoning our UI.
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_unhide_if_needed(app: &AppHandle) {
+    if MACOS_APP_HIDDEN.swap(false, Ordering::SeqCst) {
+        let _ = app.show();
+    }
+}
+
 pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), String> {
+    // macOS: hiding individual windows is NOT enough — the app itself stays
+    // active with no key window, and synthesized keystrokes land nowhere.
+    // The only mechanism that hands activation back to the previously-active
+    // app is an app-level hide ([NSApp hide:], AppHandle::hide). Only needed
+    // when one of our windows actually holds focus; in the pure global-hotkey
+    // flow our app was never activated, and hiding it would just make the
+    // recording toolbar vanish mid-session.
+    // Deliberately NO app.show() afterwards: unhide re-activates this app and
+    // would steal focus straight back from the window we just typed into. The
+    // UI comes back via the Dock (RunEvent::Reopen), the menu-bar tray, or
+    // the next explicit window-show (macos_unhide_if_needed).
+    #[cfg(target_os = "macos")]
+    {
+        let our_window_focused = ["main", "toolbar"].iter().any(|label| {
+            app.get_webview_window(label)
+                .and_then(|w| w.is_focused().ok())
+                .unwrap_or(false)
+        });
+        if our_window_focused {
+            let _ = app.hide();
+            MACOS_APP_HIDDEN.store(true, Ordering::SeqCst);
+            // Give AppKit a beat to activate the previous app.
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+        return injector::inject_text(text);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        inject_text_defocused_windows_dance(app, text)
+    }
+}
+
+/// The original Windows-semantics dance: hide our windows, let the OS promote
+/// the previously-active window, type, restore. Correct on Windows (restoring
+/// a window there does not steal foreground); wrong on macOS (see above).
+#[cfg(not(target_os = "macos"))]
+fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<(), String> {
     let main_window = app.get_webview_window("main");
     let toolbar_window = app.get_webview_window("toolbar");
 
@@ -1967,6 +2040,8 @@ fn resolve_float_position(
 /// so we defensively hide main here. All real callers already run with main
 /// hidden, so this is a no-op in practice — it just closes any future gap.
 fn show_idle_button_inner(app: &AppHandle, saved_pos: Option<settings::ToolbarPosition>) {
+    #[cfg(target_os = "macos")]
+    macos_unhide_if_needed(app);
     let Some(toolbar) = app.get_webview_window("toolbar") else {
         return;
     };
@@ -2018,6 +2093,10 @@ fn refresh_idle_button(app: &AppHandle, state: &AppState) {
 /// main so the user can reach settings / history without the tray.
 #[tauri::command]
 fn open_main_window(app: AppHandle) -> Result<(), String> {
+    // macOS: if the injection dance left the app NSApp-hidden, window.show()
+    // below would be a no-op — unhide first (the user is summoning the UI).
+    #[cfg(target_os = "macos")]
+    macos_unhide_if_needed(&app);
     if let Some(t) = app.get_webview_window("toolbar") {
         let _ = t.hide();
     }
@@ -2070,6 +2149,11 @@ fn show_toolbar_window(
     state: State<AppState>,
     streaming: bool,
 ) -> Result<(), String> {
+    // macOS: an NSApp-hidden app can't show its recording toolbar — unhide
+    // first. Costs one activation flip, but an open mic with no on-screen
+    // indicator is worse; the injection dance re-hides at typing time anyway.
+    #[cfg(target_os = "macos")]
+    macos_unhide_if_needed(&app);
     let (toolbar_enabled, idle_enabled, saved_pos) = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
         (s.floating_toolbar_enabled, s.idle_button_enabled, s.toolbar_position)
@@ -2320,6 +2404,16 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // macOS: show the Accessibility grant dialog on first launch and
+            // register the app in the Privacy & Security pane. Without this the
+            // permission is undiscoverable (our pre-check in injector.rs returns
+            // before enigo posts a CGEvent, so even the OS's automatic prompt
+            // never fires) and injection into other apps silently never works.
+            #[cfg(target_os = "macos")]
+            std::thread::spawn(|| {
+                let _ = injector::prompt_accessibility_if_needed();
+            });
+
             // Apply persisted recorder settings BEFORE wiring shortcuts so the very
             // first hotkey press uses the user's configured behavior.
             {
@@ -2486,6 +2580,7 @@ pub fn run() {
             accept_terms,
             load_whisper_model,
             is_whisper_loaded,
+            is_accessibility_trusted,
             is_model_downloaded,
             download_model,
             delete_model,
@@ -2526,8 +2621,27 @@ pub fn run() {
             set_idle_button_enabled,
             open_main_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // macOS: clicking the Dock icon fires Reopen. Without this handler
+            // a window hidden by close-to-tray (or an app hidden by the
+            // injection dance) never comes back through the standard macOS
+            // gesture, and the app reads as dead.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                macos_unhide_if_needed(app);
+                let _ = app.show();
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app, &event);
+            }
+        });
 }
 
 #[cfg(test)]

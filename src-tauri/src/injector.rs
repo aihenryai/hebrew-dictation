@@ -4,15 +4,68 @@ use enigo::{Enigo, Keyboard, Settings};
 // the app is a trusted Accessibility client. Unlike the microphone, no Info.plist
 // key can grant this — the user must enable it manually — so we detect it and
 // return actionable guidance instead of typing nothing.
+//
+// Discoverability caveat that shaped this file: the plain `AXIsProcessTrusted`
+// is QUERY-ONLY. It never shows the system dialog and never registers the app
+// in System Settings → Privacy & Security → Accessibility — and because we
+// return Err before enigo posts any CGEvent, macOS's own automatic consent
+// prompt never fires either. A fresh install therefore has NO path to discover
+// the permission. `prompt_accessibility_if_needed` (called once at startup)
+// uses AXIsProcessTrustedWithOptions with kAXTrustedCheckOptionPrompt, which
+// both shows the dialog and lists the app in the pane.
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(
+        options: core_foundation::dictionary::CFDictionaryRef,
+    ) -> bool;
+    static kAXTrustedCheckOptionPrompt: core_foundation::string::CFStringRef;
 }
 
 #[cfg(target_os = "macos")]
 fn accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+/// True when keystroke injection can work. Always true off-macOS so the
+/// frontend can call it unconditionally.
+pub fn is_accessibility_trusted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        accessibility_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// macOS: show the system Accessibility-permission dialog if the app is not
+/// yet trusted, and register it in the Privacy & Security → Accessibility
+/// pane either way. Returns the current trust state. No-op (true) elsewhere.
+pub fn prompt_accessibility_if_needed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use core_foundation::base::TCFType;
+        use core_foundation::boolean::CFBoolean;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::CFString;
+        unsafe {
+            // wrap_under_get_rule retains the framework-owned constant, so the
+            // CFString drop releases OUR retain, never the framework's.
+            let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+            let options = CFDictionary::from_CFType_pairs(&[(
+                key.as_CFType(),
+                CFBoolean::true_value().as_CFType(),
+            )]);
+            AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
 }
 
 /// Guidance surfaced when injection can't run for lack of macOS Accessibility

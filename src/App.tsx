@@ -673,8 +673,15 @@ function App() {
   const injectText = useCallback(async (text: string) => {
     try {
       await invoke("inject_text", { text });
-    } catch {
-      // Injection may fail if no text field is focused
+    } catch (e) {
+      // A real failure (e.g. missing macOS Accessibility permission, enigo
+      // init error) — surface it. Note enigo does NOT error when no text
+      // field is focused (keystrokes just go nowhere), so this can't spam on
+      // the benign Windows case the old empty catch was written for. The old
+      // swallow meant a Mac without Accessibility permission dictated into
+      // nothing with zero feedback (real user report, 2026-08).
+      setError(String(e));
+      if (audioFeedbackEnabledRef.current) playErrorTone();
     }
   }, []);
 
@@ -975,6 +982,13 @@ function App() {
     const unlistenStreamError = listen<string>("audio-stream-error", (event) => {
       setError(`ההקלטה נקטעה: ${event.payload}`);
     });
+    // Streaming injects per final segment in the backend; when that fails
+    // (e.g. missing macOS Accessibility permission) the backend emits this
+    // once per session instead of silently dropping the whole dictation.
+    const unlistenInjectError = listen<string>("injection-error", (event) => {
+      setError(String(event.payload));
+      if (audioFeedbackEnabledRef.current) playErrorTone();
+    });
     const unlistenClose = listen("window-close-attempted", async () => {
       pendingCloseTipRef.current = true;
     });
@@ -1005,6 +1019,7 @@ function App() {
       unlistenNarrationStage.then((fn) => fn());
       unlistenNoInput.then((fn) => fn());
       unlistenStreamError.then((fn) => fn());
+      unlistenInjectError.then((fn) => fn());
       unlistenClose.then((fn) => fn());
       unlistenFocus.then((fn) => fn());
       unlistenMigration.then((fn) => fn());
@@ -1102,15 +1117,37 @@ function App() {
       }
     } catch { /* defaults */ }
 
-    if (needsOnboarding) setView("onboarding");
-
     const allModels = await refreshModels();
     const preferred = allModels.find((m) => m.name === preferredModelName && m.downloaded);
     const anyDownloaded = preferred || allModels.find((m) => m.downloaded);
+
+    // A downloaded local model proves the user finished setup once — the
+    // wizard completion just never persisted (merge_frontend_update clobbered
+    // the flag before 2.13.2). Heal the stored flag instead of re-onboarding.
+    if (needsOnboarding && anyDownloaded) {
+      needsOnboarding = false;
+      try { await invoke("mark_onboarding_complete"); } catch { /* ok */ }
+    }
+
+    if (needsOnboarding) setView("onboarding");
+
     if (anyDownloaded) {
       setSelectedModel(anyDownloaded.name);
       await loadWhisperModel(anyDownloaded.name, true);
     }
+
+    // macOS: without Accessibility trust, dictation transcribes but types
+    // nothing into other apps — say so up front instead of failing silently.
+    // Always true on Windows/Linux, so this is macOS-only in effect.
+    try {
+      const trusted = await invoke("is_accessibility_trusted") as boolean;
+      if (!trusted && !needsOnboarding) {
+        setError(
+          "כדי שהטקסט יוקלד לאפליקציות אחרות, אשרו את ״הכתבה בעברית״ תחת " +
+          "הגדרות המערכת ← פרטיות ואבטחה ← נגישות, ואז הפעילו את האפליקציה מחדש."
+        );
+      }
+    } catch { /* older backend without the command */ }
   }
 
   const persistSettings = useCallback(async (overrides: Partial<AppSettings> = {}) => {
@@ -1820,6 +1857,11 @@ function App() {
       // failed. The user can re-enter the key from Settings; we don't want them
       // stuck in the wizard forever.
       try { await persistSettings(overrides); } catch { /* swallow — best effort */ }
+      // The dedicated command bypasses merge_frontend_update entirely. Before
+      // 2.13.2 the merge overwrote the smuggled onboarding_completed:true with
+      // the in-memory false, re-onboarding every keyless user on every launch
+      // (the merge now latches too — this is belt and suspenders).
+      try { await invoke("mark_onboarding_complete"); } catch { /* ok */ }
       try { await invoke("accept_terms"); } catch { /* ok */ }
       setView("main");
 

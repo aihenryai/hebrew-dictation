@@ -54,6 +54,11 @@ tiny_http = "0.12"
 # WASAPI loopback capture of the default render device (system audio). Windows only.
 # Pinned to 0.23.x; the capture body below targets 0.23.0's StreamMode-based API
 # (three-arg initialize_client; loopback = default Render device + Direction::Capture).
+[target.'cfg(target_os = "macos")'.dependencies]
+# CF types for AXIsProcessTrustedWithOptions (Accessibility prompt). 0.10 is
+# already in the tree via tao/wry — this adds no new build unit family.
+core-foundation = "0.10"
+
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
 win32job = "2.0"
