@@ -948,6 +948,17 @@ function App() {
   useEffect(() => {
     runUpdateCheck(true);
     getVersion().then(setAppVersion).catch(() => {});
+
+    // Also re-check periodically while the app stays open. This is a
+    // background dictation tool people leave running for days — a single
+    // check at launch means a transient failure (or a release that just
+    // missed the CDN) silently loses the ENTIRE session's chance to ever
+    // offer that update, with no way for the user to know. Skipped once an
+    // update is already found — no reason to keep polling.
+    const intervalId = setInterval(() => {
+      if (!updateRef.current) runUpdateCheck(true);
+    }, 3 * 60 * 60 * 1000); // 3h
+    return () => clearInterval(intervalId);
   }, [runUpdateCheck]);
 
   const handleInstallUpdate = useCallback(async () => {
