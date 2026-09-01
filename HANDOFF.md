@@ -4,6 +4,26 @@
 
 ---
 
+## 🚀 v2.13.3 — RELEASED 2026-09-01 · Deepgram day-name→Spanish-ordinal fix
+
+Ran step 0א from `HANDOFF-TRANSCRIPTION-QUALITY.md` live with Henry (5 real dictations,
+compared intended text / on-screen text / raw MCP transcript). Found the actual root
+cause: Deepgram's `smart_format` reformats Hebrew day-names into the SPANISH ordinal
+convention — "ביום שני" → "ביום 2º" (U+00BA, literally "2nd" in Spanish). Confirmed 3x
+live, always right after "ביום". Screen matched the MCP transcript every time — this was
+never an injection bug, and never needed the LLM-corrector/Gemini-unfreeze path the
+original brief was written around.
+
+Fix: `replace=` query params (7-pair table, Hebrew-only) added to all 4 Deepgram call
+sites — 3 batch + streaming (the default path). Deterministic, zero LLM risk. Full
+writeup + what was measured but NOT fixed (API→abi garbling, no dropped-words repro):
+`memory/hebrew-dictation.md`'s v2.13.3 section.
+
+⚠️ **Not verified against real Deepgram before shipping** (no key available outside the
+running app). First dictation after auto-update on Henry's machine is the real test.
+
+---
+
 ## 🚀 v2.13.2 — RELEASED 2026-08-31 · macOS fix wave (real user report)
 
 A Mac user reported: works once, only inside the app, then "no model loaded" forever. A
