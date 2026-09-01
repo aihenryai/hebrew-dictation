@@ -4,6 +4,37 @@
 
 ---
 
+## 🚀 v2.13.2 — RELEASED 2026-08-31 · macOS fix wave (real user report)
+
+A Mac user reported: works once, only inside the app, then "no model loaded" forever. A
+16-agent adversarially-verified audit confirmed 5 bugs; all fixed and shipped the same
+session. Full mechanics + the refuted TCC/ad-hoc-signing claim: the v2.13.2 section of
+`memory/hebrew-dictation.md`. Commits `ecb2449` (fixes) + `d02de6a` (bump).
+
+The five, in one line each:
+1. Accessibility permission was undiscoverable (query-only check, error swallowed in
+   frontend AND streaming) → prompt at startup + `is_accessibility_trusted` + surfacing.
+2. Injection defocus dance had Windows semantics → app-level [NSApp hide:] on macOS
+   (`MACOS_APP_HIDDEN` latch, `macos_unhide_if_needed` in window-show paths).
+3. No `RunEvent::Reopen` → Dock click restored nothing after close-to-tray. Added.
+4. `merge_frontend_update` clobbered the wizard's `onboarding_completed:true` (BOTH
+   platforms) → latch + dedicated command + initApp self-heal + 2 regression tests.
+5. RAM pre-flight rejected the small model forever on macOS (sysinfo subtracts the
+   compressor) → guard now Windows-only.
+
+**⚠️ Fixes 2+3 follow documented AppKit behavior but were NOT verified on real hardware
+— the reporting Mac user is the tester. Ask Henry for his feedback before building
+further macOS work on top of them.**
+
+Release verified live: latest.json carries windows-x86_64 + darwin-aarch64 on 2.13.2,
+all assets 200, site bumped and confirmed live (5 v2.13.2 refs on the page).
+⚠️ New shared-tree trap variant hit during the site bump: Henry-Website was checked out
+on another session's `feature/webinar-copilot`, so the commit landed there first.
+Recovered (reset branch, cherry-pick to main, restored their checkout). **Check
+`git branch --show-current` before committing in Henry-Website.**
+
+---
+
 ## 🚀 v2.13.0 — RELEASED 2026-08-25
 
 Everything in the two 2026-08-25 sections below shipped here, plus the whole narration feature
