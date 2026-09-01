@@ -40,9 +40,15 @@ impl StreamingSession {
         language: &str,
         app: AppHandle,
     ) -> Result<Arc<Self>, String> {
+        // day_ordinal_replace_params: Deepgram's smart_format reformats Hebrew
+        // day-names ("ביום שני") into a Spanish-style ordinal indicator
+        // ("ביום 2º") — see its doc comment in api_transcribe.rs for the full
+        // writeup. This is the default (streaming) path Henry dictates through,
+        // so this call site is the one that matters most in practice.
         let url = format!(
-            "wss://api.deepgram.com/v1/listen?model=nova-3&language={}&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&punctuate=true&interim_results=true",
-            language
+            "wss://api.deepgram.com/v1/listen?model=nova-3&language={}&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&punctuate=true&interim_results=true{}",
+            language,
+            crate::api_transcribe::day_ordinal_replace_params(language)
         );
 
         let mut request = url

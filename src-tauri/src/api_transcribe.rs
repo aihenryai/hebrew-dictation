@@ -244,6 +244,64 @@ async fn transcribe_groq_inner(
 
 // ── Deepgram Nova-3 API ──
 
+/// Deepgram's `smart_format` misfires on Hebrew day-names: "ביום שני" ("on
+/// Monday") comes back as "ביום 2º" — U+00BA MASCULINE ORDINAL INDICATOR, the
+/// Spanish/Portuguese/Italian glyph for "2nd" (1º, 2º, 3º…). This is not a
+/// mis-hearing — Deepgram recognized the word correctly and then reformatted
+/// it into the wrong language's ordinal convention. Confirmed reproducible
+/// live with Henry 2026-09-01 (session that captured this): "ביום 5º",
+/// "ביום 2º", "ביום 3º", "ביום 1º" all appeared for חמישי/שני/שלישי/ראשון,
+/// while the SAME words stayed correct when not directly preceded by "ביום"
+/// (e.g. "וחמישי", "ורביעי" in "ביום שני וחמישי" — only the word right after
+/// "ביום" gets reformatted). `replace` deterministically undoes the specific
+/// wrong string Deepgram is known to emit — no guessing, no LLM, can't invent
+/// text that wasn't there. Hebrew has no native use for "º" at all, so this
+/// can't collide with a legitimate transcript.
+/// Deepgram docs: find terms must be lowercase; digits aren't cased, so no
+/// issue here. https://developers.deepgram.com/docs/find-and-replace
+pub(crate) fn day_ordinal_replace_params(lang: &str) -> String {
+    if lang != "he" {
+        // The bug is specific to Hebrew day-names; "multi" is never used for
+        // Hebrew in this app (see transcribe_deepgram_batch's doc comment), so
+        // "he" is the only language where this string can legitimately appear.
+        return String::new();
+    }
+    const DAYS: [(&str, &str); 7] = [
+        ("1º", "ראשון"),
+        ("2º", "שני"),
+        ("3º", "שלישי"),
+        ("4º", "רביעי"),
+        ("5º", "חמישי"),
+        ("6º", "שישי"),
+        ("7º", "שבת"),
+    ];
+    let mut out = String::new();
+    for (find, replacement) in DAYS {
+        out.push_str("&replace=");
+        out.push_str(&urlencoding_percent_encode(find));
+        out.push(':');
+        out.push_str(&urlencoding_percent_encode(replacement));
+    }
+    out
+}
+
+/// Minimal percent-encoding for a Deepgram query-param value: UTF-8 bytes,
+/// percent-escape everything outside `A-Za-z0-9-_.~`. No external crate
+/// needed for the small, fixed inputs `day_ordinal_replace_params` calls this
+/// with.
+fn urlencoding_percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
 async fn transcribe_deepgram_inner(
     samples: &[f32],
     api_key: &str,
@@ -254,8 +312,9 @@ async fn transcribe_deepgram_inner(
     // "auto" → default to Hebrew (single-language). "multi" → Nova-3 code-switching (Hebrew+English mid-sentence).
     let lang = if language == "auto" { "he" } else { language };
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true",
-        lang
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}",
+        lang,
+        day_ordinal_replace_params(lang)
     );
 
     let response = reqwest::Client::new()
@@ -305,8 +364,9 @@ pub(crate) async fn transcribe_deepgram_batch(
     // change the transcript text, so it's safe to send on every batch request
     // (single-speaker audio simply reports one speaker → no SRT label).
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true",
-        lang
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true{}",
+        lang,
+        day_ordinal_replace_params(lang)
     );
 
     let response = client
@@ -392,8 +452,9 @@ pub(crate) fn parse_deepgram_words(alt: &serde_json::Value) -> Vec<crate::srt::T
 fn multichannel_url(language: &str) -> String {
     let lang = if language == "auto" { "he" } else { language };
     format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&multichannel=true",
-        lang
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&multichannel=true{}",
+        lang,
+        day_ordinal_replace_params(lang)
     )
 }
 
@@ -630,11 +691,31 @@ mod tests {
         assert!(url.contains("multichannel=true"));
         assert!(!url.contains("diarize"));
         assert!(!url.contains("paragraphs"));
-        // An explicit language passes through unchanged.
+        // Hebrew also carries the day-ordinal replace fix (see day_ordinal_replace_params).
+        assert!(url.contains("replace="));
+
+        // A non-Hebrew language: base params unchanged, no replace params appended
+        // (the º-for-day-name bug is Hebrew-specific).
         assert_eq!(
-            multichannel_url("he"),
-            "https://api.deepgram.com/v1/listen?model=nova-3&language=he&smart_format=true&punctuate=true&multichannel=true"
+            multichannel_url("en"),
+            "https://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true&punctuate=true&multichannel=true"
         );
+    }
+
+    #[test]
+    fn day_ordinal_replace_params_only_for_hebrew() {
+        assert_eq!(day_ordinal_replace_params("en"), "");
+        assert_eq!(day_ordinal_replace_params("multi"), "");
+        assert_eq!(day_ordinal_replace_params("auto"), "");
+    }
+
+    #[test]
+    fn day_ordinal_replace_params_covers_all_seven_days_percent_encoded() {
+        let params = day_ordinal_replace_params("he");
+        // Deepgram's own encoding: º is U+00BA → UTF-8 C2 BA → %C2%BA.
+        assert!(params.contains("&replace=1%C2%BA:%D7%A8%D7%90%D7%A9%D7%95%D7%9F"));
+        assert!(params.contains("&replace=2%C2%BA:%D7%A9%D7%A0%D7%99"));
+        assert_eq!(params.matches("&replace=").count(), 7, "one pair per day of the week");
     }
 
     #[test]
