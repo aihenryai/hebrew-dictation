@@ -4,11 +4,11 @@ import { listen, emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { check, Update } from "@tauri-apps/plugin-updater";
+import { getVersion } from "@tauri-apps/api/app";
 import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 /* ----------- אפליקציה: קבועים ----------- */
-const APP_VERSION = "v2.11.0";
 const APP_LICENSE = "MIT";
 
 // Main window's steady-state size — must match `tauri.conf.json`'s `main`
@@ -49,14 +49,17 @@ const LINKS = {
   email: "henrystauber22@gmail.com",
 };
 
-// פידבק והצעות לשיפור — נשלח ישירות לאימייל של הנרי
-const FEEDBACK_URL = `mailto:${LINKS.email}?subject=${encodeURIComponent(
-  "פידבק על הכתבה בעברית"
-)}&body=${encodeURIComponent(
-  "היי הנרי,\n\n[כתבו כאן: באג / בקשה לפיצ'ר / שאלה / מחשבה]\n\nגרסה: " +
-    APP_VERSION +
-    "\n"
-)}`;
+// פידבק והצעות לשיפור — נשלח ישירות לאימייל של הנרי. פונקציה, לא קבוע:
+// הגרסה נטענת א-סינכרונית מ-getVersion(), אז חייבת להיכנס בזמן הרינדור.
+function feedbackUrl(version: string): string {
+  return `mailto:${LINKS.email}?subject=${encodeURIComponent(
+    "פידבק על הכתבה בעברית"
+  )}&body=${encodeURIComponent(
+    "היי הנרי,\n\n[כתבו כאן: באג / בקשה לפיצ'ר / שאלה / מחשבה]\n\nגרסה: " +
+      (version || "לא ידועה") +
+      "\n"
+  )}`;
+}
 
 type AppStatus = "idle" | "recording" | "transcribing" | "enhancing" | "downloading" | "loading-model";
 type AppView = "main" | "settings" | "onboarding" | "batch" | "narration";
@@ -545,6 +548,13 @@ function App() {
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string } | null>(null);
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateCheckMessage, setUpdateCheckMessage] = useState("");
+  // Empty until getVersion() resolves — never a stale hardcoded number. The
+  // display constant used to be hand-bumped and was stuck at "v2.11.0" through
+  // 12+ later releases (real user confusion, 2026-09-02: Henry couldn't tell
+  // whether he was up to date because the version shown never matched reality).
+  const [appVersion, setAppVersion] = useState("");
   // Batch file transcription (multi-file upload → cloud Deepgram / local whisper).
   const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
@@ -903,20 +913,42 @@ function App() {
     } catch { return []; }
   }
 
-  // Check for a new release once at startup. Silent on network/endpoint errors.
-  useEffect(() => {
-    (async () => {
-      try {
-        const update = await check();
-        if (update) {
-          updateRef.current = update;
-          setUpdateAvailable({ version: update.version });
-        }
-      } catch {
-        // Offline or endpoint unreachable — ignore, try again next launch.
+  // Shared by the silent startup check and the manual "בדוק עדכונים" button.
+  // `silent=true` (startup) swallows failures exactly as before — a launch
+  // shouldn't nag about a transient network blip. `silent=false` (the user
+  // explicitly asked) always shows a result: found, up to date, or the error
+  // itself. Before this, a failed check was 100% invisible either way — the
+  // real gap Henry hit (2026-09-02): a genuine check failure looked identical
+  // to "no update exists", with no way to tell the difference or retry.
+  const runUpdateCheck = useCallback(async (silent: boolean) => {
+    if (!silent) {
+      setUpdateChecking(true);
+      setUpdateCheckMessage("");
+    }
+    try {
+      const update = await check();
+      if (update) {
+        updateRef.current = update;
+        setUpdateAvailable({ version: update.version });
+        if (!silent) setUpdateCheckMessage("");
+      } else if (!silent) {
+        // Read the version fresh here instead of depending on `appVersion`
+        // state, so this callback never needs that in its dependency array.
+        const current = await getVersion().catch(() => "נוכחית");
+        setUpdateCheckMessage(`אתה מעודכן — גרסה ${current}`);
       }
-    })();
+    } catch (e) {
+      if (!silent) setUpdateCheckMessage(`בדיקת עדכון נכשלה: ${e}`);
+      // Silent path: offline or endpoint unreachable — ignore, try again next launch.
+    } finally {
+      if (!silent) setUpdateChecking(false);
+    }
   }, []);
+
+  useEffect(() => {
+    runUpdateCheck(true);
+    getVersion().then(setAppVersion).catch(() => {});
+  }, [runUpdateCheck]);
 
   const handleInstallUpdate = useCallback(async () => {
     const update = updateRef.current;
@@ -2226,7 +2258,7 @@ function App() {
                     <span className="cta-icon">🔗</span>
                     <span className="cta-label">כל הקישורים</span>
                   </a>
-                  <a className="wizard-cta-btn cta-feedback" href={FEEDBACK_URL} target="_blank" rel="noopener">
+                  <a className="wizard-cta-btn cta-feedback" href={feedbackUrl(appVersion)} target="_blank" rel="noopener">
                     <span className="cta-icon">✏️</span>
                     <span className="cta-label">פידבק</span>
                   </a>
@@ -2237,7 +2269,7 @@ function App() {
               <button className="btn-wizard-next" onClick={completeOnboarding}>התחל</button>
             </div>
             <div className="wizard-credit">
-              <span>נוצר ע״י הנרי שטאובר · BinTech AI · רישיון {APP_LICENSE} · {APP_VERSION}</span>
+              <span>נוצר ע״י הנרי שטאובר · BinTech AI · רישיון {APP_LICENSE} · {appVersion ? `v${appVersion}` : ""}</span>
             </div>
           </div>
         )}
@@ -2915,8 +2947,32 @@ function App() {
         {/* About */}
         <div className="settings-section about-section">
           <h3>אודות</h3>
-          <p className="about-app-name">הכתבה בעברית {APP_VERSION}</p>
+          <p className="about-app-name">הכתבה בעברית {appVersion ? `v${appVersion}` : ""}</p>
           <p className="about-brand">BinTech AI — הנרי שטאובר</p>
+
+          {/* Manual update check — the ONLY way to trigger one before this was
+              the silent automatic check at launch, which failed with zero
+              user-visible feedback on any error (real gap: Henry looked for
+              an update option and found none, 2026-09-02). */}
+          {updateAvailable && !updateInstalling ? (
+            <button
+              className="btn-test valid"
+              onClick={handleInstallUpdate}
+              disabled={status !== "idle"}
+              title={status !== "idle" ? "סיים את ההקלטה לפני העדכון" : undefined}
+            >
+              🎉 גרסה {updateAvailable.version} זמינה — התקן
+            </button>
+          ) : (
+            <button
+              className="btn-test"
+              onClick={() => runUpdateCheck(false)}
+              disabled={updateChecking}
+            >
+              {updateChecking ? "בודק..." : "בדוק עדכונים עכשיו"}
+            </button>
+          )}
+          {updateCheckMessage && <p className="settings-note">{updateCheckMessage}</p>}
 
           <div className="about-cta-grid">
             <a className="about-cta-btn" href={LINKS.youtube} target="_blank" rel="noopener" title="ערוץ YouTube">
@@ -2928,7 +2984,7 @@ function App() {
             <a className="about-cta-btn" href={LINKS.taplink} target="_blank" rel="noopener" title="כל הקישורים">
               <span>🔗</span><span>קישורים</span>
             </a>
-            <a className="about-cta-btn about-cta-btn-primary" href={FEEDBACK_URL} title="שלח פידבק במייל">
+            <a className="about-cta-btn about-cta-btn-primary" href={feedbackUrl(appVersion)} title="שלח פידבק במייל">
               <span>✉️</span><span>פידבק</span>
             </a>
           </div>

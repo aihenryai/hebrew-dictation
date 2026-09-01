@@ -44,6 +44,7 @@ pub fn is_accessibility_trusted() -> bool {
 /// macOS: show the system Accessibility-permission dialog if the app is not
 /// yet trusted, and register it in the Privacy & Security → Accessibility
 /// pane either way. Returns the current trust state. No-op (true) elsewhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn prompt_accessibility_if_needed() -> bool {
     #[cfg(target_os = "macos")]
     {

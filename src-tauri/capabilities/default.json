@@ -5,6 +5,7 @@
   "windows": ["main", "toolbar"],
   "permissions": [
     "core:default",
+    "core:app:allow-version",
     "core:window:allow-start-dragging",
     "core:window:allow-set-position",
     "core:window:allow-scale-factor",
