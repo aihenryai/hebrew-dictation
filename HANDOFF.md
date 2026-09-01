@@ -4,6 +4,35 @@
 
 ---
 
+## 🚀 v2.13.4 — RELEASED 2026-09-02 · why v2.13.3 never reached Henry
+
+Henry reported (2026-09-02) "I don't see an update option" — investigation found his
+running app was still **v2.13.2**, launched hours after v2.13.3 published. Root cause was
+a chain of two silent gaps, not a fluke:
+
+1. **`APP_VERSION` was a hardcoded const stuck at `"v2.11.0"`** through 12+ later releases
+   — every settings screen and every feedback-email body lied about what was actually
+   installed. Now read live via Tauri's `getVersion()` (`@tauri-apps/api/app`), which
+   cannot drift from the running binary.
+2. **No manual "check for updates" control existed anywhere.** The only trigger was the
+   silent automatic check at launch, whose `catch` block swallowed every error with zero
+   user-facing feedback — a real failure was indistinguishable from "no update exists".
+   Added a "בדוק עדכונים עכשיו" button in Settings; the auto-check still fails silently
+   (a launch shouldn't nag on a transient blip), but a manual check always reports a
+   result now — found, up to date, or the actual error.
+
+**Consequence worth flagging:** this means the v2.13.3 day-ordinal fix below was
+**still unverified against Henry's real usage** at the time this was found — he'd been
+stuck on 2.13.2 the whole time. First dictation after he actually updates to 2.13.4 (which
+carries both fixes) is the real test of both.
+
+Also from this session: a live "אצלי" (dropped-word) report couldn't be captured via the
+MCP transcript tool (only exposes the LATEST dictation, and several attempts happened
+between polls) — logged as unconfirmed, not fixed. Re-attempt with one dictation at a time
+if this comes up again.
+
+---
+
 ## 🚀 v2.13.3 — RELEASED 2026-09-01 · Deepgram day-name→Spanish-ordinal fix
 
 Ran step 0א from `HANDOFF-TRANSCRIPTION-QUALITY.md` live with Henry (5 real dictations,
