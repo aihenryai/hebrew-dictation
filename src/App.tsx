@@ -113,6 +113,7 @@ interface AppSettings {
   always_on_top?: boolean;
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
+  language_switch_keywords_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
   pause_hotkey?: string | null;
@@ -142,6 +143,7 @@ interface RedactedSettings {
   always_on_top?: boolean;
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
+  language_switch_keywords_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
   pause_hotkey?: string | null;
@@ -438,6 +440,7 @@ async function persistLoadedSettings(base: RedactedSettings, overrides: Partial<
     always_on_top: base.always_on_top,
     autostart_enabled: base.autostart_enabled,
     streaming_enabled: base.streaming_enabled,
+    language_switch_keywords_enabled: base.language_switch_keywords_enabled,
     floating_toolbar_enabled: base.floating_toolbar_enabled,
     hotkey: base.hotkey,
     pause_hotkey: base.pause_hotkey,
@@ -520,6 +523,7 @@ function App() {
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(true);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
+  const [languageSwitchKeywordsEnabled, setLanguageSwitchKeywordsEnabled] = useState(false);
   const [floatingToolbarEnabled, setFloatingToolbarEnabled] = useState(true);
   // v2.7.0 — configurable behavior
   const [hotkey, setHotkey] = useState<string>("alt+d");
@@ -866,6 +870,25 @@ function App() {
     };
   }, [stopAndTranscribe, beginRecording]);
 
+  // Opt-in: saying "כתוב בעברית" / "כתוב באנגלית" mid-dictation (streaming.rs
+  // detects the exact trigger phrase and never injects/accumulates it) restarts
+  // the session in the new language — a Deepgram WS's language is fixed at
+  // connection time, so switching means stop-then-start with the new value.
+  // languageRef is updated FIRST so beginRecording (which reads it) picks up
+  // the new language on this same restart, not the next one.
+  useEffect(() => {
+    const unlistenLanguageSwitch = listen<string>("language-switch-requested", async (event) => {
+      const target = event.payload as Language;
+      setLanguage(target);
+      languageRef.current = target;
+      await stopAndTranscribe();
+      await beginRecording();
+    });
+    return () => {
+      unlistenLanguageSwitch.then((fn) => fn());
+    };
+  }, [stopAndTranscribe, beginRecording]);
+
   // Live transcription events (streaming mode). Accumulates final segments and
   // appends the latest interim chunk for in-flight preview.
   useEffect(() => {
@@ -1114,6 +1137,9 @@ function App() {
           persistLoadedSettings(settings, { streaming_enabled: false });
         }
       }
+      if (typeof settings.language_switch_keywords_enabled === "boolean") {
+        setLanguageSwitchKeywordsEnabled(settings.language_switch_keywords_enabled);
+      }
       if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
       if (typeof settings.hotkey === "string" && settings.hotkey) setHotkey(settings.hotkey);
       if (typeof settings.pause_hotkey === "string" || settings.pause_hotkey === null) {
@@ -1203,6 +1229,7 @@ function App() {
       always_on_top: alwaysOnTop,
       autostart_enabled: autostartEnabled,
       streaming_enabled: streamingEnabled,
+      language_switch_keywords_enabled: languageSwitchKeywordsEnabled,
       floating_toolbar_enabled: floatingToolbarEnabled,
       hotkey: hotkey,
       pause_hotkey: pauseHotkey,
@@ -1217,7 +1244,7 @@ function App() {
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, languageSwitchKeywordsEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -2684,6 +2711,31 @@ function App() {
             </span>
           </label>
           <p className="settings-hint">לא תואם ל-✨ רישוף חכם — כשהרישוף דלוק, ההכתבה הסימולטנית נעולה, וההיפך.</p>
+        </div>
+
+        {/* Language switch by voice keyword — real user request, 2026-09-02 */}
+        <div className="settings-section">
+          <h3>מעבר שפה במילת מפתח</h3>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={languageSwitchKeywordsEnabled}
+              // Requires streaming — the keyword is detected on the live segment
+              // stream, and switching languages means restarting that session.
+              disabled={!streamingEnabled}
+              onChange={() => {
+                const v = !languageSwitchKeywordsEnabled;
+                setLanguageSwitchKeywordsEnabled(v);
+                persistSettings({ language_switch_keywords_enabled: v });
+              }}
+            />
+            <span className="toggle-text">
+              תגידו ״כתוב בעברית״ או ״כתוב באנגלית״ תוך כדי הכתבה כדי לעבור שפה
+            </span>
+          </label>
+          <p className="settings-hint">
+            דורש הכתבה סימולטנית דלוקה. המילים עצמן לא יוקלדו — רק ישנו את השפה מאותה נקודה.
+          </p>
         </div>
 
         {/* Always on top */}

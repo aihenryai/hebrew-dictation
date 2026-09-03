@@ -1376,15 +1376,17 @@ async fn start_streaming_transcription(
         Some("auto") | None => "he".to_string(),
         Some(other) => other.to_string(),
     };
-    let api_key = {
+    let (api_key, language_switch_enabled) = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
         if !matches!(s.api_provider, settings::ApiProvider::Deepgram) {
             return Err("Streaming זמין רק עם Deepgram. עבור ל-Deepgram בהגדרות.".to_string());
         }
-        s.deepgram_api_key
+        let key = s
+            .deepgram_api_key
             .clone()
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?
+            .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?;
+        (key, s.language_switch_keywords_enabled)
     };
 
     // Channel to pipe audio chunks from the CPAL callback (sync) to an async dispatcher.
@@ -1416,7 +1418,14 @@ async fn start_streaming_transcription(
     }
 
     // Open WebSocket. If this fails, roll back the recorder we just started.
-    let session = match streaming::StreamingSession::start(&api_key, &lang, app.clone()).await {
+    let session = match streaming::StreamingSession::start(
+        &api_key,
+        &lang,
+        language_switch_enabled,
+        app.clone(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;

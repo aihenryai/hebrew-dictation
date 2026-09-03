@@ -87,6 +87,17 @@ pub struct AppSettings {
     pub autostart_enabled: bool,
     #[serde(default)]
     pub streaming_enabled: bool,
+    /// Opt-in: saying "כתוב בעברית" / "כתוב באנגלית" as a standalone utterance
+    /// mid-dictation switches the active language and restarts the streaming
+    /// session — real user request (עומרי רוזן, 2026-09-02): Deepgram's Nova-3
+    /// `multi` code-switching mode is never used for Hebrew (see
+    /// `transcribe_deepgram_batch`'s doc comment), so a keyword-driven switch is
+    /// the only way to dictate bilingually. Default false — a spoken sentence
+    /// that happens to exactly match a trigger phrase would otherwise vanish
+    /// instead of being typed, which must never happen to someone who didn't
+    /// opt in.
+    #[serde(default)]
+    pub language_switch_keywords_enabled: bool,
     #[serde(default = "default_true")]
     pub floating_toolbar_enabled: bool,
     #[serde(default = "default_hotkey")]
@@ -169,6 +180,7 @@ pub struct RedactedSettings {
     pub always_on_top: bool,
     pub autostart_enabled: bool,
     pub streaming_enabled: bool,
+    pub language_switch_keywords_enabled: bool,
     pub floating_toolbar_enabled: bool,
     pub hotkey: String,
     pub pause_hotkey: Option<String>,
@@ -205,6 +217,7 @@ impl AppSettings {
             always_on_top: self.always_on_top,
             autostart_enabled: self.autostart_enabled,
             streaming_enabled: self.streaming_enabled,
+            language_switch_keywords_enabled: self.language_switch_keywords_enabled,
             floating_toolbar_enabled: self.floating_toolbar_enabled,
             hotkey: self.hotkey.clone(),
             pause_hotkey: self.pause_hotkey.clone(),
@@ -291,6 +304,7 @@ impl Default for AppSettings {
             always_on_top: true,
             autostart_enabled: true,
             streaming_enabled: true,
+            language_switch_keywords_enabled: false,
             floating_toolbar_enabled: true,
             hotkey: default_hotkey(),
             pause_hotkey: default_pause_hotkey(),

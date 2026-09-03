@@ -32,12 +32,37 @@ pub struct StreamingSession {
 /// macOS Accessibility permission) surfaces exactly once, not once per segment.
 type InjectErrReported = Arc<std::sync::atomic::AtomicBool>;
 
+/// Real request (עומרי רוזן, 2026-09-02): say "כתוב בעברית" / "כתוב באנגלית" mid-
+/// dictation to switch language, since Deepgram's `multi` code-switching mode is
+/// never used for Hebrew (see `transcribe_deepgram_batch`'s doc comment) — a
+/// keyword trigger is the only way to dictate bilingually today.
+///
+/// Matches ONLY when the ENTIRE final segment is the trigger phrase (after
+/// trimming whitespace and a trailing sentence-ending mark smart_format may add)
+/// — never a substring — so a sentence that merely mentions writing Hebrew or
+/// English ("אני אוהב לכתוב בעברית") is never swallowed as a command. A
+/// streaming final segment is exactly what the user said between two pauses, so
+/// requiring an exact match is not a burden: saying the trigger phrase alone,
+/// which is how a command is naturally spoken, already produces this.
+fn detect_language_switch(transcript: &str) -> Option<&'static str> {
+    let trimmed = transcript
+        .trim()
+        .trim_end_matches(['.', '!', '?', '。', '׃'])
+        .trim();
+    match trimmed {
+        "כתוב בעברית" | "תכתוב בעברית" => Some("he"),
+        "כתוב באנגלית" | "תכתוב באנגלית" => Some("en"),
+        _ => None,
+    }
+}
+
 impl StreamingSession {
     /// Open a WebSocket connection to Deepgram streaming and start a receive task
     /// that emits `transcription-interim` events for each message.
     pub async fn start(
         api_key: &str,
         language: &str,
+        language_switch_enabled: bool,
         app: AppHandle,
     ) -> Result<Arc<Self>, String> {
         // day_ordinal_replace_params: Deepgram's smart_format reformats Hebrew
@@ -77,8 +102,14 @@ impl StreamingSession {
             while let Some(msg) = reader.next().await {
                 match msg {
                     Ok(Message::Text(txt)) => {
-                        handle_message(&txt, &final_text_rx, &app_clone, &inject_err_reported)
-                            .await;
+                        handle_message(
+                            &txt,
+                            &final_text_rx,
+                            &app_clone,
+                            &inject_err_reported,
+                            language_switch_enabled,
+                        )
+                        .await;
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
@@ -143,6 +174,7 @@ async fn handle_message(
     final_text: &Arc<Mutex<String>>,
     app: &AppHandle,
     inject_err_reported: &InjectErrReported,
+    language_switch_enabled: bool,
 ) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
@@ -164,6 +196,17 @@ async fn handle_message(
 
     if transcript.is_empty() {
         return;
+    }
+
+    if is_final && language_switch_enabled {
+        if let Some(target_lang) = detect_language_switch(transcript) {
+            // A command, not content: never inject it, never accumulate it into
+            // the dictated text. The frontend restarts the streaming session
+            // with the new language (a WS connection's language is fixed at
+            // open time, so switching mid-stream means reconnecting).
+            let _ = app.emit("language-switch-requested", target_lang);
+            return;
+        }
     }
 
     if is_final {
@@ -219,5 +262,42 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
         },
         WsErr::Io(io) => format!("אין חיבור ל-Deepgram — {}", io),
         _ => format!("שגיאת streaming: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_language_switch_matches_exact_hebrew_and_english_triggers() {
+        assert_eq!(detect_language_switch("כתוב בעברית"), Some("he"));
+        assert_eq!(detect_language_switch("תכתוב בעברית"), Some("he"));
+        assert_eq!(detect_language_switch("כתוב באנגלית"), Some("en"));
+        assert_eq!(detect_language_switch("תכתוב באנגלית"), Some("en"));
+    }
+
+    #[test]
+    fn detect_language_switch_tolerates_smart_format_punctuation_and_whitespace() {
+        assert_eq!(detect_language_switch("כתוב בעברית."), Some("he"));
+        assert_eq!(detect_language_switch("  כתוב בעברית  "), Some("he"));
+        assert_eq!(detect_language_switch("כתוב באנגלית!"), Some("en"));
+    }
+
+    /// The load-bearing guard: a sentence that merely mentions the trigger
+    /// phrase must never be swallowed as a command — only an EXACT match on
+    /// the whole final segment counts.
+    #[test]
+    fn detect_language_switch_never_matches_a_substring_of_a_real_sentence() {
+        assert_eq!(detect_language_switch("אני אוהב לכתוב בעברית כל יום"), None);
+        assert_eq!(detect_language_switch("הוא אמר לי כתוב בעברית ואני כתבתי"), None);
+        assert_eq!(detect_language_switch("כתוב בעברית ותשלח לי"), None);
+    }
+
+    #[test]
+    fn detect_language_switch_ignores_unrelated_text() {
+        assert_eq!(detect_language_switch(""), None);
+        assert_eq!(detect_language_switch("שלום עולם"), None);
+        assert_eq!(detect_language_switch("write in hebrew"), None);
     }
 }
