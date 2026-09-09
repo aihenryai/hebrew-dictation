@@ -4,6 +4,34 @@
 
 ---
 
+## 🚀 v2.13.5 — RELEASED 2026-09-09 · dropped keystrokes on longer dictations
+
+Henry reported (2026-09-09): typing into Claude Desktop starts, then silently stops
+partway through longer dictations. Traced to enigo 0.2.1's Windows backend: `text()`
+batches an ENTIRE call's characters into one array and fires them as a SINGLE
+`SendInput` syscall — for a long segment, hundreds of synthetic key events landing on
+the target in one burst. `SendInput` is dispatched through the receiving app's own
+message pump; a heavier controlled-input UI (chat composers, Electron apps) doing real
+work per keystroke can fall behind a big burst, and Windows drops what the pump wasn't
+ready for — worse as the message grows, matching the report exactly (each burst grows,
+so does the target's per-keystroke render cost).
+
+Fix: `injector::chunk_chars()` splits into ≤30-char pieces injected with an 8ms pause
+between them — gives the target's pump repeated chances to catch up. Adds well under a
+second even to a long paragraph. This ALSO applies to the language-switch feature from
+last week (same `inject_text` call path) and to macOS (same `SendInput`-style
+backpressure risk on CGEventPost + Electron, though the report was Windows). Commit
+`41384e7`. Also folds in `e656b4f` (voice-triggered language switch, committed 09-02 but
+deliberately held back from a release then).
+
+⚠️ Not verified against a real reproduction — could not observe live (Claude Desktop is
+this session's own window; computer-use explicitly refuses to grant control of Claude's
+own app). Diagnosis is from `enigo`'s actual vendored source + the shape of the report,
+not from watching it happen. **First real test is Henry's next long dictation into
+Claude Desktop after updating.**
+
+---
+
 ## 🚀 v2.13.4 — RELEASED 2026-09-02 · why v2.13.3 never reached Henry
 
 Henry reported (2026-09-02) "I don't see an update option" — investigation found his
