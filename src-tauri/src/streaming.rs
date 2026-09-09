@@ -44,8 +44,24 @@ type InjectErrReported = Arc<std::sync::atomic::AtomicBool>;
 /// streaming final segment is exactly what the user said between two pauses, so
 /// requiring an exact match is not a burden: saying the trigger phrase alone,
 /// which is how a command is naturally spoken, already produces this.
+/// Strip Hebrew niqud/cantillation marks (U+0591–U+05C7 — points, dagesh,
+/// rafe, shin/sin dots, cantillation; base letters are U+05D0–U+05EA, a
+/// disjoint range, so this never touches them). Confirmed necessary live
+/// (Henry, 2026-09-09): a short, isolated utterance like "כתוב באנגלית" can
+/// come back from Deepgram FULLY NIQQUD ("כְּתוֹב בַּאֲנָלִית") even though
+/// no other transcript this session ever showed niqud — smart_format seems to
+/// reach for a more "dictionary pronunciation" rendering specifically when it
+/// has little surrounding context. Byte-for-byte exact matching against plain
+/// text silently failed on every such segment.
+fn strip_niqud(s: &str) -> String {
+    s.chars()
+        .filter(|c| !('\u{0591}'..='\u{05C7}').contains(c))
+        .collect()
+}
+
 fn detect_language_switch(transcript: &str) -> Option<&'static str> {
-    let trimmed = transcript
+    let stripped = strip_niqud(transcript);
+    let trimmed = stripped
         .trim()
         .trim_end_matches(['.', '!', '?', '。', '׃'])
         .trim();
@@ -275,6 +291,24 @@ mod tests {
         assert_eq!(detect_language_switch("תכתוב בעברית"), Some("he"));
         assert_eq!(detect_language_switch("כתוב באנגלית"), Some("en"));
         assert_eq!(detect_language_switch("תכתוב באנגלית"), Some("en"));
+    }
+
+    /// Real live failure (Henry, 2026-09-09): a short isolated trigger phrase
+    /// came back from Deepgram FULLY NIQQUD — "כְּתוֹב בַּאֲנָלִית" — while every
+    /// other transcript that session was plain text. Byte-exact matching
+    /// silently never fired. (That real capture also mis-heard the base word
+    /// as "אנלית" — a separate ASR error niqud-stripping can't fix; tested
+    /// here with the correctly-heard word to isolate the niqud mechanism.)
+    #[test]
+    fn detect_language_switch_strips_niqud_deepgram_sometimes_adds() {
+        assert_eq!(detect_language_switch("כְּתוֹב בַּאֲנְגְּלִית."), Some("en"));
+        assert_eq!(detect_language_switch("כְּתוֹב בְּעִבְרִית"), Some("he"));
+    }
+
+    #[test]
+    fn strip_niqud_removes_points_but_keeps_every_base_letter() {
+        assert_eq!(strip_niqud("כְּתוֹב בַּאֲנְגְּלִית"), "כתוב באנגלית");
+        assert_eq!(strip_niqud("שלום"), "שלום", "plain text must pass through untouched");
     }
 
     #[test]
