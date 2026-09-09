@@ -77,7 +77,26 @@ fn accessibility_permission_hint() -> &'static str {
     "לא ניתן להקליד את הטקסט — חסרה הרשאת נגישות. אשרו את \"הכתבה בעברית\" תחת הגדרות המערכת ← פרטיות ואבטחה ← נגישות, ואז נסו שוב."
 }
 
-/// Type the text directly via `enigo.text()`. Avoids a known bug in enigo 0.2.1 on Windows
+/// Characters per `enigo.text()` call. enigo's Windows backend (0.2.1) builds
+/// EVERY character in one call into a single array and fires it as ONE
+/// `SendInput` syscall — for a long segment that's a burst of hundreds of
+/// synthetic key events landing on the target in one shot. `SendInput` events
+/// are dispatched through the RECEIVING app's own message pump; if that app is
+/// mid-render (heavier controlled-input UIs — chat composers, Electron apps —
+/// do real work per keystroke) when the burst arrives, Windows can drop the
+/// events the pump wasn't ready for. Real report (Henry, 2026-09-09): typing
+/// into Claude Desktop would start, then silently stop partway through longer
+/// dictations — worse as the message grew, i.e. exactly as each burst got
+/// bigger and the target's per-keystroke render cost climbed. Splitting into
+/// small chunks with a short pause between them gives the target's message
+/// pump repeated chances to catch up; ~30 chars × 8ms adds well under a
+/// second even to a long paragraph, imperceptible after a multi-second
+/// speech-to-text round trip.
+const INJECT_CHUNK_CHARS: usize = 30;
+const INJECT_CHUNK_DELAY: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// Type the text directly via `enigo.text()`, in small paced chunks (see
+/// `INJECT_CHUNK_CHARS`). Also avoids a known bug in enigo 0.2.1 on Windows
 /// where `Key::Unicode('v') + Ctrl` fails with "key state could not be converted to u32"
 /// because `GetKeyState` returns negative values while any modifier is held. Typing the
 /// characters as Unicode WM_CHAR events bypasses the modifier path entirely and works in
@@ -94,10 +113,27 @@ pub fn inject_text(text: &str) -> Result<(), String> {
 
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|e| format!("Enigo init error: {}", e))?;
-    enigo
-        .text(text)
-        .map_err(|e| format!("Text input error: {}", e))?;
+
+    for (i, piece) in chunk_chars(text, INJECT_CHUNK_CHARS).iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(INJECT_CHUNK_DELAY);
+        }
+        enigo
+            .text(piece)
+            .map_err(|e| format!("Text input error: {}", e))?;
+    }
     Ok(())
+}
+
+/// Split `text` into pieces of at most `size` Unicode scalar values (`char`s),
+/// preserving order and content exactly — `pieces.concat() == text` always.
+/// Pure so the chunk boundaries are unit-tested without touching the OS.
+fn chunk_chars(text: &str, size: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(size.max(1))
+        .map(|c| c.iter().collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -110,5 +146,41 @@ mod tests {
         assert!(hint.contains("נגישות"), "must name the Accessibility pane");
         assert!(hint.contains("הגדרות המערכת"), "must name macOS System Settings");
         assert!(!hint.contains("Windows"), "must not send a Mac user to Windows");
+    }
+
+    #[test]
+    fn chunk_chars_reassembles_to_the_exact_original_hebrew_text() {
+        let text = "אני לא רואה אפשרות לעדכן בתוכנה, זה משפט ארוך יותר משלושים תווים";
+        let pieces = chunk_chars(text, 30);
+        assert_eq!(pieces.concat(), text);
+        assert!(pieces.len() > 1, "a long segment must actually split");
+        for p in &pieces[..pieces.len() - 1] {
+            assert_eq!(p.chars().count(), 30);
+        }
+    }
+
+    #[test]
+    fn chunk_chars_short_text_is_a_single_chunk() {
+        let pieces = chunk_chars("שלום", 30);
+        assert_eq!(pieces, vec!["שלום".to_string()]);
+    }
+
+    #[test]
+    fn chunk_chars_empty_text_produces_no_chunks() {
+        assert!(chunk_chars("", 30).is_empty());
+    }
+
+    #[test]
+    fn chunk_chars_exact_multiple_has_no_trailing_empty_chunk() {
+        // 6 chars, size 3 -> exactly two chunks, not three.
+        let pieces = chunk_chars("abcdef", 3);
+        assert_eq!(pieces, vec!["abc".to_string(), "def".to_string()]);
+    }
+
+    #[test]
+    fn chunk_chars_never_panics_on_a_zero_size() {
+        // size.max(1) guards this — must not divide/chunk by zero.
+        let pieces = chunk_chars("שלום", 0);
+        assert_eq!(pieces.concat(), "שלום");
     }
 }
