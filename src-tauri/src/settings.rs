@@ -87,17 +87,32 @@ pub struct AppSettings {
     pub autostart_enabled: bool,
     #[serde(default)]
     pub streaming_enabled: bool,
-    /// Opt-in: saying "כתוב בעברית" / "כתוב באנגלית" as a standalone utterance
-    /// mid-dictation switches the active language and restarts the streaming
+    /// Saying a switch command ("כתוב באנגלית", "switch to Hebrew", …) mid-
+    /// dictation changes the active language and reconnects the streaming
     /// session — real user request (עומרי רוזן, 2026-09-02): Deepgram's Nova-3
-    /// `multi` code-switching mode is never used for Hebrew (see
-    /// `transcribe_deepgram_batch`'s doc comment), so a keyword-driven switch is
-    /// the only way to dictate bilingually. Default false — a spoken sentence
-    /// that happens to exactly match a trigger phrase would otherwise vanish
-    /// instead of being typed, which must never happen to someone who didn't
-    /// opt in.
-    #[serde(default)]
+    /// `multi` code-switching mode does not include Hebrew at all (see
+    /// `normalize_language`), so a spoken command is the only way to dictate
+    /// bilingually.
+    ///
+    /// Default true as of the `lang_switch` rewrite. It was opt-in while the
+    /// matcher compared the whole segment against four exact string literals —
+    /// a sentence that happened to match would vanish instead of being typed.
+    /// The matcher now refuses unless EVERY token in a short segment is a known
+    /// verb / language word / filler, and there is a hotkey that never depends
+    /// on speech recognition at all, so the failure mode that justified opt-in
+    /// is gone. Users who explicitly turned it off keep their `false`; serde
+    /// only reaches for this default when the key is absent.
+    #[serde(default = "default_true")]
     pub language_switch_keywords_enabled: bool,
+    /// Saying "נקודה" / "פסיק" / "סימן שאלה" at the end of a spoken segment
+    /// types the mark instead of the word. Hebrew only — the English path uses
+    /// Deepgram's own `dictation=true`, which does not support Hebrew.
+    ///
+    /// Default true: this is what a user expects dictation to do, and the
+    /// matcher in `punctuation` is built around never firing on the noun (see
+    /// its module docs — "ועוד נקודה, לא מספיק ברור" must survive untouched).
+    #[serde(default = "default_true")]
+    pub spoken_punctuation_enabled: bool,
     #[serde(default = "default_true")]
     pub floating_toolbar_enabled: bool,
     #[serde(default = "default_hotkey")]
@@ -106,6 +121,15 @@ pub struct AppSettings {
     /// `None` = feature disabled. Default `Some("alt+p")`.
     #[serde(default = "default_pause_hotkey")]
     pub pause_hotkey: Option<String>,
+    /// Optional third global shortcut: toggle the dictation language between
+    /// Hebrew and English. `None` = disabled. Default `Some("alt+l")`.
+    ///
+    /// This exists because the spoken command can always be misheard, and when
+    /// it is, the phrase gets typed into the user's document. A hotkey cannot
+    /// be misheard. It is the mechanism to point users at first; the voice
+    /// command is the convenience on top.
+    #[serde(default = "default_language_hotkey")]
+    pub language_hotkey: Option<String>,
     #[serde(default = "default_silence_duration_secs")]
     pub vad_silence_secs: f32,
     #[serde(default = "default_max_recording_secs")]
@@ -181,9 +205,11 @@ pub struct RedactedSettings {
     pub autostart_enabled: bool,
     pub streaming_enabled: bool,
     pub language_switch_keywords_enabled: bool,
+    pub spoken_punctuation_enabled: bool,
     pub floating_toolbar_enabled: bool,
     pub hotkey: String,
     pub pause_hotkey: Option<String>,
+    pub language_hotkey: Option<String>,
     pub vad_silence_secs: f32,
     pub max_recording_secs: f32,
     pub unlimited_recording: bool,
@@ -218,9 +244,11 @@ impl AppSettings {
             autostart_enabled: self.autostart_enabled,
             streaming_enabled: self.streaming_enabled,
             language_switch_keywords_enabled: self.language_switch_keywords_enabled,
+            spoken_punctuation_enabled: self.spoken_punctuation_enabled,
             floating_toolbar_enabled: self.floating_toolbar_enabled,
             hotkey: self.hotkey.clone(),
             pause_hotkey: self.pause_hotkey.clone(),
+            language_hotkey: self.language_hotkey.clone(),
             vad_silence_secs: self.vad_silence_secs,
             max_recording_secs: self.max_recording_secs,
             unlimited_recording: self.unlimited_recording,
@@ -258,6 +286,10 @@ fn default_hotkey() -> String {
 
 fn default_pause_hotkey() -> Option<String> {
     Some("alt+p".to_string())
+}
+
+fn default_language_hotkey() -> Option<String> {
+    Some("alt+l".to_string())
 }
 
 fn default_silence_duration_secs() -> f32 {
@@ -304,10 +336,12 @@ impl Default for AppSettings {
             always_on_top: true,
             autostart_enabled: true,
             streaming_enabled: true,
-            language_switch_keywords_enabled: false,
+            language_switch_keywords_enabled: true,
+            spoken_punctuation_enabled: true,
             floating_toolbar_enabled: true,
             hotkey: default_hotkey(),
             pause_hotkey: default_pause_hotkey(),
+            language_hotkey: default_language_hotkey(),
             vad_silence_secs: default_silence_duration_secs(),
             max_recording_secs: default_max_recording_secs(),
             unlimited_recording: false,

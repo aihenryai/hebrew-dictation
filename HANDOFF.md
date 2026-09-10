@@ -4,6 +4,32 @@
 
 ---
 
+## 🚀 v2.13.6 — RELEASED 2026-09-09 · niqud broke the language-switch trigger
+
+Same live session as v2.13.5, continued testing with Henry right after: enabled
+`language_switch_keywords_enabled`, said "כתוב באנגלית" as an isolated utterance
+exactly as designed — it never triggered. Caught the raw Deepgram transcript via
+`get_last_transcript`: `"כְּתוֹב בַּאֲנָלִית."` — **fully niqqud**, though no other
+transcript that session ever came back with niqud. `smart_format` appears to reach
+for a "dictionary pronunciation" rendering specifically for short, isolated,
+low-context utterances — exactly the shape of a command phrase, which is the worst
+possible case for this feature.
+
+`detect_language_switch` did exact byte matching against plain text, so every
+niqqud segment silently failed. Fix: `strip_niqud()` removes U+0591–U+05C7 (points,
+dagesh, rafe, shin/sin dots, cantillation — disjoint from base letters
+U+05D0–U+05EA, so real content is never touched) before comparing. 2 new tests,
+one built from the actual captured string. 138 total passing.
+
+⚠️ **Not fully fixed — a second, separate bug survives in the same capture:**
+Deepgram also misheard the base word as "אנלית" (dropped the ג). That's a real ASR
+error, not a normalization gap; fixing it would mean fuzzy matching, which trades
+away the exact-match design's safety against false positives. **If the feature
+still doesn't trigger after this release, check `get_last_transcript` for a
+mis-hearing before assuming the niqud fix regressed.**
+
+---
+
 ## 🚀 v2.13.5 — RELEASED 2026-09-09 · dropped keystrokes on longer dictations
 
 Henry reported (2026-09-09): typing into Claude Desktop starts, then silently stops

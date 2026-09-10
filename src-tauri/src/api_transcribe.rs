@@ -244,6 +244,68 @@ async fn transcribe_groq_inner(
 
 // ── Deepgram Nova-3 API ──
 
+/// The language code that is safe to put in a Deepgram URL.
+///
+/// **`"multi"` must never reach Deepgram from this app.** Nova-3's multilingual
+/// code-switching model covers English, Spanish, French, German, Hindi, Russian,
+/// Portuguese, Japanese, Italian and Dutch — **Hebrew is not in that list**
+/// (verified against Deepgram's Models & Languages docs, 2026-09-10). Hebrew
+/// exists on Nova-3 only as a monolingual model. Sending `language=multi` gets
+/// the request rejected, which surfaced to the user as the generic 400 message
+/// in `streaming.rs`.
+///
+/// This used to be four separate `if language == "auto"` lines that each let
+/// `"multi"` through untouched, while a settings screen offered a
+/// "עברית + אנגלית" button that produced exactly that value. One function now
+/// owns the rule, so an old settings.json still carrying `"multi"` degrades to
+/// Hebrew instead of breaking every dictation.
+pub(crate) fn normalize_language(lang: &str) -> &str {
+    match lang {
+        "he" | "en" => lang,
+        _ => "he",
+    }
+}
+
+/// `&dictation=true` for the languages Deepgram supports it on.
+///
+/// Deepgram's own spoken-punctuation feature ("period" → "."). Per its docs it
+/// is **English only**, which is why Hebrew has `crate::punctuation` instead.
+/// Dictation paths only — someone saying "period" inside a recorded meeting
+/// means the word, so this must not reach the batch or multichannel URLs.
+pub(crate) fn dictation_params(lang: &str) -> &'static str {
+    if lang == "en" {
+        "&dictation=true"
+    } else {
+        ""
+    }
+}
+
+/// `&keyterm=` boosts for the words a spoken language-switch command is made of.
+///
+/// Nova-3 Hebrew supports Keyterm Prompting (Deepgram, Feb 2026). It steers the
+/// model while it listens rather than editing the output afterwards, so at worst
+/// it does nothing — it cannot invent text. Added because the captured failure
+/// was Deepgram mishearing "באנגלית" as "אנלית": `lang_switch` now tolerates
+/// that after the fact, and this reduces how often it happens at all.
+///
+/// Streaming only — the switch feature is streaming-only.
+pub(crate) fn language_switch_keyterm_params(lang: &str, enabled: bool) -> String {
+    if !enabled {
+        return String::new();
+    }
+    let terms: &[&str] = match lang {
+        "he" => &["באנגלית", "בעברית", "אנגלית", "עברית"],
+        "en" => &["Hebrew", "English"],
+        _ => return String::new(),
+    };
+    let mut out = String::new();
+    for term in terms {
+        out.push_str("&keyterm=");
+        out.push_str(&urlencoding_percent_encode(term));
+    }
+    out
+}
+
 /// Deepgram's `smart_format` misfires on Hebrew day-names: "ביום שני" ("on
 /// Monday") comes back as "ביום 2º" — U+00BA MASCULINE ORDINAL INDICATOR, the
 /// Spanish/Portuguese/Italian glyph for "2nd" (1º, 2º, 3º…). This is not a
@@ -309,12 +371,12 @@ async fn transcribe_deepgram_inner(
 ) -> Result<String, ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
 
-    // "auto" → default to Hebrew (single-language). "multi" → Nova-3 code-switching (Hebrew+English mid-sentence).
-    let lang = if language == "auto" { "he" } else { language };
+    let lang = normalize_language(language);
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}",
         lang,
-        day_ordinal_replace_params(lang)
+        day_ordinal_replace_params(lang),
+        dictation_params(lang)
     );
 
     let response = reqwest::Client::new()
@@ -359,7 +421,7 @@ pub(crate) async fn transcribe_deepgram_batch(
     language: &str,
 ) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
-    let lang = if language == "auto" { "he" } else { language };
+    let lang = normalize_language(language);
     // diarize=true adds a per-word `speaker` index to words[]; it does not
     // change the transcript text, so it's safe to send on every batch request
     // (single-speaker audio simply reports one speaker → no SRT label).

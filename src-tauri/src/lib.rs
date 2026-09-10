@@ -4,7 +4,9 @@ mod batch;
 mod decode;
 mod enhance;
 mod export;
+mod hebrew;
 mod injector;
+mod lang_switch;
 mod local_api;
 mod model;
 mod narration;
@@ -12,6 +14,7 @@ mod narration;
 mod narration_process;
 #[cfg(target_os = "windows")]
 mod narration_provision;
+mod punctuation;
 mod secure_keys;
 mod settings;
 mod srt;
@@ -170,36 +173,34 @@ fn set_hotkey(app: AppHandle, state: State<AppState>, combo: String) -> Result<(
         return Err("קיצור ריק — בחר שילוב מקשים תקין".to_string());
     }
 
-    // Capture pause combo so we can restore it after unregister_all wipes everything.
-    let pause_combo = state
+    // Capture the secondary combos so they survive the unregister_all inside
+    // `reapply_all_shortcuts`.
+    let (pause_combo, language_combo, prev_toggle) = state
         .settings
         .lock()
-        .ok()
-        .and_then(|s| s.pause_hotkey.clone());
+        .map(|s| (s.pause_hotkey.clone(), s.language_hotkey.clone(), s.hotkey.clone()))
+        .unwrap_or_else(|_| (None, None, "alt+d".to_string()));
 
-    let _ = app.global_shortcut().unregister_all();
-
-    if let Err(e) = register_toggle_shortcut(&app, &trimmed) {
-        let prev = state
-            .settings
-            .lock()
-            .map(|s| s.hotkey.clone())
-            .unwrap_or_else(|_| "alt+d".to_string());
-        let _ = register_toggle_shortcut(&app, &prev);
-        if let Some(p) = &pause_combo {
-            if !p.eq_ignore_ascii_case(&prev) {
-                let _ = register_pause_shortcut(&app, p);
+    match reapply_all_shortcuts(
+        &app,
+        &trimmed,
+        pause_combo.as_deref(),
+        language_combo.as_deref(),
+    ) {
+        Ok(warning) => {
+            if let Some(w) = warning {
+                eprintln!("Secondary hotkey not restored after toggle change: {}", w);
             }
         }
-        return Err(e);
-    }
-
-    // Re-register pause shortcut if it was active and doesn't conflict with the new toggle.
-    if let Some(p) = &pause_combo {
-        if !p.eq_ignore_ascii_case(&trimmed) {
-            if let Err(e) = register_pause_shortcut(&app, p) {
-                eprintln!("Could not restore pause shortcut '{}': {}", p, e);
-            }
+        Err(e) => {
+            // Never leave the app without a way to start dictating.
+            let _ = reapply_all_shortcuts(
+                &app,
+                &prev_toggle,
+                pause_combo.as_deref(),
+                language_combo.as_deref(),
+            );
+            return Err(e);
         }
     }
 
@@ -217,38 +218,86 @@ fn set_pause_hotkey(
     state: State<AppState>,
     combo: Option<String>,
 ) -> Result<(), String> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    set_secondary_hotkey(app, state, combo, SecondaryHotkey::Pause)
+}
 
+/// Re-register or disable the language-toggle hotkey at runtime.
+/// `combo = None` clears it entirely. Conflicts with the other two are rejected.
+#[tauri::command]
+fn set_language_hotkey(
+    app: AppHandle,
+    state: State<AppState>,
+    combo: Option<String>,
+) -> Result<(), String> {
+    set_secondary_hotkey(app, state, combo, SecondaryHotkey::Language)
+}
+
+#[derive(Clone, Copy)]
+enum SecondaryHotkey {
+    Pause,
+    Language,
+}
+
+impl SecondaryHotkey {
+    fn conflict_message(self) -> &'static str {
+        match self {
+            SecondaryHotkey::Pause => "קיצור ההשהיה זהה לקיצור אחר - בחר שילוב אחר",
+            SecondaryHotkey::Language => "קיצור החלפת השפה זהה לקיצור אחר - בחר שילוב אחר",
+        }
+    }
+}
+
+/// Shared body of `set_pause_hotkey` / `set_language_hotkey`: validate against
+/// the other two combos, re-apply the whole set, then persist. Settings are
+/// written only after registration succeeded, so a rejected combo never leaves
+/// settings.json describing a shortcut that isn't actually bound.
+fn set_secondary_hotkey(
+    app: AppHandle,
+    state: State<AppState>,
+    combo: Option<String>,
+    which: SecondaryHotkey,
+) -> Result<(), String> {
     let normalized = combo.map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty());
 
-    let toggle_combo = state
+    let (toggle_combo, current_pause, current_language) = state
         .settings
         .lock()
-        .map(|s| s.hotkey.clone())
-        .unwrap_or_else(|_| "alt+d".to_string());
+        .map(|s| (s.hotkey.clone(), s.pause_hotkey.clone(), s.language_hotkey.clone()))
+        .unwrap_or_else(|_| ("alt+d".to_string(), None, None));
+
+    let (pause, language) = match which {
+        SecondaryHotkey::Pause => (normalized.clone(), current_language),
+        SecondaryHotkey::Language => (current_pause, normalized.clone()),
+    };
 
     if let Some(c) = &normalized {
-        if c.eq_ignore_ascii_case(&toggle_combo) {
-            return Err("קיצור ההשהיה זהה לקיצור הראשי — בחר שילוב אחר".to_string());
+        let others = match which {
+            SecondaryHotkey::Pause => [Some(&toggle_combo), language.as_ref()],
+            SecondaryHotkey::Language => [Some(&toggle_combo), pause.as_ref()],
+        };
+        if others
+            .iter()
+            .flatten()
+            .any(|o| o.eq_ignore_ascii_case(c))
+        {
+            return Err(which.conflict_message().to_string());
         }
     }
 
-    // Re-register everything so changing the pause hotkey doesn't leave a stale
-    // listener on the previous combo.
-    let _ = app.global_shortcut().unregister_all();
-    if let Err(e) = register_toggle_shortcut(&app, &toggle_combo) {
-        return Err(format!("רענון הקיצור הראשי נכשל: {}", e));
-    }
-
-    if let Some(c) = &normalized {
-        if let Err(e) = register_pause_shortcut(&app, c) {
-            // Toggle still works — surface the error to the UI but don't roll back.
-            return Err(e);
-        }
+    // A secondary failure comes back as Ok(Some(..)) — surface it to the UI and
+    // do NOT persist, so the settings screen keeps showing the combo that is
+    // actually bound.
+    match reapply_all_shortcuts(&app, &toggle_combo, pause.as_deref(), language.as_deref()) {
+        Ok(Some(w)) => return Err(w),
+        Ok(None) => {}
+        Err(e) => return Err(format!("רענון הקיצור הראשי נכשל: {}", e)),
     }
 
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
-    s.pause_hotkey = normalized;
+    match which {
+        SecondaryHotkey::Pause => s.pause_hotkey = normalized,
+        SecondaryHotkey::Language => s.language_hotkey = normalized,
+    }
     settings::save_settings(&s)?;
     Ok(())
 }
@@ -1716,7 +1765,53 @@ pub(crate) fn macos_unhide_if_needed(app: &AppHandle) {
     }
 }
 
+/// The last character this app actually typed into the user's field, for the
+/// whole process lifetime. Drives `punctuation::leading_separator`.
+///
+/// Process-wide rather than per-session on purpose: the streaming path used to
+/// append a TRAILING space to every segment, which is also what separated one
+/// dictation from the next when the user dictated twice into the same field. A
+/// trailing space cannot know that the next thing typed will be a "." that must
+/// hug the word before it, so the separator moved to the front — and keeping
+/// this state process-wide is what preserves the cross-dictation behaviour.
+static LAST_INJECTED_CHAR: std::sync::Mutex<Option<char>> = std::sync::Mutex::new(None);
+
+pub(crate) fn last_injected_char() -> Option<char> {
+    LAST_INJECTED_CHAR.lock().ok().and_then(|g| *g)
+}
+
+fn remember_injected(text: &str) {
+    if let Some(c) = text.chars().last() {
+        if let Ok(mut g) = LAST_INJECTED_CHAR.lock() {
+            *g = Some(c);
+        }
+    }
+}
+
+/// Does one of our own windows currently hold OS focus? Shared by both platform
+/// branches of the injection dance, and used as the fallback signal on Windows
+/// when the foreground query can't answer.
+fn our_window_focused(app: &AppHandle) -> bool {
+    ["main", "toolbar"].iter().any(|label| {
+        app.get_webview_window(label)
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false)
+    })
+}
+
+/// Type `text` into whatever the user is focused on, hiding our own windows
+/// first if they hold the foreground. The single funnel every injected byte
+/// passes through — which is also why the "what did we last type" bookkeeping
+/// for `punctuation::leading_separator` lives here and nowhere else.
 pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), String> {
+    let result = inject_text_defocused_inner(app, text);
+    if result.is_ok() {
+        remember_injected(text);
+    }
+    result
+}
+
+fn inject_text_defocused_inner(app: &AppHandle, text: &str) -> Result<(), String> {
     // macOS: hiding individual windows is NOT enough — the app itself stays
     // active with no key window, and synthesized keystrokes land nowhere.
     // The only mechanism that hands activation back to the previously-active
@@ -1730,12 +1825,7 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
     // the next explicit window-show (macos_unhide_if_needed).
     #[cfg(target_os = "macos")]
     {
-        let our_window_focused = ["main", "toolbar"].iter().any(|label| {
-            app.get_webview_window(label)
-                .and_then(|w| w.is_focused().ok())
-                .unwrap_or(false)
-        });
-        if our_window_focused {
+        if our_window_focused(app) {
             let _ = app.hide();
             MACOS_APP_HIDDEN.store(true, Ordering::SeqCst);
             // Give AppKit a beat to activate the previous app.
@@ -1755,6 +1845,25 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
 /// a window there does not steal foreground); wrong on macOS (see above).
 #[cfg(not(target_os = "macos"))]
 fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<(), String> {
+    // Only dance when we ACTUALLY hold the foreground.
+    //
+    // This used to key off window VISIBILITY, which meant the whole
+    // hide → wait → type → show cycle ran on every single streaming segment.
+    // The floating bar is declared `"focus": false` (tauri.conf.json) and in
+    // the normal Alt+D flow never holds focus at all, so that was pure cost:
+    // a visible flicker and a stall at every pause in speech, plus a window of
+    // time in which our own re-shown window could land back over the target.
+    //
+    // `foreground_is_ours()` is the authoritative answer; `our_window_focused`
+    // is the fallback for when the query can't answer (or off-Windows).
+    let must_defocus = match injector::foreground_is_ours() {
+        Some(ours) => ours,
+        None => our_window_focused(app),
+    };
+    if !must_defocus {
+        return injector::inject_text(text);
+    }
+
     let main_window = app.get_webview_window("main");
     let toolbar_window = app.get_webview_window("toolbar");
 
@@ -1777,11 +1886,16 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
             let _ = w.hide();
         }
     }
-    if main_was_visible || toolbar_was_visible {
-        // Let Windows promote the previously-active window to the foreground.
-        std::thread::sleep(std::time::Duration::from_millis(80));
-    }
+    // Let Windows promote the previously-active window to the foreground, and
+    // wait only as long as that actually takes. A flat 80ms sleep was both too
+    // slow in the common case (the flip is usually 10-30ms) and too short on a
+    // loaded machine — where it produced exactly the reported symptom: the text
+    // typed into whatever still held focus, or into nothing.
+    injector::wait_for_foreground_release(injector::FOREGROUND_RELEASE_TIMEOUT);
 
+    // If the foreground never left us, `injector::inject_text` refuses and
+    // returns actionable Hebrew guidance rather than typing into our own
+    // webview and reporting success.
     let result = injector::inject_text(text);
 
     if main_was_visible {
@@ -2222,20 +2336,54 @@ fn set_toolbar_position(state: State<AppState>, x: f64, y: f64) -> Result<(), St
 
 /// Hide the floating toolbar and restore the main window if it was visible
 /// before the toolbar took over.
+///
+/// `defer_restore` splits those two halves apart. Restoring the main window
+/// promotes it to the foreground, and doing that at the START of the stop
+/// sequence raced the dictation's own tail: `stop_streaming_transcription`
+/// sends CloseStream, Deepgram flushes its remaining final segments, and
+/// `streaming::handle_message` injects each one — into whatever holds focus,
+/// which by then was us. The last sentence of a dictation disappeared. With
+/// `defer_restore: true` the bar is dismissed immediately (still snappy) and
+/// the caller invokes `restore_after_dictation` once the stream is fully done.
+/// The `main_was_visible_before_toolbar` latch is deliberately NOT consumed on
+/// the deferred path — it is a `swap(false)`, so reading it twice would lose it.
 #[tauri::command]
 fn hide_toolbar_window(
     app: AppHandle,
     state: State<AppState>,
     force_show_main: Option<bool>,
+    defer_restore: Option<bool>,
 ) -> Result<(), String> {
     if let Some(t) = app.get_webview_window("toolbar") {
         let _ = t.hide();
     }
 
+    if defer_restore.unwrap_or(false) {
+        return Ok(());
+    }
+
+    restore_main_after_toolbar(&app, &state, force_show_main.unwrap_or(false))
+}
+
+/// The second half of `hide_toolbar_window`, called once the dictation (and any
+/// trailing injection) is finished. See that function's doc comment for why.
+#[tauri::command]
+fn restore_after_dictation(
+    app: AppHandle,
+    state: State<AppState>,
+    force_show_main: Option<bool>,
+) -> Result<(), String> {
+    restore_main_after_toolbar(&app, &state, force_show_main.unwrap_or(false))
+}
+
+fn restore_main_after_toolbar(
+    app: &AppHandle,
+    state: &AppState,
+    force: bool,
+) -> Result<(), String> {
     let was_visible = state
         .main_was_visible_before_toolbar
         .swap(false, Ordering::Relaxed);
-    let force = force_show_main.unwrap_or(false);
 
     // Force is set when the user clicked the toolbar's stop button — they want
     // to see the transcription, so promote the main window even if it wasn't
@@ -2250,7 +2398,7 @@ fn hide_toolbar_window(
         // Return to the circle instead of yanking the main window into the
         // user's face — this also avoids stealing focus from their target
         // app right after the text was injected.
-        show_idle_button_inner(&app, saved_pos);
+        show_idle_button_inner(app, saved_pos);
     } else if was_visible || force {
         if let Some(main) = app.get_webview_window("main") {
             let _ = main.show();
@@ -2279,57 +2427,96 @@ fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
 /// string follows the `tauri_plugin_global_shortcut` syntax — "alt+d", "ctrl+shift+f1",
 /// etc. Returns a Hebrew error string on parse failure or OS-level conflict.
 fn register_toggle_shortcut(app: &AppHandle, combo: &str) -> Result<(), String> {
-    let parsed: Shortcut = combo
-        .parse()
-        .map_err(|e| format!("פורמט קיצור לא תקין ('{}'): {}", combo, e))?;
-
-    let app_handle = app.clone();
-    app.global_shortcut()
-        .on_shortcut(parsed, move |_app, shortcut, event| {
-            if event.state == ShortcutState::Pressed {
-                // Emit event without showing/focusing the window — keeps focus in the text field
-                let _ = app_handle.emit("hotkey-pressed", shortcut.to_string());
-            }
-        })
-        .map_err(|e| format!("רישום הקיצור נכשל ('{}'): {}", combo, e))
+    // Emits without showing/focusing the window — keeps focus in the text field.
+    register_emitting_shortcut(app, combo, "hotkey-pressed", "הקיצור")
 }
 
-/// Register a Pause/Resume hotkey. Emits `pause-pressed` to the frontend, which
-/// decides whether to call `pause_recording` or `resume_recording`. Independent
-/// of the toggle hotkey — only fires while a recording is active.
-fn register_pause_shortcut(app: &AppHandle, combo: &str) -> Result<(), String> {
+/// One shape for all three global shortcuts: press → emit an event the frontend
+/// listens for. Only the event name and the Hebrew noun in the error differ.
+fn register_emitting_shortcut(
+    app: &AppHandle,
+    combo: &str,
+    event: &'static str,
+    what: &str,
+) -> Result<(), String> {
     let parsed: Shortcut = combo
         .parse()
         .map_err(|e| format!("פורמט קיצור לא תקין ('{}'): {}", combo, e))?;
 
     let app_handle = app.clone();
     app.global_shortcut()
-        .on_shortcut(parsed, move |_app, shortcut, event| {
-            if event.state == ShortcutState::Pressed {
-                let _ = app_handle.emit("pause-pressed", shortcut.to_string());
+        .on_shortcut(parsed, move |_app, shortcut, ev| {
+            if ev.state == ShortcutState::Pressed {
+                let _ = app_handle.emit(event, shortcut.to_string());
             }
         })
-        .map_err(|e| format!("רישום קיצור ההשהיה נכשל ('{}'): {}", combo, e))
+        .map_err(|e| format!("רישום {} נכשל ('{}'): {}", what, combo, e))
+}
+
+/// Re-apply every global shortcut from one place.
+///
+/// The plugin has no "replace a single shortcut" call, so changing any hotkey
+/// means `unregister_all` followed by re-registering the whole set. Doing that
+/// ad-hoc inside each setter is exactly how adding a third hotkey silently
+/// drops the second one — this function is the only thing that knows the full
+/// set, and every caller goes through it.
+///
+/// `Err` means the TOGGLE failed and the caller must roll back — without it the
+/// app has no way to start a dictation. `Ok(Some(msg))` means the toggle is
+/// live but a secondary shortcut could not be bound, which is survivable.
+fn reapply_all_shortcuts(
+    app: &AppHandle,
+    toggle: &str,
+    pause: Option<&str>,
+    language: Option<&str>,
+) -> Result<Option<String>, String> {
+    let _ = app.global_shortcut().unregister_all();
+    register_toggle_shortcut(app, toggle)?;
+
+    let mut first_warning: Option<String> = None;
+    let mut taken: Vec<String> = vec![toggle.to_lowercase()];
+
+    for (combo, event, what) in [
+        (pause, "pause-pressed", "קיצור ההשהיה"),
+        (language, "language-toggle-pressed", "קיצור החלפת השפה"),
+    ] {
+        let Some(c) = combo else { continue };
+        let key = c.to_lowercase();
+        // Registering the same combo twice fails. Skip silently and keep the
+        // binding that got there first; the user can change it in settings.
+        if taken.contains(&key) {
+            continue;
+        }
+        match register_emitting_shortcut(app, c, event, what) {
+            Ok(()) => taken.push(key),
+            Err(e) => {
+                if first_warning.is_none() {
+                    first_warning = Some(e);
+                }
+            }
+        }
+    }
+
+    Ok(first_warning)
 }
 
 /// Apply the user's preferred hotkeys on startup. Falls back to "alt+d" for the
 /// toggle if its registration fails (a corrupted settings.json picks a combo
-/// Windows already grabbed). Pause hotkey failure is non-fatal — the toolbar
-/// still has its own Pause button.
-fn setup_global_shortcuts(app: &AppHandle, combo: &str, pause_combo: Option<&str>) {
-    if let Err(e) = register_toggle_shortcut(app, combo) {
-        eprintln!("Hotkey '{}' failed to register: {}. Falling back to alt+d.", combo, e);
-        if let Err(e2) = register_toggle_shortcut(app, "alt+d") {
-            eprintln!("Fallback alt+d also failed: {}", e2);
-        }
-    }
-    if let Some(pause) = pause_combo {
-        // Skip silently if pause matches toggle — already-registered will error,
-        // and the user can clear it from settings.
-        if pause.eq_ignore_ascii_case(combo) {
-            eprintln!("Pause hotkey same as toggle — skipping registration");
-        } else if let Err(e) = register_pause_shortcut(app, pause) {
-            eprintln!("Pause hotkey '{}' failed to register: {}", pause, e);
+/// Windows already grabbed). Secondary hotkey failures are non-fatal.
+fn setup_global_shortcuts(
+    app: &AppHandle,
+    combo: &str,
+    pause_combo: Option<&str>,
+    language_combo: Option<&str>,
+) {
+    match reapply_all_shortcuts(app, combo, pause_combo, language_combo) {
+        Ok(Some(w)) => eprintln!("Secondary hotkey not registered: {}", w),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Hotkey '{}' failed to register: {}. Falling back to alt+d.", combo, e);
+            if let Err(e2) = reapply_all_shortcuts(app, "alt+d", pause_combo, language_combo) {
+                eprintln!("Fallback alt+d also failed: {}", e2);
+            }
         }
     }
 }
@@ -2449,16 +2636,22 @@ pub fn run() {
                 recorder.set_app_handle(app.handle().clone());
             }
 
-            // Read the user's preferred hotkeys and register them (toggle + optional pause).
-            let (combo, pause_combo) = {
+            // Read the user's preferred hotkeys and register them
+            // (toggle + optional pause + optional language toggle).
+            let (combo, pause_combo, language_combo) = {
                 let state = app.state::<AppState>();
                 let s = state
                     .settings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                (s.hotkey.clone(), s.pause_hotkey.clone())
+                (s.hotkey.clone(), s.pause_hotkey.clone(), s.language_hotkey.clone())
             };
-            setup_global_shortcuts(app.handle(), &combo, pause_combo.as_deref());
+            setup_global_shortcuts(
+                app.handle(),
+                &combo,
+                pause_combo.as_deref(),
+                language_combo.as_deref(),
+            );
             let _ = setup_tray(app.handle());
 
             // Opt-in local API — off unless explicitly enabled in settings.json,
@@ -2582,6 +2775,7 @@ pub fn run() {
             set_preferred_audio_device,
             set_hotkey,
             set_pause_hotkey,
+            set_language_hotkey,
             transcribe,
             start_streaming_transcription,
             stop_streaming_transcription,
@@ -2625,6 +2819,7 @@ pub fn run() {
             set_autostart_enabled,
             show_toolbar_window,
             hide_toolbar_window,
+            restore_after_dictation,
             set_toolbar_position,
             show_idle_button,
             set_idle_button_enabled,

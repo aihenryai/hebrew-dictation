@@ -712,12 +712,23 @@ function App() {
 
     // Dismiss the floating bar IMMEDIATELY on stop — BEFORE transcription +
     // enhancement (which take a few seconds). Leaving it up makes it look like
-    // recording is still running. forceShowMain only when the stop came from the
-    // toolbar button (the user is looking at the app); on Alt+D from another app
-    // we hide the bar without stealing focus. The main window's status carries
-    // the wait either way.
-    await invoke("hide_toolbar_window", { forceShowMain: fromToolbar })
+    // recording is still running.
+    //
+    // ORDERING INVARIANT — do not recombine these two halves.
+    // Restoring the main window PROMOTES IT TO THE FOREGROUND. Doing that here
+    // raced the dictation's own tail: stop_streaming_transcription sends
+    // CloseStream, Deepgram flushes its remaining final segments, and
+    // streaming.rs injects each one into whatever holds focus — which by then
+    // was us. The last sentence of a dictation vanished. The non-streaming
+    // branch had the same bug: main was promoted before injectText() ran.
+    // So: dismiss the bar now, restore the main window only when everything
+    // that can still inject text is done.
+    await invoke("hide_toolbar_window", { forceShowMain: fromToolbar, deferRestore: true })
       .catch((e) => console.error("hide_toolbar_window failed:", e));
+
+    const restoreMainWindow = () =>
+      invoke("restore_after_dictation", { forceShowMain: fromToolbar })
+        .catch((e) => console.error("restore_after_dictation failed:", e));
 
     try {
       if (isStreamingSession()) {
@@ -736,6 +747,7 @@ function App() {
         const samples = await invoke("stop_recording") as number[];
         if (samples.length < MIN_TRANSCRIBE_SAMPLES) {
           // Too short to transcribe — the toolbar was already hidden up top.
+          await restoreMainWindow();
           setStatus("idle");
           setRecordingTime(0);
           return;
@@ -768,7 +780,9 @@ function App() {
       // covers the toolbar / main window (bad key, no credit, offline).
       if (audioFeedbackEnabledRef.current) playErrorTone();
     }
-    // Toolbar was already hidden at the top of this function (snappy on every path).
+    // Toolbar was already hidden at the top of this function (snappy on every
+    // path); the main window comes back only now — see the ordering invariant.
+    await restoreMainWindow();
     setStatus("idle");
     setRecordingTime(0);
   }, [stopVadPolling, stopTimer, injectText, isStreamingSession]);

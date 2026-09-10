@@ -77,6 +77,112 @@ fn accessibility_permission_hint() -> &'static str {
     "לא ניתן להקליד את הטקסט — חסרה הרשאת נגישות. אשרו את \"הכתבה בעברית\" תחת הגדרות המערכת ← פרטיות ואבטחה ← נגישות, ואז נסו שוב."
 }
 
+// ---------------------------------------------------------------------------
+// Foreground-window guard (Windows)
+//
+// enigo does NOT error when no text field has focus — the synthetic keystrokes
+// simply go nowhere and `inject_text` still returns Ok. That made the single
+// most damaging failure mode of this app invisible: the user dictates, the
+// transcript is recorded as successful, and nothing appears on screen.
+//
+// These helpers give us the one signal that was missing: is the window that
+// currently owns the foreground OUR window? If it is, typing would land in our
+// own webview, so we refuse and say so instead of silently losing the text.
+//
+// Strictly read-only Win32. We never call SetForegroundWindow/AttachThreadInput
+// — see the note in Cargo.toml for why stealing focus back is not the fix.
+// ---------------------------------------------------------------------------
+
+/// How long to wait for Windows to promote the previously-active window after
+/// we hide ours. Was a flat 80ms sleep; polling returns as soon as the
+/// foreground actually flips (usually 10-30ms) and still covers a loaded
+/// machine where 80ms was never enough.
+pub(crate) const FOREGROUND_RELEASE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(400);
+#[cfg_attr(not(windows), allow(dead_code))]
+const FOREGROUND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// The flat wait this file used everywhere before polling existed. Still the
+/// only option off-Windows, where we have no foreground query to poll.
+#[cfg_attr(windows, allow(dead_code))]
+const LEGACY_DEFOCUS_WAIT: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Is the foreground window one of ours?
+///
+/// `None` means "can't tell" — the Win32 call failed, or there is no foreground
+/// window at all (a normal transient state during window switches). **Every
+/// caller must treat `None` as permission to proceed**, never as a refusal:
+/// this guard exists to catch a known-bad state, not to gate injection on a
+/// positive result.
+#[cfg(windows)]
+pub(crate) fn foreground_is_ours() -> Option<bool> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    // SAFETY: all three are read-only queries with no pointer aliasing beyond
+    // `pid`, which is a live stack local for the duration of the call.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        if GetWindowThreadProcessId(hwnd, &mut pid) == 0 || pid == 0 {
+            return None;
+        }
+        Some(pid == GetCurrentProcessId())
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn foreground_is_ours() -> Option<bool> {
+    None
+}
+
+/// Poll `ready` every `poll` until it is true or `deadline` elapses; returns
+/// whether it became true. The predicate is injected so the loop itself is
+/// unit-testable without touching the OS (pass `Duration::ZERO` for `poll`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wait_until(ready: impl Fn() -> bool, deadline: std::time::Duration, poll: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if ready() {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Wait until the foreground window is no longer ours. True when the foreground
+/// belongs to someone else — or when we can't tell, which is not a failure.
+pub(crate) fn wait_for_foreground_release(deadline: std::time::Duration) -> bool {
+    #[cfg(windows)]
+    {
+        wait_until(
+            || foreground_is_ours() != Some(true),
+            deadline,
+            FOREGROUND_POLL_INTERVAL,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        // Nothing to poll here — keep the historical flat wait so the OS still
+        // gets its beat to promote the previously-active window.
+        std::thread::sleep(LEGACY_DEFOCUS_WAIT.min(deadline));
+        true
+    }
+}
+
+/// Shown when we were about to type into our own window. Actionable on purpose:
+/// the user's next move is to click the field they want, not to file a bug.
+pub(crate) fn foreground_stolen_hint() -> &'static str {
+    "הטקסט לא הוקלד - חלון האפליקציה תפס את המיקוד. לחצו על התיבה שאליה תרצו להכתיב ונסו שוב."
+}
+
 /// Characters per `enigo.text()` call. enigo's Windows backend (0.2.1) builds
 /// EVERY character in one call into a single array and fires it as ONE
 /// `SendInput` syscall — for a long segment that's a burst of hundreds of
@@ -109,6 +215,13 @@ pub fn inject_text(text: &str) -> Result<(), String> {
         if !accessibility_trusted() {
             return Err(accessibility_permission_hint().to_string());
         }
+    }
+
+    // Last line of defence. The callers in lib.rs hide our windows and wait for
+    // the foreground to flip; if it never did, typing here would put the user's
+    // dictation into our own webview and report success. Refuse instead.
+    if foreground_is_ours() == Some(true) {
+        return Err(foreground_stolen_hint().to_string());
     }
 
     let mut enigo = Enigo::new(&Settings::default())
@@ -175,6 +288,68 @@ mod tests {
         // 6 chars, size 3 -> exactly two chunks, not three.
         let pieces = chunk_chars("abcdef", 3);
         assert_eq!(pieces, vec!["abc".to_string(), "def".to_string()]);
+    }
+
+    #[test]
+    fn wait_until_returns_immediately_when_already_ready() {
+        let calls = std::cell::Cell::new(0);
+        let got = wait_until(
+            || {
+                calls.set(calls.get() + 1);
+                true
+            },
+            std::time::Duration::from_secs(5),
+            std::time::Duration::ZERO,
+        );
+        assert!(got);
+        assert_eq!(calls.get(), 1, "must not poll again once ready");
+    }
+
+    #[test]
+    fn wait_until_polls_until_the_predicate_flips() {
+        let calls = std::cell::Cell::new(0);
+        let got = wait_until(
+            || {
+                calls.set(calls.get() + 1);
+                calls.get() >= 3
+            },
+            std::time::Duration::from_secs(5),
+            std::time::Duration::ZERO,
+        );
+        assert!(got);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn wait_until_gives_up_at_the_deadline_instead_of_hanging() {
+        let got = wait_until(
+            || false,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        assert!(!got, "a predicate that never flips must return false, not spin");
+    }
+
+    #[test]
+    fn foreground_stolen_hint_tells_the_user_what_to_do() {
+        let hint = foreground_stolen_hint();
+        assert!(hint.contains("לחצו"), "must tell the user to click the target field");
+        assert!(
+            !hint.contains("error") && !hint.contains("Error"),
+            "user-facing text stays Hebrew"
+        );
+    }
+
+    /// `None` means "can't tell", and every caller treats it as permission to
+    /// proceed. Pinning that here so a future change to the signature can't
+    /// quietly turn an unknown into a refusal to type.
+    #[test]
+    fn unknown_foreground_never_reads_as_ours() {
+        assert_ne!(
+            foreground_is_ours(),
+            Some(true),
+            "in a test process there is no foreground window of ours to find"
+        );
     }
 
     #[test]

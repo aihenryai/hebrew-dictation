@@ -62,6 +62,18 @@ core-foundation = "0.10"
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
 win32job = "2.0"
+# READ-ONLY foreground-window inspection for the injection guard
+# (`injector::foreground_is_ours`). Deliberately NOT used to CHANGE focus:
+# SetForegroundWindow is refused unless the process satisfies the Win32
+# foreground-lock rules, and the usual AttachThreadInput workaround is a
+# reliability swamp. We avoid stealing focus instead of stealing-then-restoring.
+# 0.61.2 is already in Cargo.lock via 24 transitive consumers, so this adds
+# feature modules to an existing build unit, not a new dependency.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
