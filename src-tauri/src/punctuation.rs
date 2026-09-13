@@ -67,6 +67,9 @@ const COMMANDS: &[Command] = &[
     Command { spoken: &["סוגריים", "סגורים"], mark: ")", ambiguous: false },
     // One-token.
     Command { spoken: &["נקודה"], mark: ".", ambiguous: true },
+    // Niqqud spelling נְקֻדָּה uses qubuts instead of the letter vav.
+    // Stripping its marks therefore produces נקדה, not נקודה.
+    Command { spoken: &["נקדה"], mark: ".", ambiguous: true },
     Command { spoken: &["פסיק"], mark: ",", ambiguous: false },
     Command { spoken: &["נקודתיים"], mark: ":", ambiguous: false },
     Command { spoken: &["מקף"], mark: "-", ambiguous: true },
@@ -294,6 +297,7 @@ mod tests {
     fn a_fully_niqqud_command_still_matches() {
         assert_eq!(he("כותב נְקֻדָּה"), "כותב.");
         assert_eq!(he("נְקֻדָּה"), ".");
+        assert_eq!(he("עוד נְקֻדָּה"), "עוד נְקֻדָּה");
     }
 
     // ---- language gate ----

@@ -1,5 +1,47 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-13 - Local 2.13.7 focus fixes (not published or installed)
+
+- Confirmed installed executable is 2.13.6. Working tree was clean on arrival.
+- Reproduced ToolbarApp's 400ms stop timer restoring main before pending
+  transcription/injection completes. Removed it; main owns final restoration.
+  `npm run test:focus` passes; `FOCUS_BASELINE=2b58094 node --test
+  scripts/test-dictation-focus.mjs` fails against the original revision as expected.
+- Toolbar's `focus:false` only covers its initial show. Tao 0.34.8 clears
+  MARKER_DONT_FOCUS and subsequently uses SW_SHOW; repeated always-on-top=true
+  is a cached no-op. Added focusable:false and Windows-native show/hide with
+  SetWindowPos + NOACTIVATE, reasserting TOPMOST on every show. ALL toolbar
+  show/hide paths must use the helpers, never mix native visibility with Tao's
+  cached VISIBLE flag. Tao is_visible queries Win32 and remains accurate.
+- Injection now waits through null foreground transitions and held modifiers,
+  checks the target between chunks, and serializes streaming/manual injection.
+  Manual injection is async to keep the event loop available to worker threads.
+- Existing punctuation test failed for niqqud spelling נְקֻדָּה (normalizes to
+  נקדה, without vav). Added that spelling with the same noun-context protection.
+  NOTE: punctuation/lang_switch modules are currently not wired into runtime;
+  their tests passing does NOT mean those draft features work in the app.
+- Native regression test uses an offscreen 1px owned window to check repeated
+  show/hide, topmost recovery, and unchanged foreground without typing anywhere.
+  Its creation flags match the real toolbar (TOPMOST + NOACTIVATE), and the
+  recovery test asserts native demotion succeeded before reasserting topmost.
+  Final Rust suite: 187 passed, 5 existing ignored; frontend regression: 1 passed.
+- Build with `LIBCLANG_PATH=C:\Program Files\LLVM\bin` and
+  `cargo tauri build --debug --no-bundle`; test with `cargo test --lib
+  --features tauri/custom-protocol`. This is a LOCAL DEBUG build, not a release.
+- Real Claude Code composer injection is NOT yet verified. The UI helper
+  returned a Codex image when asked for Claude; stopped UI testing rather than
+  treating it as evidence. Asked which Claude Code surface; no reply yet.
+- Follow-up audit: StreamingSession::stop currently closes the WebSocket
+  immediately after CloseStream and drops a timed-out JoinHandle without abort;
+  investigate final-result loss / late injection separately with a mock server.
+- Before replacing the running installed executable or restarting the user's
+  dictation app, obtain approval per Henry's environment-change rule. No public
+  release, tag, push, installation, or app restart was done in this session.
+
+Native API references: [ShowWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow),
+[window styles](https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles),
+[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput).
+
 > **Next session: read this + `memory/hebrew-dictation.md` + `memory/hebrew-dictation-changelog.md` to continue.**
 
 ---

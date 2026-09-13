@@ -1,6 +1,6 @@
 [package]
 name = "hebrew-dictation"
-version = "2.13.6"
+version = "2.13.7"
 description = "הכתבה בעברית — Hebrew Voice Dictation by BinTech AI"
 authors = ["Henry Stauber <henrystauber22@gmail.com>"]
 edition = "2021"
@@ -71,7 +71,9 @@ win32job = "2.0"
 # feature modules to an existing build unit, not a new dependency.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Threading",
 ] }
 

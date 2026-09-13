@@ -6,6 +6,8 @@ mod enhance;
 mod export;
 mod hebrew;
 mod injector;
+#[cfg(windows)]
+mod floating_window;
 mod lang_switch;
 mod local_api;
 mod model;
@@ -1775,6 +1777,8 @@ pub(crate) fn macos_unhide_if_needed(app: &AppHandle) {
 /// hug the word before it, so the separator moved to the front — and keeping
 /// this state process-wide is what preserves the cross-dictation behaviour.
 static LAST_INJECTED_CHAR: std::sync::Mutex<Option<char>> = std::sync::Mutex::new(None);
+// Manual paste and streaming segments share the same focus/typing transaction.
+static INJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn last_injected_char() -> Option<char> {
     LAST_INJECTED_CHAR.lock().ok().and_then(|g| *g)
@@ -1804,6 +1808,7 @@ fn our_window_focused(app: &AppHandle) -> bool {
 /// passes through — which is also why the "what did we last type" bookkeeping
 /// for `punctuation::leading_separator` lives here and nowhere else.
 pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), String> {
+    let _guard = INJECTION_LOCK.lock().map_err(|_| "לא ניתן להתחיל הזרקה נוספת".to_string())?;
     let result = inject_text_defocused_inner(app, text);
     if result.is_ok() {
         remember_injected(text);
@@ -1883,7 +1888,7 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
     }
     if toolbar_was_visible {
         if let Some(w) = &toolbar_window {
-            let _ = w.hide();
+            let _ = hide_floating_window(w);
         }
     }
     // Let Windows promote the previously-active window to the foreground, and
@@ -1905,7 +1910,7 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
     }
     if toolbar_was_visible {
         if let Some(w) = &toolbar_window {
-            let _ = w.show();
+            let _ = show_floating_window(w);
         }
     }
 
@@ -1913,8 +1918,14 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
 }
 
 #[tauri::command]
-fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
-    let result = inject_text_defocused(&app, &text);
+async fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
+    // Window operations from the worker need the event loop to remain free.
+    // A synchronous command waiting on INJECTION_LOCK could deadlock it.
+    let inject_app = app.clone();
+    let inject_value = text.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        inject_text_defocused(&inject_app, &inject_value)
+    }).await.unwrap_or_else(|e| Err(format!("ההזרקה נכשלה: {e}")));
     // Record regardless of injection outcome: the transcript was completed
     // (the user spoke it, Whisper/Deepgram transcribed it) whether or not the
     // OS-level clipboard-paste into the active field then succeeded. Matches
@@ -2109,6 +2120,44 @@ const TOOLBAR_H: f64 = 76.0;
 const IDLE_W: f64 = 56.0;
 const IDLE_H: f64 = 56.0;
 
+/// Reassert the native z-order on every show. Tao caches always-on-top and
+/// treats repeated `set_always_on_top(true)` calls as no-ops, even if another
+/// topmost window has since covered the bar. Never activate the typing target.
+fn show_floating_window(toolbar: &tauri::WebviewWindow) -> Result<(), String> {
+    set_floating_visibility(toolbar, true)
+}
+
+fn hide_floating_window(toolbar: &tauri::WebviewWindow) -> Result<(), String> {
+    set_floating_visibility(toolbar, false)
+}
+
+fn set_floating_visibility(toolbar: &tauri::WebviewWindow, visible: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // All toolbar visibility uses native APIs on Windows. Never mix with
+        // Tao's cached VISIBLE flag: its show() activates after the first show.
+        // is_visible() queries Win32 directly, so existing readers stay valid.
+        let window = toolbar.clone();
+        toolbar.run_on_main_thread(move || {
+            if let Ok(hwnd) = window.hwnd() {
+                if let Err(error) = floating_window::set_visible(hwnd.0 as _, visible) {
+                    eprintln!("{error}");
+                }
+            }
+        }).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        if visible {
+            toolbar.set_always_on_top(true).map_err(|e| e.to_string())?;
+            toolbar.show().map_err(|e| e.to_string())?;
+        } else {
+            toolbar.hide().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 /// Compute the on-screen logical position for a floating window of size `w`×`h`.
 /// Honors the user's saved drag position when it stays on the active monitor,
 /// else falls back to bottom-center, 80px above the bottom edge. Shared by the
@@ -2178,9 +2227,8 @@ fn show_idle_button_inner(app: &AppHandle, saved_pos: Option<settings::ToolbarPo
     }
     let _ = toolbar.set_size(tauri::LogicalSize::new(IDLE_W, IDLE_H));
     // Unconditional — see set_window_always_on_top's doc comment.
-    let _ = toolbar.set_always_on_top(true);
     let _ = app.emit("toolbar-mode", "idle");
-    let _ = toolbar.show();
+    let _ = show_floating_window(&toolbar);
 }
 
 /// Re-evaluate whether the idle button should be on screen: show it when the
@@ -2207,7 +2255,7 @@ fn refresh_idle_button(app: &AppHandle, state: &AppState) {
     if enabled && !main_visible {
         show_idle_button_inner(app, saved_pos);
     } else if let Some(t) = app.get_webview_window("toolbar") {
-        let _ = t.hide();
+        let _ = hide_floating_window(&t);
     }
 }
 
@@ -2221,7 +2269,7 @@ fn open_main_window(app: AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     macos_unhide_if_needed(&app);
     if let Some(t) = app.get_webview_window("toolbar") {
-        let _ = t.hide();
+        let _ = hide_floating_window(&t);
     }
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.show();
@@ -2312,9 +2360,8 @@ fn show_toolbar_window(
         // the webview to render the recording layout.
         let _ = toolbar.set_size(tauri::LogicalSize::new(TOOLBAR_W, TOOLBAR_H));
         // Unconditional — see set_window_always_on_top's doc comment.
-        let _ = toolbar.set_always_on_top(true);
         let _ = app.emit("toolbar-mode", "recording");
-        let _ = toolbar.show();
+        show_floating_window(&toolbar)?;
     }
 
     if let Some(w) = &main {
@@ -2355,7 +2402,7 @@ fn hide_toolbar_window(
     defer_restore: Option<bool>,
 ) -> Result<(), String> {
     if let Some(t) = app.get_webview_window("toolbar") {
-        let _ = t.hide();
+        let _ = hide_floating_window(&t);
     }
 
     if defer_restore.unwrap_or(false) {
@@ -2540,7 +2587,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // Main is back — the idle circle (same window) must step aside.
                 if let Some(t) = app.get_webview_window("toolbar") {
-                    let _ = t.hide();
+                    let _ = hide_floating_window(&t);
                 }
             }
             "quit" => {
@@ -2557,7 +2604,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = window.set_focus();
                 }
                 if let Some(t) = app_clone.get_webview_window("toolbar") {
-                    let _ = t.hide();
+                    let _ = hide_floating_window(&t);
                 }
             }
         });

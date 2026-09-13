@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "הכתבה בעברית",
-  "version": "2.13.6",
+  "version": "2.13.7",
   "identifier": "com.bintech.hebrew-dictation",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -36,6 +36,7 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "focus": false,
+        "focusable": false,
         "shadow": false
       }
     ],

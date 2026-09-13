@@ -3966,13 +3966,6 @@ export function ToolbarApp() {
   // Pending single-click timer — lets us tell a single click (start dictation)
   // from a double click (open the full window).
   const idleClickTimerRef = useRef<number | null>(null);
-  // Pending handleStop() fallback-hide timer (see handleStop below). Cancelled
-  // by the "toolbar-reset" listener when a NEW recording starts in the same
-  // window — otherwise a fast re-trigger (quick re-press, VAD auto-stop
-  // immediately followed by a new dictation) races the old stop's delayed
-  // hide, which fires after the fresh bar is already showing and yanks it
-  // away — the "toolbar sometimes doesn't appear" report.
-  const stopFallbackTimerRef = useRef<number | null>(null);
 
   // Mount-time mode detection. The backend emits `toolbar-mode` when it shows
   // the window, but on a cold autostart-minimized launch that emit can fire
@@ -3991,9 +3984,6 @@ export function ToolbarApp() {
     return () => {
       if (idleClickTimerRef.current !== null) {
         window.clearTimeout(idleClickTimerRef.current);
-      }
-      if (stopFallbackTimerRef.current !== null) {
-        window.clearTimeout(stopFallbackTimerRef.current);
       }
     };
   }, []);
@@ -4018,13 +4008,6 @@ export function ToolbarApp() {
       setLivePreview("");
       setPaused(false);
       setAudioLevel(0);
-      // A new recording just started — any fallback-hide timer left over from
-      // a previous handleStop() is now stale and would hide THIS session's bar
-      // instead of the one it was meant for. See stopFallbackTimerRef above.
-      if (stopFallbackTimerRef.current !== null) {
-        window.clearTimeout(stopFallbackTimerRef.current);
-        stopFallbackTimerRef.current = null;
-      }
     });
     const unlistenLevel = listen<number>("audio-level", (event) => {
       setAudioLevel(event.payload);
@@ -4065,21 +4048,10 @@ export function ToolbarApp() {
   }, []);
 
   const handleStop = useCallback(async () => {
-    // 1) Re-use main's hotkey handler — it already toggles recording state and
-    //    runs the full transcribe → inject → history pipeline.
+    // Main owns the whole stop/transcribe/inject/restore sequence. A timed
+    // fallback used to restore it after 400ms, stealing focus while the final
+    // transcript was still being produced. Only restore after injection ends.
     await emit("hotkey-pressed", "toolbar");
-    // 2) Safety fallback — if main's listener no-ops (e.g. status was neither
-    //    "recording" nor "idle" at click time, like a status flicker between
-    //    paths), the toolbar would have stayed visible forever. Force-hide it
-    //    after a short window. If main already handled the click, this call
-    //    is a no-op (window is already hidden).
-    if (stopFallbackTimerRef.current !== null) {
-      window.clearTimeout(stopFallbackTimerRef.current);
-    }
-    stopFallbackTimerRef.current = window.setTimeout(() => {
-      stopFallbackTimerRef.current = null;
-      invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
-    }, 400);
   }, []);
 
   // Mouse-down drag handler for the toolbar window.

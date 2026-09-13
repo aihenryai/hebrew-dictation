@@ -1,11 +1,12 @@
 {
   "name": "hebrew-dictation",
   "private": true,
-  "version": "2.13.6",
+  "version": "2.13.7",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:focus": "node --test scripts/test-dictation-focus.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

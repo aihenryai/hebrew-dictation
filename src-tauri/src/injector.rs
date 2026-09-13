@@ -109,10 +109,8 @@ const LEGACY_DEFOCUS_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// Is the foreground window one of ours?
 ///
 /// `None` means "can't tell" — the Win32 call failed, or there is no foreground
-/// window at all (a normal transient state during window switches). **Every
-/// caller must treat `None` as permission to proceed**, never as a refusal:
-/// this guard exists to catch a known-bad state, not to gate injection on a
-/// positive result.
+/// window at all (a normal transient state during window switches). On Windows
+/// wait for a real external target; typing during that gap silently loses text.
 #[cfg(windows)]
 pub(crate) fn foreground_is_ours() -> Option<bool> {
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
@@ -158,12 +156,12 @@ fn wait_until(ready: impl Fn() -> bool, deadline: std::time::Duration, poll: std
 }
 
 /// Wait until the foreground window is no longer ours. True when the foreground
-/// belongs to someone else — or when we can't tell, which is not a failure.
+/// belongs to someone else. A transient null foreground is not ready yet.
 pub(crate) fn wait_for_foreground_release(deadline: std::time::Duration) -> bool {
     #[cfg(windows)]
     {
         wait_until(
-            || foreground_is_ours() != Some(true),
+            || foreground_ready(foreground_is_ours()),
             deadline,
             FOREGROUND_POLL_INTERVAL,
         )
@@ -177,27 +175,20 @@ pub(crate) fn wait_for_foreground_release(deadline: std::time::Duration) -> bool
     }
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn foreground_ready(ours: Option<bool>) -> bool {
+    ours == Some(false)
+}
+
 /// Shown when we were about to type into our own window. Actionable on purpose:
 /// the user's next move is to click the field they want, not to file a bug.
 pub(crate) fn foreground_stolen_hint() -> &'static str {
     "הטקסט לא הוקלד - חלון האפליקציה תפס את המיקוד. לחצו על התיבה שאליה תרצו להכתיב ונסו שוב."
 }
 
-/// Characters per `enigo.text()` call. enigo's Windows backend (0.2.1) builds
-/// EVERY character in one call into a single array and fires it as ONE
-/// `SendInput` syscall — for a long segment that's a burst of hundreds of
-/// synthetic key events landing on the target in one shot. `SendInput` events
-/// are dispatched through the RECEIVING app's own message pump; if that app is
-/// mid-render (heavier controlled-input UIs — chat composers, Electron apps —
-/// do real work per keystroke) when the burst arrives, Windows can drop the
-/// events the pump wasn't ready for. Real report (Henry, 2026-09-09): typing
-/// into Claude Desktop would start, then silently stop partway through longer
-/// dictations — worse as the message grew, i.e. exactly as each burst got
-/// bigger and the target's per-keystroke render cost climbed. Splitting into
-/// small chunks with a short pause between them gives the target's message
-/// pump repeated chances to catch up; ~30 chars × 8ms adds well under a
-/// second even to a long paragraph, imperceptible after a multi-second
-/// speech-to-text round trip.
+/// Pace Unicode input and recheck the target between bounded batches. This
+/// limits how much text can be misdirected if focus changes during SendInput;
+/// success from SendInput alone does not prove a target editor accepted text.
 const INJECT_CHUNK_CHARS: usize = 30;
 const INJECT_CHUNK_DELAY: std::time::Duration = std::time::Duration::from_millis(8);
 
@@ -205,9 +196,12 @@ const INJECT_CHUNK_DELAY: std::time::Duration = std::time::Duration::from_millis
 /// `INJECT_CHUNK_CHARS`). Also avoids a known bug in enigo 0.2.1 on Windows
 /// where `Key::Unicode('v') + Ctrl` fails with "key state could not be converted to u32"
 /// because `GetKeyState` returns negative values while any modifier is held. Typing the
-/// characters as Unicode WM_CHAR events bypasses the modifier path entirely and works in
-/// every text field we target (chat inputs, text editors, browsers).
+/// characters with KEYEVENTF_UNICODE bypasses that key-lookup path. Target
+/// editors still need to support Unicode input; do not assume universal support.
 pub fn inject_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
     // On macOS, keystroke injection is silently dropped without Accessibility
     // permission — bail out with guidance instead of typing nothing.
     #[cfg(target_os = "macos")]
@@ -224,6 +218,24 @@ pub fn inject_text(text: &str) -> Result<(), String> {
         return Err(foreground_stolen_hint().to_string());
     }
 
+    #[cfg(windows)]
+    let target = {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        if !wait_for_foreground_release(FOREGROUND_RELEASE_TIMEOUT) {
+            return Err("לא נמצאה תיבת יעד פעילה. הטקסט נשמר בתמלול; לחצו על תיבת הטקסט ונסו שוב.".into());
+        }
+        // Do not synthesize text while Alt+D (or another modifier shortcut)
+        // is still held. SendInput does not reset physical keyboard state.
+        if !wait_until(modifiers_released, std::time::Duration::from_secs(2), FOREGROUND_POLL_INTERVAL) {
+            return Err("ההקלדה נעצרה כי מקש קיצור עדיין לחוץ. שחררו את המקשים ונסו שוב; הטקסט נשמר בתמלול.".into());
+        }
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_null() || foreground_is_ours() != Some(false) {
+            return Err(foreground_stolen_hint().into());
+        }
+        hwnd
+    };
+
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|e| format!("Enigo init error: {}", e))?;
 
@@ -231,11 +243,27 @@ pub fn inject_text(text: &str) -> Result<(), String> {
         if i > 0 {
             std::thread::sleep(INJECT_CHUNK_DELAY);
         }
+        #[cfg(windows)]
+        if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } != target
+            || !modifiers_released()
+        {
+            return Err("החלון או מצב המקלדת השתנו בזמן ההקלדה. ההקלדה נעצרה; התמלול המלא נשמר באפליקציה.".into());
+        }
         enigo
             .text(piece)
             .map_err(|e| format!("Text input error: {}", e))?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn modifiers_released() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN,
+    };
+    [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+        .iter()
+        .all(|key| unsafe { GetAsyncKeyState(*key as i32) >= 0 })
 }
 
 /// Split `text` into pieces of at most `size` Unicode scalar values (`char`s),
@@ -252,6 +280,22 @@ fn chunk_chars(text: &str, size: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_gap_is_not_permission_to_type() {
+        assert!(!foreground_ready(None));
+        assert!(!foreground_ready(Some(true)));
+        assert!(foreground_ready(Some(false)));
+        let observations = std::cell::RefCell::new(
+            [Some(true), None, None, Some(false)].into_iter()
+        );
+        assert!(wait_until(
+            || foreground_ready(observations.borrow_mut().next().unwrap()),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
+        ));
+        assert!(observations.borrow_mut().next().is_none());
+    }
 
     #[test]
     fn accessibility_hint_points_to_the_macos_pane() {
@@ -340,9 +384,7 @@ mod tests {
         );
     }
 
-    /// `None` means "can't tell", and every caller treats it as permission to
-    /// proceed. Pinning that here so a future change to the signature can't
-    /// quietly turn an unknown into a refusal to type.
+    /// The foreground probe must not classify another process as our own.
     #[test]
     fn unknown_foreground_never_reads_as_ours() {
         assert_ne!(
