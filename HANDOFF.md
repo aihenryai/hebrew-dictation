@@ -1,5 +1,17 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-14 - v2.13.9 publication in progress
+
+Henry confirmed the local fixes work in Claude Desktop, then asked why the update
+was not available on GitHub or his website. Publishing the verified changes as
+v2.13.9 (higher than his running local 2.13.8, so the updater detects it).
+App main and tag pushed at b9ca287. Release workflow: 34799861761.
+Website commit ba9d1a3 updates download links, version badges, SEO and fix details;
+build passed. Hold website push until both release installers are available.
+191 Rust tests and the frontend focus test passed again at release version 2.13.9.
+Git pushes must use the account-bound Git Credential Manager helper (the active
+gh account is subletyapp and cannot push to aihenryai). No credentials printed.
+
 ## 2026-09-14 - 2.13.8 streaming shutdown fixes; target is Claude Desktop
 
 Henry clarified the target is **Claude Desktop, not the terminal CLI**. He found
