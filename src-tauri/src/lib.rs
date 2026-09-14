@@ -36,7 +36,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 struct ActiveStreaming {
     session: Arc<streaming::StreamingSession>,
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
-    dispatch_task: tokio::task::JoinHandle<()>,
+    dispatch_task: tokio::task::JoinHandle<Result<(), String>>,
 }
 
 struct AppState {
@@ -1487,13 +1487,15 @@ async fn start_streaming_transcription(
     };
 
     let session_for_task = session.clone();
+    let app_for_dispatch = app.clone();
     let dispatch_task = tokio::spawn(async move {
         while let Some(chunk) = audio_rx.recv().await {
             if let Err(e) = session_for_task.send_audio_pcm16(&chunk).await {
-                eprintln!("streaming send error: {}", e);
-                break;
+                let _ = app_for_dispatch.emit("audio-stream-error", &e);
+                return Err(e);
             }
         }
+        Ok(())
     });
 
     // Store the active session so stop_streaming_transcription can find it.
@@ -1508,7 +1510,7 @@ async fn start_streaming_transcription(
 }
 
 #[tauri::command]
-async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<String, String> {
+async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     // Stop the CPAL stream FIRST. With the chunk callback still wired, the final 10-30ms
     // of WASAPI-buffered audio is delivered via the callback into `audio_tx` before the
     // stream is dropped. clear_chunk_callback AFTER ensures nothing further is queued.
@@ -1533,10 +1535,14 @@ async fn stop_streaming_transcription(state: State<'_, AppState>) -> Result<Stri
 
     // Drop the sender so the dispatch task terminates when the channel drains.
     drop(active.audio_tx);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), active.dispatch_task).await;
+    let dispatch_warning = streaming::finish_task(active.dispatch_task, std::time::Duration::from_secs(3)).await.err();
 
     // Close the WebSocket and return the accumulated final text.
-    let text = active.session.stop().await?;
+    let stopped = active.session.stop().await;
+    let text = stopped.text;
+    if let Some(warning) = dispatch_warning.or(stopped.warning) {
+        let _ = app.emit("audio-stream-error", warning);
+    }
 
     // One seq bump per streaming session = the whole utterance, not per segment.
     local_api::record_utterance(&state.last_transcript, &text);

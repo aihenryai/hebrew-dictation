@@ -2279,7 +2279,7 @@ function App() {
                 <span className="wizard-key">Alt + D</span>
                 <span>ודבר בעברית</span>
               </div>
-              <p className="wizard-note" style={{ fontSize: "0.7rem" }}>התוכנה רצה ברקע. גם בסגירת החלון Alt+D ממשיך לעבוד.</p>
+              <p className="wizard-note" style={{ fontSize: "0.7rem" }}>התוכנה רצה ברקע. גם בסגירת החלון <bdi>{formatHotkey(hotkey)}</bdi> ממשיך לעבוד.</p>
 
               <label className="toggle-label wizard-idle-toggle">
                 <input
@@ -2521,6 +2521,7 @@ function App() {
             </button>
           </div>
           {hotkeyError && <p className="settings-error">{hotkeyError}</p>}
+          <p className="settings-hint">אם Alt פותח תפריט בתוכנה שאליה מכתיבים, בחרו כאן קיצור שאינו כולל Alt.</p>
         </div>
 
         {/* Pause hotkey — separate global shortcut for Pause/Resume (v2.8.0) */}
@@ -3750,7 +3751,7 @@ function App() {
     <main className="container compact" dir="rtl">
       {showCloseTip && (
         <div className="close-tip-banner">
-          <span>💡 Alt+D עובד גם כשהחלון סגור</span>
+          <span>💡 <bdi>{formatHotkey(hotkey)}</bdi> עובד גם כשהחלון סגור</span>
           <button className="btn-close-tip" onClick={dismissCloseTip}>✓</button>
         </div>
       )}

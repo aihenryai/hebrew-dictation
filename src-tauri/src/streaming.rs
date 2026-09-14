@@ -1,7 +1,9 @@
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -25,7 +27,62 @@ pub struct InterimPayload {
 pub struct StreamingSession {
     writer: Arc<Mutex<Option<WsWriter>>>,
     final_text: Arc<Mutex<String>>,
-    recv_task: Mutex<Option<JoinHandle<()>>>,
+    recv_task: Mutex<Option<JoinHandle<Result<(), String>>>>,
+    stop_requested: Arc<AtomicBool>,
+    injection: Arc<SessionInjection>,
+}
+
+pub(crate) struct StreamingStop {
+    pub text: String,
+    pub warning: Option<String>,
+}
+
+/// A cancelled spawn_blocking future does not stop its OS thread. Closing this
+/// gate skips queued work and waits for any injection already inside it, before
+/// the UI can restore a window or start another dictation.
+struct SessionInjection {
+    enabled: AtomicBool,
+    running: std::sync::Mutex<()>,
+}
+
+impl SessionInjection {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            running: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn run(&self, inject: impl FnOnce()) {
+        let _guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if self.enabled.load(Ordering::SeqCst) {
+            inject();
+        }
+    }
+
+    async fn close_and_drain(self: &Arc<Self>) {
+        self.enabled.store(false, Ordering::SeqCst);
+        let gate = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(gate.running.lock().unwrap_or_else(|e| e.into_inner()));
+        })
+        .await;
+    }
+}
+
+/// Timeout must abort AND join: dropping a JoinHandle merely detaches its task.
+pub(crate) async fn finish_task(
+    mut task: JoinHandle<Result<(), String>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(result) => result.map_err(|e| format!("משימת התמלול נקטעה: {e}"))?,
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err("שירות התמלול לא סיים בזמן; ייתכן שחסר סוף ההכתבה. הטקסט שכבר התקבל נשמר.".into())
+        }
+    }
 }
 
 /// Per-session latch so a repeating per-segment injection failure (e.g. missing
@@ -109,6 +166,10 @@ impl StreamingSession {
         let (writer, mut reader) = ws_stream.split();
         let writer = Arc::new(Mutex::new(Some(writer)));
         let final_text = Arc::new(Mutex::new(String::new()));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stopping = stop_requested.clone();
+        let injection = Arc::new(SessionInjection::new());
+        let injection_rx = injection.clone();
 
         let final_text_rx = final_text.clone();
         let app_clone = app.clone();
@@ -124,12 +185,26 @@ impl StreamingSession {
                             &app_clone,
                             &inject_err_reported,
                             language_switch_enabled,
+                            &injection_rx,
                         )
                         .await;
                     }
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Close(_)) => break,
+                    Err(e) => {
+                        let error = map_ws_error(&e);
+                        let _ = app_clone.emit("audio-stream-error", &error);
+                        return Err(error);
+                    }
                     _ => {}
                 }
+            }
+            if stopping.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                let error =
+                    "החיבור לשירות התמלול נסגר במהלך ההכתבה. הטקסט שכבר התקבל נשמר.".to_string();
+                let _ = app_clone.emit("audio-stream-error", &error);
+                Err(error)
             }
         });
 
@@ -137,6 +212,8 @@ impl StreamingSession {
             writer,
             final_text,
             recv_task: Mutex::new(Some(recv_task)),
+            stop_requested,
+            injection,
         }))
     }
 
@@ -158,30 +235,53 @@ impl StreamingSession {
         Ok(())
     }
 
-    /// Send Deepgram's CloseStream message, close the WS, await the receive task,
-    /// and return the accumulated final text.
-    pub async fn stop(&self) -> Result<String, String> {
-        {
+    /// Ask Deepgram to flush and let the SERVER close the WebSocket afterwards.
+    /// Never discard received text because shutdown failed or timed out.
+    pub async fn stop(&self) -> StreamingStop {
+        self.stop_with_timeout(Duration::from_secs(5)).await
+    }
+
+    async fn stop_with_timeout(&self, timeout: Duration) -> StreamingStop {
+        // Holding this guard also serializes concurrent stop requests.
+        let mut receiver = self.recv_task.lock().await;
+        self.stop_requested.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let close_result = tokio::time::timeout_at(deadline, async {
             let mut guard = self.writer.lock().await;
             if let Some(mut writer) = guard.take() {
-                // Deepgram accepts {"type": "CloseStream"} to flush remaining final results.
-                let _ = writer
-                    .send(Message::Text(r#"{"type":"CloseStream"}"#.to_string().into()))
-                    .await;
-                let _ = writer.close().await;
+                writer
+                    .send(Message::Text(
+                        r#"{"type":"CloseStream"}"#.to_string().into(),
+                    ))
+                    .await
+                    .map_err(|e| map_ws_error(&e))?;
+                // Do not call writer.close(): after sending a WebSocket close
+                // frame tungstenite will reject late transcript data frames.
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        let mut warning = match close_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some("בקשת סיום ההכתבה התעכבה; ייתכן שחסר סוף התמלול.".into()),
+        };
+        if let Some(task) = receiver.take() {
+            if let Err(error) = finish_task(
+                task,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            {
+                warning.get_or_insert(error);
             }
         }
-
-        let task = {
-            let mut guard = self.recv_task.lock().await;
-            guard.take()
-        };
-        if let Some(task) = task {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-        }
-
+        self.injection.close_and_drain().await;
         let text = self.final_text.lock().await.clone();
-        Ok(text.trim().to_string())
+        StreamingStop {
+            text: text.trim().to_string(),
+            warning,
+        }
     }
 }
 
@@ -191,6 +291,7 @@ async fn handle_message(
     app: &AppHandle,
     inject_err_reported: &InjectErrReported,
     language_switch_enabled: bool,
+    injection: &Arc<SessionInjection>,
 ) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
@@ -208,7 +309,10 @@ async fn handle_message(
         return;
     };
 
-    let is_final = json.get("is_final").and_then(|b| b.as_bool()).unwrap_or(false);
+    let is_final = json
+        .get("is_final")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
 
     if transcript.is_empty() {
         return;
@@ -226,6 +330,15 @@ async fn handle_message(
     }
 
     if is_final {
+        // Commit received words before awaiting OS input. If stop cancels the
+        // receive task during injection, history still contains these words.
+        {
+            let mut acc = final_text.lock().await;
+            if !acc.is_empty() {
+                acc.push(' ');
+            }
+            acc.push_str(transcript);
+        }
         // Inject this segment into the active text field immediately so the user
         // sees dictation appear in their target app as they speak (live streaming).
         // A trailing space separates consecutive segments. Goes through
@@ -238,23 +351,20 @@ async fn handle_message(
         let app_for_inject = app.clone();
         let app_for_err = app.clone();
         let reported = inject_err_reported.clone();
+        let gate = injection.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = crate::inject_text_defocused(&app_for_inject, &to_inject) {
-                // Surface the failure to the UI ONCE per session — previously it
-                // was discarded, so a Mac without Accessibility permission
-                // streamed an entire dictation into nothing with zero feedback.
-                if !reported.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    let _ = app_for_err.emit("injection-error", e);
+            gate.run(|| {
+                if let Err(e) = crate::inject_text_defocused(&app_for_inject, &to_inject) {
+                    // Surface the failure to the UI ONCE per session — previously it
+                    // was discarded, so a Mac without Accessibility permission
+                    // streamed an entire dictation into nothing with zero feedback.
+                    if !reported.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = app_for_err.emit("injection-error", e);
+                    }
                 }
-            }
+            });
         })
         .await;
-
-        let mut acc = final_text.lock().await;
-        if !acc.is_empty() {
-            acc.push(' ');
-        }
-        acc.push_str(transcript);
     }
 
     let _ = app.emit(
@@ -273,7 +383,9 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
             401 | 403 => "מפתח Deepgram לא תקין — עדכן אותו בהגדרות".to_string(),
             402 => "נגמר הקרדיט ב-Deepgram — צור חשבון חדש או הוסף קרדיט בלוח הבקרה".to_string(),
             429 => "חרגת ממגבלת השימוש ב-Deepgram — נסה שוב בעוד רגע".to_string(),
-            400 => "Deepgram דחה את הבקשה (400) — ייתכן שפת תמלול לא נתמכת במצב streaming".to_string(),
+            400 => {
+                "Deepgram דחה את הבקשה (400) — ייתכן שפת תמלול לא נתמכת במצב streaming".to_string()
+            }
             code => format!("שגיאת Deepgram (HTTP {})", code),
         },
         WsErr::Io(io) => format!("אין חיבור ל-Deepgram — {}", io),
@@ -284,6 +396,149 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Loopback-only fake service: no API key, microphone, or real text field.
+    async fn local_session() -> (Arc<StreamingSession>, WebSocketStream<TcpStream>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap()
+        });
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let server = accept.await.unwrap();
+        let (writer, mut reader) = client.split();
+        let final_text = Arc::new(Mutex::new(String::new()));
+        let received = final_text.clone();
+        let receiver = tokio::spawn(async move {
+            while let Some(message) = reader.next().await {
+                match message.map_err(|e| e.to_string())? {
+                    Message::Text(raw) => {
+                        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                        if let Some(text) = json
+                            .pointer("/channel/alternatives/0/transcript")
+                            .and_then(|v| v.as_str())
+                        {
+                            received.lock().await.push_str(text);
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+        (
+            Arc::new(StreamingSession {
+                writer: Arc::new(Mutex::new(Some(writer))),
+                final_text,
+                recv_task: Mutex::new(Some(receiver)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                injection: Arc::new(SessionInjection::new()),
+            }),
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn stop_receives_final_words_before_the_server_closes() {
+        let (session, mut server) = local_session().await;
+        let service = tokio::spawn(async move {
+            let message = server.next().await.unwrap().unwrap();
+            assert_eq!(message, Message::Text(r#"{"type":"CloseStream"}"#.into()));
+            // The old writer.close() sent a second, protocol-level close here,
+            // making late final transcript frames impossible to receive.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), server.next())
+                    .await
+                    .is_err()
+            );
+            server.send(Message::Text(r#"{"is_final":true,"channel":{"alternatives":[{"transcript":"המילים האחרונות"}]}}"#.into())).await.unwrap();
+            server.close(None).await.unwrap();
+        });
+        let result = session.stop().await;
+        service.await.unwrap();
+        assert_eq!(result.text, "המילים האחרונות");
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+        assert!(!session.injection.enabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stalled_shutdown_preserves_received_text_and_closes_injection() {
+        let (session, mut server) = local_session().await;
+        *session.final_text.lock().await = "טקסט שכבר התקבל".into();
+        let service = tokio::spawn(async move {
+            let _ = server.next().await;
+            std::future::pending::<()>().await;
+            drop(server);
+        });
+        let result = session.stop_with_timeout(Duration::from_millis(50)).await;
+        assert_eq!(result.text, "טקסט שכבר התקבל");
+        assert!(result.warning.is_some());
+        assert!(session.recv_task.lock().await.is_none());
+        session
+            .injection
+            .run(|| panic!("timed-out session must never inject again"));
+        service.abort();
+        let _ = service.await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_receive_or_dispatch_task_is_aborted_not_detached() {
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = dropped.clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = OnDrop(flag);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        running.await.unwrap();
+        assert!(finish_task(task, Duration::from_millis(10)).await.is_err());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "task must have been destroyed before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_input_and_skips_queued_input() {
+        let gate = Arc::new(SessionInjection::new());
+        let worker_gate = gate.clone();
+        let (entered, entry) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_gate.run(|| {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+        });
+        entry.await.unwrap();
+        let stop_gate = gate.clone();
+        let mut stop = tokio::spawn(async move {
+            stop_gate.close_and_drain().await;
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut stop)
+            .await
+            .is_err());
+        let queued_gate = gate.clone();
+        let queued = tokio::task::spawn_blocking(move || {
+            queued_gate.run(|| panic!("queued input from a closed session must be skipped"));
+        });
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        stop.await.unwrap();
+        queued.await.unwrap();
+    }
 
     #[test]
     fn detect_language_switch_matches_exact_hebrew_and_english_triggers() {
@@ -308,7 +563,11 @@ mod tests {
     #[test]
     fn strip_niqud_removes_points_but_keeps_every_base_letter() {
         assert_eq!(strip_niqud("כְּתוֹב בַּאֲנְגְּלִית"), "כתוב באנגלית");
-        assert_eq!(strip_niqud("שלום"), "שלום", "plain text must pass through untouched");
+        assert_eq!(
+            strip_niqud("שלום"),
+            "שלום",
+            "plain text must pass through untouched"
+        );
     }
 
     #[test]
@@ -324,7 +583,10 @@ mod tests {
     #[test]
     fn detect_language_switch_never_matches_a_substring_of_a_real_sentence() {
         assert_eq!(detect_language_switch("אני אוהב לכתוב בעברית כל יום"), None);
-        assert_eq!(detect_language_switch("הוא אמר לי כתוב בעברית ואני כתבתי"), None);
+        assert_eq!(
+            detect_language_switch("הוא אמר לי כתוב בעברית ואני כתבתי"),
+            None
+        );
         assert_eq!(detect_language_switch("כתוב בעברית ותשלח לי"), None);
     }
 

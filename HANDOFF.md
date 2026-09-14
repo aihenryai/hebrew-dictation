@@ -1,5 +1,38 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-14 - 2.13.8 streaming shutdown fixes; target is Claude Desktop
+
+Henry clarified the target is **Claude Desktop, not the terminal CLI**. He found
+Alt opens a menu there and changed his dictation shortcut to ctrl+d himself.
+Preserve that setting; earlier terminal Alt+D research is not evidence for his
+Desktop issue. The existing pause/language shortcuts remain unchanged.
+
+- Removed the premature WebSocket close after Deepgram CloseStream. Wait for
+  the server's final results and server-initiated close, with a bounded deadline.
+- Both audio-dispatch and receive task deadlines now abort AND join the task;
+  dropping the old JoinHandle merely detached it.
+- A session-specific gate skips queued injection and drains any active blocking
+  injection before stop returns, including receive timeout. No late typing into
+  a restored window or a new dictation session.
+- Save each received final segment before awaiting injection. Stop returns the
+  received transcript even on network/timeout errors, alongside a UI warning;
+  history and the local transcript endpoint retain it.
+- Wizard/closed-window hints display the user's actual shortcut; settings explain
+  selecting a non-Alt shortcut if the target application opens a menu.
+- Validation: 191 Rust tests passed, 5 existing ignored; frontend focus test and
+  TypeScript/Vite build passed. Four new tests use loopback WebSockets and fake
+  injection callbacks (no paid API, microphone, or typing into external apps).
+- This remains a local debug build, not a public release or replacement of the
+  installed executable. Backup of the prior running test executable:
+  target/debug/test-backups/hebrew-dictation-2.13.7-20260914.exe.
+- Restart completed: one responding local debug process (PID 27020), executable
+  version 2.13.8. Settings still contain ctrl+d and streaming_enabled=true.
+  Native inspection confirmed the toolbar has TOPMOST and NOACTIVATE styles;
+  it is currently hidden while the main window is visible. Live dictation into
+  Claude Desktop remains unverified.
+
+Protocol reference: [Deepgram CloseStream](https://developers.deepgram.com/docs/close-stream).
+
 ## 2026-09-14 - Approved local test launch
 
 Henry approved closing the active app and launching the debug build. Stopped
