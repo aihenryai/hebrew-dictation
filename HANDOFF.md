@@ -1,5 +1,13 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-14 - Approved local test launch
+
+Henry approved closing the active app and launching the debug build. Stopped
+installed 2.13.6 (PID 40948) and launched target/debug/hebrew-dictation.exe
+2.13.7 (PID 27644). Process responds; live toolbar HWND 853464 is visible,
+TOPMOST=true, NOACTIVATE=true. Installed executable was not replaced. No public
+release. Real dictation into Claude Code still needs Henry's speech test.
+
 ## 2026-09-13 - Local 2.13.7 focus fixes (not published or installed)
 
 - Confirmed installed executable is 2.13.6. Working tree was clean on arrival.
