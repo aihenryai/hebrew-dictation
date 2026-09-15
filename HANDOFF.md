@@ -1,5 +1,35 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-16 - v2.13.9 publication verified; repeatable release check
+
+The publication wait below is resolved. Workflow 34799861761 completed successfully.
+The public latest.json reports 2.13.9, both Windows and Apple Silicon Mac updater
+entries (including their aliases) resolve to binary downloads, and each published
+.sig file matches the manifest. The Mac DMG is also available. The live
+https://bintechai.com/hebrew-dictation page contains 2.13.9 and the Windows download
+link. No installation or cryptographic verification of installer bytes was done.
+
+Added `scripts/check-release.mjs`: read-only, anonymous GETs for manifest/signatures
+and HEAD requests for binaries, with bounded request timeouts. Rejects missing
+platforms, stale versions, wrong asset URLs, absent/mismatched signatures, missing
+downloads and non-binary responses. Defaults to package.json version; optional
+first argument selects another stable version. Does not publish or install.
+
+From the project directory:
+```sh
+node scripts/check-release.mjs
+node --test scripts/test-release.mjs scripts/test-dictation-focus.mjs
+```
+
+Validation: live check passed (4 updater entries, 3 unique downloads); all 15
+offline tests passed, including the existing focus regression. New checks are
+manual and are not wired into the release matrix (the first platform job finishes
+before the second platform exists). Run after the entire workflow completes.
+
+Coordination: this session changed only this handoff and the two new release-check
+scripts. Existing website, recorder, demo-machine and Notion work was left intact.
+Next: no remaining publication work for 2.13.9; use this check after future releases.
+
 ## 2026-09-14 - v2.13.9 publication in progress
 
 Henry confirmed the local fixes work in Claude Desktop, then asked why the update
