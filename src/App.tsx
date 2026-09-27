@@ -2521,7 +2521,7 @@ function App() {
             </button>
           </div>
           {hotkeyError && <p className="settings-error">{hotkeyError}</p>}
-          <p className="settings-hint">אם Alt פותח תפריט בתוכנה שאליה מכתיבים, בחרו כאן קיצור שאינו כולל Alt.</p>
+          <p className="settings-hint">קיצור עם Alt כבר לא פותח את התפריט של התוכנה שאליה מכתיבים (כמו Claude). אם בתוכנה מסוימת משהו עדיין נפתח, בחרו כאן קיצור בלי Alt.</p>
         </div>
 
         {/* Pause hotkey — separate global shortcut for Pause/Resume (v2.8.0) */}

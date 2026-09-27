@@ -1889,7 +1889,7 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
 
     if main_was_visible {
         if let Some(w) = &main_window {
-            let _ = w.hide();
+            set_main_visible_quietly(w, false);
         }
     }
     if toolbar_was_visible {
@@ -1911,7 +1911,7 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
 
     if main_was_visible {
         if let Some(w) = &main_window {
-            let _ = w.show();
+            set_main_visible_quietly(w, true);
         }
     }
     if toolbar_was_visible {
@@ -1921,6 +1921,36 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
     }
 
     result
+}
+
+/// Hide `main` for an injection and bring it back WITHOUT activating it.
+///
+/// The old `w.show()` here activated main the instant the last keystroke was
+/// handed to SendInput. Keyboard input is routed to whichever window is in the
+/// foreground when Windows gets to it, and a busy target (Claude Desktop
+/// re-renders its composer on every character) may still be working through
+/// the tail of the text — which then went to us instead: the "paste" button
+/// typed only part of a long transcript. Coming back with SW_SHOWNA leaves the
+/// foreground with the app the user pasted into, so there is nothing to race.
+///
+/// Both halves are native on purpose: Tao caches visibility and skips calls
+/// that match its cache, so hiding through Tao and showing natively would
+/// leave the next Tao `hide()` a silent no-op. A native pair restores exactly
+/// the state Tao already believes in. ShowWindowAsync: we run on a worker
+/// thread and must not block on the event loop.
+#[cfg(windows)]
+fn set_main_visible_quietly(main: &tauri::WebviewWindow, visible: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE, SW_SHOWNA};
+    if let Ok(hwnd) = main.hwnd() {
+        unsafe {
+            ShowWindowAsync(hwnd.0 as _, if visible { SW_SHOWNA } else { SW_HIDE });
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn set_main_visible_quietly(main: &tauri::WebviewWindow, visible: bool) {
+    let _ = if visible { main.show() } else { main.hide() };
 }
 
 #[tauri::command]
@@ -2500,6 +2530,10 @@ fn register_emitting_shortcut(
     app.global_shortcut()
         .on_shortcut(parsed, move |_app, shortcut, ev| {
             if ev.state == ShortcutState::Pressed {
+                // First, while the user still holds Alt: otherwise releasing it
+                // opens the target app's menu (Claude Desktop does) and the
+                // menu swallows the dictation.
+                injector::mask_lone_modifier_release();
                 let _ = app_handle.emit(event, shortcut.to_string());
             }
         })

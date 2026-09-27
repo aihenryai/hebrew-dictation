@@ -239,7 +239,7 @@ pub fn inject_text(text: &str) -> Result<(), String> {
     let mut enigo = Enigo::new(&Settings::default())
         .map_err(|e| format!("Enigo init error: {}", e))?;
 
-    for (i, piece) in chunk_chars(text, INJECT_CHUNK_CHARS).iter().enumerate() {
+    for (i, piece) in plan_pieces(text, INJECT_CHUNK_CHARS).iter().enumerate() {
         if i > 0 {
             std::thread::sleep(INJECT_CHUNK_DELAY);
         }
@@ -249,12 +249,116 @@ pub fn inject_text(text: &str) -> Result<(), String> {
         {
             return Err("החלון או מצב המקלדת השתנו בזמן ההקלדה. ההקלדה נעצרה; התמלול המלא נשמר באפליקציה.".into());
         }
-        enigo
-            .text(piece)
-            .map_err(|e| format!("Text input error: {}", e))?;
+        match piece {
+            Piece::Text(run) => enigo
+                .text(run)
+                .map_err(|e| format!("Text input error: {}", e))?,
+            Piece::LineBreak => type_line_break(&mut enigo)?,
+        }
     }
     Ok(())
 }
+
+/// One unit of typing: a run of ordinary characters, or a line break.
+#[derive(Debug, PartialEq)]
+enum Piece {
+    Text(String),
+    LineBreak,
+}
+
+/// Turn `text` into what `inject_text` actually types. Line breaks must never
+/// reach `enigo.text()`: its Windows backend handles '\n' (and '\t') with an
+/// early `return`, pressing a bare Enter and silently dropping every other
+/// character of that call — the chunk's text before the newline was buffered
+/// but never sent. In a chat composer (Claude, WhatsApp) that bare Enter also
+/// SENDS the half-typed message. So line breaks become their own piece, typed
+/// as Shift+Enter; tabs become spaces (a Tab key would move focus out of the
+/// field mid-dictation); other control characters are dropped.
+fn plan_pieces(text: &str, size: usize) -> Vec<Piece> {
+    let normalized: String = text
+        .replace("\r\n", "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\r' | '\u{2028}' | '\u{2029}' => Some('\n'),
+            '\t' => Some(' '),
+            '\n' => Some('\n'),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let mut pieces = Vec::new();
+    for (i, line) in normalized.split('\n').enumerate() {
+        if i > 0 {
+            pieces.push(Piece::LineBreak);
+        }
+        pieces.extend(chunk_chars(line, size).into_iter().map(Piece::Text));
+    }
+    pieces
+}
+
+/// Shift+Enter: a new line in chat composers (where a bare Enter sends), and
+/// still a new line in editors and documents.
+fn type_line_break(enigo: &mut Enigo) -> Result<(), String> {
+    use enigo::{Direction, Key};
+    enigo
+        .key(Key::Shift, Direction::Press)
+        .map_err(|e| format!("Text input error: {}", e))?;
+    let enter = enigo.key(Key::Return, Direction::Click);
+    // Release Shift even if Enter failed, or the user's keyboard stays shifted.
+    let release = enigo.key(Key::Shift, Direction::Release);
+    enter
+        .and(release)
+        .map_err(|e| format!("Text input error: {}", e))?;
+    // The between-pieces guard reads the async key state, which can trail our
+    // own Shift release by a moment. Wait for it rather than abort on it.
+    #[cfg(windows)]
+    if !wait_until(modifiers_released, std::time::Duration::from_millis(500), FOREGROUND_POLL_INTERVAL) {
+        return Err("ההקלדה נעצרה כי מקש קיצור עדיין לחוץ. שחררו את המקשים ונסו שוב; הטקסט נשמר בתמלול.".into());
+    }
+    Ok(())
+}
+
+/// Unassigned virtual-key code (the same "menu mask" AutoHotkey has used by
+/// default since 2017): pressing it has no meaning in any application.
+#[cfg(windows)]
+const MENU_MASK_VK: u16 = 0xE8;
+
+/// Call when an Alt/Win global shortcut fires, while the user still holds it.
+///
+/// RegisterHotKey swallows the letter's key-down, so the focused app sees
+/// Alt go down and come back up with nothing in between: a "lone Alt". Windows
+/// opens the menu bar on that, and apps copy the rule — Claude Desktop pops its
+/// application menu (its `before-input-event` tracker opens on an Alt key-up
+/// that followed an Alt key-down with no other key-down). The menu then grabs
+/// the keyboard and swallows the dictation. One press of an unassigned key
+/// while Alt is still down makes it an Alt combination again. Win gets the
+/// same treatment (a lone Win opens the Start menu).
+#[cfg(windows)]
+pub(crate) fn mask_lone_modifier_release() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        VK_LWIN, VK_MENU, VK_RWIN,
+    };
+    let held = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+    if !(held(VK_MENU) || held(VK_LWIN) || held(VK_RWIN)) {
+        // Already released (or a Ctrl/Shift shortcut): nothing to mask, and a
+        // stray key press would be all we'd add.
+        return;
+    }
+    let key = |flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: MENU_MASK_VK, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    let inputs = [key(0), key(KEYEVENTF_KEYUP)];
+    unsafe {
+        SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn mask_lone_modifier_release() {}
 
 #[cfg(windows)]
 fn modifiers_released() -> bool {
@@ -392,6 +496,63 @@ mod tests {
             Some(true),
             "in a test process there is no foreground window of ours to find"
         );
+    }
+
+    fn typed(pieces: &[Piece]) -> String {
+        pieces
+            .iter()
+            .map(|p| match p {
+                Piece::Text(s) => s.as_str(),
+                Piece::LineBreak => "\n",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_breaks_never_reach_enigo_text() {
+        // enigo 0.2.1 on Windows returns early at the first '\n' of a text()
+        // call: one bare Enter, and every other character of the call is lost.
+        let text = "דובר 1: שלום לכולם\n\nדובר 2: תודה רבה, מתחילים\tעכשיו";
+        let pieces = plan_pieces(text, 30);
+        for p in &pieces {
+            if let Piece::Text(s) = p {
+                assert!(!s.contains(['\n', '\r', '\t']), "control char left in {s:?}");
+            }
+        }
+        assert_eq!(
+            pieces.iter().filter(|p| **p == Piece::LineBreak).count(),
+            2,
+            "a blank line between paragraphs is two line breaks"
+        );
+        assert_eq!(typed(&pieces), text.replace('\t', " "), "nothing may be lost");
+    }
+
+    #[test]
+    fn carriage_returns_fold_into_single_line_breaks() {
+        assert_eq!(typed(&plan_pieces("א\r\nב\rג\u{2029}ד", 30)), "א\nב\nג\nד");
+    }
+
+    #[test]
+    fn stray_control_characters_are_dropped_not_typed() {
+        // A null byte makes enigo fail the whole call; others type garbage.
+        assert_eq!(typed(&plan_pieces("שלום\u{0}\u{7}עולם", 30)), "שלוםעולם");
+    }
+
+    #[test]
+    fn long_lines_are_still_chunked_between_line_breaks() {
+        let line = "א".repeat(65);
+        let pieces = plan_pieces(&format!("{line}\n{line}"), 30);
+        // 30 + 30 + 5, a break, 30 + 30 + 5.
+        assert_eq!(pieces.len(), 7);
+        assert_eq!(pieces[3], Piece::LineBreak);
+        assert_eq!(typed(&pieces), format!("{line}\n{line}"));
+    }
+
+    #[test]
+    fn text_without_line_breaks_types_exactly_as_before() {
+        let text = "אני לא רואה אפשרות לעדכן בתוכנה, זה משפט ארוך יותר משלושים תווים ";
+        let expected: Vec<Piece> = chunk_chars(text, 30).into_iter().map(Piece::Text).collect();
+        assert_eq!(plan_pieces(text, 30), expected);
     }
 
     #[test]
