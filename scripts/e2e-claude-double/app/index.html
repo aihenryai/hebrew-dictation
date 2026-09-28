@@ -1,0 +1,23 @@
+<!doctype html>
+<html dir="rtl">
+<head><meta charset="utf-8"><title>HD-ALT-TEST</title>
+<style>body{font:15px Arial;margin:12px} textarea{width:100%;height:280px;font:16px Arial}</style></head>
+<body>
+<textarea id="composer" placeholder="composer"></textarea>
+<script>
+  const c = document.getElementById('composer');
+  // Like Claude's composer: Enter sends the message, Shift+Enter is a newline.
+  c.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      window.probe.sent(c.value);
+      c.value = '';
+      window.probe.value('');
+    }
+  });
+  c.addEventListener('input', () => window.probe.value(c.value));
+  window.addEventListener('focus', () => c.focus());
+  c.focus();
+</script>
+</body>
+</html>

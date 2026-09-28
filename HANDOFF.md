@@ -1,5 +1,53 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-28 - v2.13.10: Alt menu, paste button, line breaks, end-of-dictation focus
+
+Henry reported (1) Alt shortcuts open something in Claude Desktop and jam the
+injection, (2) "הדבק בחלון הפעיל" does not type the whole text. Both root-caused
+and measured end to end on the real app (old installed 2.13.9 vs new debug build)
+against a Claude-like Electron test double (`scripts/e2e-claude-double/`).
+
+1. **Lone-Alt menu.** Claude Desktop's app.asar (v2.9939.2.0) tracks Alt in
+   `before-input-event`: Alt keyDown arms it, ANY other keyDown disarms it, an
+   Alt keyUp while armed pops the application menu. RegisterHotKey eats the
+   letter's keyDown, so Alt+D reads as a lone Alt (only when Alt is released
+   before the letter - why it looked intermittent). Fix: `injector::
+   mask_lone_modifier_release()` sends vk 0xE8 (unassigned, AutoHotkey's menu
+   mask) from the shortcut handler while Alt/Win is still held. Old app Alt+P:
+   MENU OPENED; new: no menu. Default hotkey stays Alt+D (no need to break every
+   guide and video); Henry's own ctrl+w setting untouched.
+2. **Paste button lost most of the text.** The Windows injection dance re-showed
+   main with Tao `show()` (SW_SHOW = activate) right after the last SendInput;
+   keystrokes the target had not consumed yet went to us. Old: 83/91/112 of 835
+   chars; new: 835/835 x3. Main now hides/shows natively (ShowWindowAsync
+   SW_HIDE / SW_SHOWNA) as a pair from a visible state, so Tao's cached
+   VISIBLE flag is never out of sync (Tao re-applies cached visibility on ANY
+   flag change - mixing Tao and native visibility is a trap).
+3. **Line breaks.** enigo 0.2.1's Windows `text()` hits `'\n' => return
+   self.key(Return)`: one bare Enter (sends a Claude/WhatsApp message) and every
+   other char of that call is dropped. `plan_pieces()` now splits line breaks
+   out and types them as Shift+Enter; tabs become spaces; control chars drop.
+   Batch-file transcripts (paragraphs=true) always had newlines. New: 78/78.
+4. **End of dictation.** `restore_main_after_toolbar` activated main right after
+   the last injection (same loss: old 231/835 main-open, 415/835 tray+bar-stop).
+   Now `restore_main` waits `injection_settle_time` (4ms/char, 300-2000ms) from
+   the last injection, and a new dictation (`RESTORE_GENERATION`) cancels it.
+   New tray+bar-stop: 835/835. Main-open case not re-run (harness could not
+   take focus that round); it shares the same code path.
+5. **Tao `set_focus()` synthesizes a lone Alt** (`force_window_active`) when
+   SetForegroundWindow is refused - i.e. it opens Claude's menu itself. Removed
+   from the end-of-dictation restore; the remaining callers run on a user click
+   of our own UI (tray, idle circle), where the plain call succeeds. Any new
+   `set_focus()` without fresh user input is a bug.
+
+A first attempt hid main natively for the whole dictation to allow a
+non-activating restore; it left Tao's cache wrong for seconds and, in testing,
+Windows activated a different app after the hide. Reverted to Tao hide + delay.
+
+Validation: 197 Rust tests (5 new for line breaks, 1 for settle time), clippy
+unchanged. E2E probes need a quiet desktop and the user's app closed (they
+ask first); see the docstring in `alt_probe.py`.
+
 ## 2026-09-16 - v2.13.9 publication verified; repeatable release check
 
 The publication wait below is resolved. Workflow 34799861761 completed successfully.

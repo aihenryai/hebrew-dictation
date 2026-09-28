@@ -1819,6 +1819,11 @@ pub(crate) fn inject_text_defocused(app: &AppHandle, text: &str) -> Result<(), S
     if result.is_ok() {
         remember_injected(text);
     }
+    // Even a failed call may have typed part of the text: the target still
+    // has to consume it before main may take the foreground (restore_main).
+    if let Ok(mut last) = LAST_INJECTION.lock() {
+        *last = Some((std::time::Instant::now(), text.chars().count()));
+    }
     result
 }
 
@@ -1933,11 +1938,12 @@ fn inject_text_defocused_windows_dance(app: &AppHandle, text: &str) -> Result<()
 /// typed only part of a long transcript. Coming back with SW_SHOWNA leaves the
 /// foreground with the app the user pasted into, so there is nothing to race.
 ///
-/// Both halves are native on purpose: Tao caches visibility and skips calls
-/// that match its cache, so hiding through Tao and showing natively would
-/// leave the next Tao `hide()` a silent no-op. A native pair restores exactly
-/// the state Tao already believes in. ShowWindowAsync: we run on a worker
-/// thread and must not block on the event loop.
+/// Both halves are native on purpose, and only ever used as a pair on a window
+/// that was visible: Tao caches visibility, and ANY later Tao flag change
+/// (always-on-top, focusable) re-applies the cached state with ShowWindow. A
+/// native hide/show pair leaves the window exactly as Tao already believes it
+/// is, so nothing is out of sync once the pair completes. ShowWindowAsync: the
+/// injection dance runs on a worker thread and must not block the event loop.
 #[cfg(windows)]
 fn set_main_visible_quietly(main: &tauri::WebviewWindow, visible: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE, SW_SHOWNA};
@@ -1951,6 +1957,25 @@ fn set_main_visible_quietly(main: &tauri::WebviewWindow, visible: bool) {
 #[cfg(all(not(windows), not(target_os = "macos")))]
 fn set_main_visible_quietly(main: &tauri::WebviewWindow, visible: bool) {
     let _ = if visible { main.show() } else { main.hide() };
+}
+
+/// When the last injection finished, and how many characters it typed.
+static LAST_INJECTION: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// How long an app may need to consume `chars` characters we typed into it.
+/// Chat composers re-render on every character; 4ms each covers a slow one,
+/// with a floor for short segments and a cap so main is never gone for long.
+fn injection_settle_time(chars: usize) -> std::time::Duration {
+    std::time::Duration::from_millis((chars as u64).saturating_mul(4).clamp(300, 2000))
+}
+
+/// What is left of the settle time of the most recent injection (zero if none).
+fn injection_settle_remaining() -> std::time::Duration {
+    match LAST_INJECTION.lock().ok().and_then(|g| *g) {
+        Some((at, chars)) => injection_settle_time(chars).saturating_sub(at.elapsed()),
+        None => std::time::Duration::ZERO,
+    }
 }
 
 #[tauri::command]
@@ -2400,6 +2425,9 @@ fn show_toolbar_window(
         show_floating_window(&toolbar)?;
     }
 
+    // A new dictation voids any restore still waiting to settle from the last one.
+    RESTORE_GENERATION.fetch_add(1, Ordering::SeqCst);
+
     if let Some(w) = &main {
         let _ = w.hide();
     }
@@ -2484,14 +2512,45 @@ fn restore_main_after_toolbar(
         show_idle_button_inner(app, saved_pos);
     } else if was_visible || force {
         if let Some(main) = app.get_webview_window("main") {
-            let _ = main.show();
-            if force {
-                let _ = main.set_focus();
-            }
+            restore_main(&main);
         }
     }
 
     Ok(())
+}
+
+/// Bumped by every `show_toolbar_window`: a restore that is still waiting for
+/// the target app to settle must not pop main up in the middle of the NEXT
+/// dictation.
+static RESTORE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bring main back after a dictation — but not while the app the user dictated
+/// into is still working through the keystrokes we just typed. Keyboard input
+/// is routed to whichever window is in the foreground when it gets processed,
+/// and `main.show()` activates main: the unprocessed tail then lands in our
+/// window instead. Measured through the same activation on a long paste:
+/// 83-112 of 835 characters arrived. Waiting until the injection has had time
+/// to settle keeps main coming back without the loss.
+///
+/// Deliberately no `set_focus()`: when Windows refuses a foreground change,
+/// Tao's `force_window_active` "unlocks" it by synthesizing a lone Alt press
+/// into whatever app is in front — which opens Claude Desktop's menu, the
+/// very bug the Alt mask fixes. `show()` still activates main whenever the
+/// user's last input (hotkey, a click on the floating bar) allows it.
+fn restore_main(main: &tauri::WebviewWindow) {
+    let wait = injection_settle_remaining();
+    if wait.is_zero() {
+        let _ = main.show();
+        return;
+    }
+    let generation = RESTORE_GENERATION.load(Ordering::SeqCst);
+    let main = main.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(wait);
+        if RESTORE_GENERATION.load(Ordering::SeqCst) == generation {
+            let _ = main.show();
+        }
+    });
 }
 
 #[tauri::command]
@@ -2938,6 +2997,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_waits_longer_after_longer_injections_within_bounds() {
+        use std::time::Duration;
+        assert_eq!(injection_settle_time(0), Duration::from_millis(300));
+        assert_eq!(injection_settle_time(50), Duration::from_millis(300));
+        assert_eq!(injection_settle_time(200), Duration::from_millis(800));
+        assert_eq!(injection_settle_time(100_000), Duration::from_millis(2000));
+    }
 
     #[test]
     fn mic_permission_path_is_platform_specific() {
