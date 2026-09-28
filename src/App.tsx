@@ -903,6 +903,29 @@ function App() {
     };
   }, [stopAndTranscribe, beginRecording]);
 
+  // Alt+L (settings.language_hotkey): the keyboard twin of the spoken switch
+  // above, toggling Hebrew and English. The backend has registered it since
+  // 2.13.9, but nothing listened, so the key did nothing. Mid-dictation it
+  // restarts the session the same way; otherwise it only sets the language for
+  // the next dictation (never beginRecording from idle). Session-only, like the
+  // spoken switch: persistSettings here would write this closure's stale
+  // snapshot of every other setting.
+  useEffect(() => {
+    const unlistenLanguageToggle = listen<string>("language-toggle-pressed", async () => {
+      const target: Language = languageRef.current === "he" ? "en" : "he";
+      setLanguage(target);
+      languageRef.current = target;
+      if (audioFeedbackEnabledRef.current) playCopyTone();
+      if (statusRef.current === "recording") {
+        await stopAndTranscribe();
+        await beginRecording();
+      }
+    });
+    return () => {
+      unlistenLanguageToggle.then((fn) => fn());
+    };
+  }, [stopAndTranscribe, beginRecording]);
+
   // Live transcription events (streaming mode). Accumulates final segments and
   // appends the latest interim chunk for in-flight preview.
   useEffect(() => {
@@ -2471,6 +2494,7 @@ function App() {
               </button>
             ))}
           </div>
+          <p className="settings-hint">לחיצה על Alt+L מחליפה בין עברית לאנגלית, גם באמצע הכתבה.</p>
         </div>
 
         {/* Hotkey — configurable global shortcut (v2.7.0) */}

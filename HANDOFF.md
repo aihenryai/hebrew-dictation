@@ -40,6 +40,14 @@ against a Claude-like Electron test double (`scripts/e2e-claude-double/`).
    of our own UI (tray, idle circle), where the plain call succeeds. Any new
    `set_focus()` without fresh user input is a bug.
 
+6. **Alt+L did nothing.** `language_hotkey` (default alt+l) has been registered
+   since 2.13.9 and emits `language-toggle-pressed`, but no frontend listener
+   existed. Wired in App.tsx as the keyboard twin of the spoken switch: toggles
+   he/en, restarts only a running dictation (never starts one from idle),
+   session-only like the spoken switch (persistSettings in a listener closure
+   writes stale state). Not exercised live - needs a real dictation. Still no
+   settings UI to change or disable this hotkey.
+
 A first attempt hid main natively for the whole dictation to allow a
 non-activating restore; it left Tao's cache wrong for seconds and, in testing,
 Windows activated a different app after the hide. Reverted to Tao hide + delay.
