@@ -1,6 +1,46 @@
 # Hebrew Dictation — Session Handoff
 
-## 2026-09-29 (evening) - Mac pass + "wizard came back after install" fix
+## 2026-09-29 (night) - Usage analytics baseline + anonymous usage ping (PROPOSAL, declined for now)
+
+Henry asked how many people use and download the app. What exists, measured today:
+- **GitHub asset counts:** 686 installer downloads over 29 releases (609 exe, 77 dmg).
+  Inflated: the Windows updater downloads the same `-x64.exe`, so this mixes fresh
+  installs, auto-updates and Henry's own tests.
+- **`latest.json` downloads = one update check per app launch.** v2.13.9 had 983 in
+  14 days (~70 launches/day). Counts launches, not people; rough guess is dozens of
+  active users, not hundreds.
+- **Repo traffic, 14 days** (`gh api repos/aihenryai/hebrew-dictation/traffic/views`,
+  `/clones`, `/popular/referrers`): 15 views (8 unique), 45 clones (28 unique),
+  referrers chatgpt.com and Google. 1 star, 0 forks.
+- **Site:** Cloudflare Web Analytics is on for bintechai.com (zone-level auto setup,
+  no script in the page HTML). `/hebrew-dictation`, last 30 days, bots excluded:
+  200 visits, 240 page views (whole site 1.91k / 4.05k). Read it in the dashboard:
+  Analytics > Web analytics > Add filter > Path. The `CLOUDFLARE_API_TOKEN` has no
+  Analytics:Read, so the GraphQL API returns 403 - use the dashboard (Claude in Chrome).
+- **Gaps:** the app sends no telemetry at all, and the download buttons have no click
+  tracking (they link straight to the release asset).
+
+**Proposal, NOT approved - Henry declined it on 2026-09-29 and asked to keep it as a
+future idea. Do not build it unprompted.** One anonymous ping per day from the app to a
+free Cloudflare Worker, counting random install IDs (no content, no keys). Would be
+opt-in with a clear line in Settings, and it must be added to the site's security
+section (`HebrewDictation.tsx` around line 1598, which lists the app's network
+destinations). It is a privacy decision, not just code.
+
+## 2026-09-29 (late) - v2.14.0 RELEASED
+
+Dry run 36527604961 and release run 36529481707 green on all three jobs
+(Windows, mac aarch64, mac x86_64). `check-release.mjs 2.14.0`: 6 updater
+entries, 5 downloads. Notes from `docs/releases/v2.14.0.md`. Site live with
+2.14.0 + Intel DMG (commit 4580a55). GitHub description now says macOS.
+
+Henry's own "forgot the keys" right after the auto-update: mode was local
+with no model installed; the generic "הגדר מפתח API או הורד מודל" read as
+lost keys. Fixed on main (d3b5404, not released): the message names the
+missing piece + download/settings buttons. Side finding: Henry's Deepgram key
+is NOT in Credential Manager (only groq.hebrew-dictation is); it works only
+through the DEEPGRAM_API_KEY user env var, which a relaunch can miss. Saving
+the key once in the app's settings removes that dependency.
 
 Henry: Mac feels second-class (no Alt key on a Mac), and a user who already
 dictated got the terms + engine choice (+ maybe the key) again when opening
