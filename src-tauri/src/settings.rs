@@ -122,7 +122,10 @@ pub struct AppSettings {
     #[serde(default = "default_pause_hotkey")]
     pub pause_hotkey: Option<String>,
     /// Optional third global shortcut: toggle the dictation language between
-    /// Hebrew and English. `None` = disabled. Default `Some("alt+l")`.
+    /// Hebrew and English. `None` = disabled. Default `Some("alt+x")`: left
+    /// hand, right under Alt+D, and free in Zoom/Office/browsers (Alt+S is
+    /// Zoom's screen share, Alt+C its cloud recording). Was alt+l, which needs
+    /// both hands; `migrate_language_hotkey` moves those installs over.
     ///
     /// This exists because the spoken command can always be misheard, and when
     /// it is, the phrase gets typed into the user's document. A hotkey cannot
@@ -130,6 +133,10 @@ pub struct AppSettings {
     /// command is the convenience on top.
     #[serde(default = "default_language_hotkey")]
     pub language_hotkey: Option<String>,
+    /// Hold Ctrl+Win to dictate, release to type (Windows). Opt-in: someone who
+    /// uses Ctrl+Win+<key> shortcuts shouldn't discover it by accident.
+    #[serde(default)]
+    pub push_to_talk_enabled: bool,
     #[serde(default = "default_silence_duration_secs")]
     pub vad_silence_secs: f32,
     #[serde(default = "default_max_recording_secs")]
@@ -210,6 +217,7 @@ pub struct RedactedSettings {
     pub hotkey: String,
     pub pause_hotkey: Option<String>,
     pub language_hotkey: Option<String>,
+    pub push_to_talk_enabled: bool,
     pub vad_silence_secs: f32,
     pub max_recording_secs: f32,
     pub unlimited_recording: bool,
@@ -249,6 +257,7 @@ impl AppSettings {
             hotkey: self.hotkey.clone(),
             pause_hotkey: self.pause_hotkey.clone(),
             language_hotkey: self.language_hotkey.clone(),
+            push_to_talk_enabled: self.push_to_talk_enabled,
             vad_silence_secs: self.vad_silence_secs,
             max_recording_secs: self.max_recording_secs,
             unlimited_recording: self.unlimited_recording,
@@ -289,7 +298,15 @@ fn default_pause_hotkey() -> Option<String> {
 }
 
 fn default_language_hotkey() -> Option<String> {
-    Some("alt+l".to_string())
+    Some("alt+x".to_string())
+}
+
+/// alt+l was the default from 2.13.9 and could not be changed in the UI, so a
+/// stored "alt+l" was never anyone's choice: move it to the new default.
+pub(crate) fn migrate_language_hotkey(settings: &mut AppSettings) {
+    if settings.language_hotkey.as_deref() == Some("alt+l") {
+        settings.language_hotkey = default_language_hotkey();
+    }
 }
 
 fn default_silence_duration_secs() -> f32 {
@@ -342,6 +359,7 @@ impl Default for AppSettings {
             hotkey: default_hotkey(),
             pause_hotkey: default_pause_hotkey(),
             language_hotkey: default_language_hotkey(),
+            push_to_talk_enabled: false,
             vad_silence_secs: default_silence_duration_secs(),
             max_recording_secs: default_max_recording_secs(),
             unlimited_recording: false,
@@ -428,6 +446,7 @@ pub fn load_settings() -> LoadResult {
     if settings.language == "auto" {
         settings.language = "he".to_string();
     }
+    migrate_language_hotkey(&mut settings);
 
     // 1) Load existing keys from keyring (works on fresh installs and post-migration).
     //    Errors are logged (the keyring backend may be unavailable on locked-down
@@ -572,6 +591,21 @@ impl AppSettings {
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn the_old_two_handed_language_hotkey_moves_to_alt_x_but_choices_stay() {
+        let mut old_default = AppSettings { language_hotkey: Some("alt+l".into()), ..AppSettings::default() };
+        migrate_language_hotkey(&mut old_default);
+        assert_eq!(old_default.language_hotkey.as_deref(), Some("alt+x"));
+
+        let mut chosen = AppSettings { language_hotkey: Some("ctrl+alt+l".into()), ..AppSettings::default() };
+        migrate_language_hotkey(&mut chosen);
+        assert_eq!(chosen.language_hotkey.as_deref(), Some("ctrl+alt+l"));
+
+        let mut disabled = AppSettings { language_hotkey: None, ..AppSettings::default() };
+        migrate_language_hotkey(&mut disabled);
+        assert_eq!(disabled.language_hotkey, None);
+    }
 
     #[test]
     fn merge_preserves_backend_managed_fields() {

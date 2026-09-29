@@ -117,6 +117,8 @@ interface AppSettings {
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
   pause_hotkey?: string | null;
+  language_hotkey?: string | null;
+  push_to_talk_enabled?: boolean;
   vad_silence_secs?: number;
   max_recording_secs?: number;
   unlimited_recording?: boolean;
@@ -147,6 +149,8 @@ interface RedactedSettings {
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
   pause_hotkey?: string | null;
+  language_hotkey?: string | null;
+  push_to_talk_enabled?: boolean;
   vad_silence_secs?: number;
   max_recording_secs?: number;
   unlimited_recording?: boolean;
@@ -444,6 +448,8 @@ async function persistLoadedSettings(base: RedactedSettings, overrides: Partial<
     floating_toolbar_enabled: base.floating_toolbar_enabled,
     hotkey: base.hotkey,
     pause_hotkey: base.pause_hotkey,
+    language_hotkey: base.language_hotkey,
+    push_to_talk_enabled: base.push_to_talk_enabled,
     vad_silence_secs: base.vad_silence_secs,
     max_recording_secs: base.max_recording_secs,
     unlimited_recording: base.unlimited_recording,
@@ -533,6 +539,11 @@ function App() {
   const [pauseHotkey, setPauseHotkey] = useState<string | null>("alt+p");
   const [pauseHotkeyCapturing, setPauseHotkeyCapturing] = useState(false);
   const [pauseHotkeyError, setPauseHotkeyError] = useState<string | null>(null);
+  // Hebrew/English switch (left hand, under Alt+D) and hold-to-talk (Ctrl+Win).
+  const [languageHotkey, setLanguageHotkey] = useState<string | null>("alt+x");
+  const [languageHotkeyCapturing, setLanguageHotkeyCapturing] = useState(false);
+  const [languageHotkeyError, setLanguageHotkeyError] = useState<string | null>(null);
+  const [pushToTalkEnabled, setPushToTalkEnabled] = useState(false);
   const [exporting, setExporting] = useState<"txt" | "docx" | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [vadSilenceSecs, setVadSilenceSecs] = useState<number>(4.5);
@@ -650,6 +661,8 @@ function App() {
   const isStreamingSession = useCallback(() => {
     return streamingEnabledRef.current && transcriptionModeRef.current !== "local";
   }, []);
+  // True while the current recording was started by holding Ctrl+Win.
+  const pttSessionRef = useRef(false);
   const audioFeedbackEnabledRef = useRef(audioFeedbackEnabled);
   useEffect(() => { audioFeedbackEnabledRef.current = audioFeedbackEnabled; }, [audioFeedbackEnabled]);
   const enhanceEnabledRef = useRef(enhanceEnabled);
@@ -735,6 +748,9 @@ function App() {
         // Streaming mode: each final segment was injected incrementally via
         // the streaming receive task (live dictation). The accumulated text is
         // returned here only for UI display (editable transcript + history).
+        // Hold-to-talk is the exception: nothing was typed while the keys were
+        // held (every character would have been a Ctrl+Win shortcut), so the
+        // whole dictation is typed now, once they're released.
         const text = await invoke("stop_streaming_transcription") as string;
         setLivePreview("");
         liveFinalRef.current = "";
@@ -742,6 +758,7 @@ function App() {
           setTranscript(text);
           setEditableTranscript(text);
           setHistory((prev) => [{ id: ++historyIdCounter, text, timestamp: new Date().toISOString() }, ...prev].slice(0, 20));
+          if (pttSessionRef.current) await injectText(text);
         }
       } else {
         const samples = await invoke("stop_recording") as number[];
@@ -783,25 +800,53 @@ function App() {
     // Toolbar was already hidden at the top of this function (snappy on every
     // path); the main window comes back only now — see the ordering invariant.
     await restoreMainWindow();
+    pttSessionRef.current = false;
     setStatus("idle");
     setRecordingTime(0);
   }, [stopVadPolling, stopTimer, injectText, isStreamingSession]);
 
+  // Hold-to-talk turned out to be a Ctrl+Win+<key> Windows shortcut: stop and
+  // throw away what was recorded (a fraction of a second of silence).
+  const discardRecording = useCallback(async () => {
+    if (statusRef.current !== "recording") return;
+    setStatus("transcribing");
+    stopVadPolling();
+    stopTimer();
+    await invoke("hide_toolbar_window", { forceShowMain: false, deferRestore: true }).catch(() => {});
+    try {
+      if (isStreamingSession()) {
+        await invoke("stop_streaming_transcription");
+        setLivePreview("");
+        liveFinalRef.current = "";
+      } else {
+        await invoke("stop_recording");
+      }
+    } catch { /* nothing worth keeping */ }
+    await invoke("restore_after_dictation", { forceShowMain: false }).catch(() => {});
+    pttSessionRef.current = false;
+    setStatus("idle");
+    setRecordingTime(0);
+  }, [stopVadPolling, stopTimer, isStreamingSession]);
+
 
   // Start recording helper — sets always-on-top
-  const beginRecording = useCallback(async () => {
+  const beginRecording = useCallback(async (opts?: { ptt?: boolean }) => {
     setError("");
+    const ptt = !!opts?.ptt;
+    pttSessionRef.current = ptt;
     try {
-      await invoke("set_vad_enabled", { enabled: vadEnabledRef.current });
+      // Hold-to-talk ends when the keys are released, never on a pause.
+      await invoke("set_vad_enabled", { enabled: ptt ? false : vadEnabledRef.current });
       await invoke("set_max_recording_secs", { secs: getMaxRecordingSecs() });
       const streamingSession = isStreamingSession();
       if (streamingSession) {
         setLivePreview("");
         liveFinalRef.current = "";
-        await invoke("start_streaming_transcription", { language: languageRef.current });
+        await invoke("start_streaming_transcription", { language: languageRef.current, liveInjection: !ptt });
       } else {
         await invoke("start_recording");
       }
+      await emit("dictation-language", languageRef.current).catch(() => {});
       // Audio feedback — short ascending arpeggio when mic opens.
       if (audioFeedbackEnabledRef.current) playStartTone();
       // Only swap to the toolbar once the backend accepted the start — avoids
@@ -810,6 +855,9 @@ function App() {
       await invoke("show_toolbar_window", { streaming: streamingSession })
         .catch((e) => console.error("show_toolbar_window failed:", e));
       setStatus("recording");
+      // Now, not after the next render: a hold-to-talk release can arrive
+      // right as this returns, and its stop checks the ref.
+      statusRef.current = "recording";
       setRecordingTime(0);
       timerRef.current = window.setInterval(() => {
         setRecordingTime((prev) => prev + 0.1);
@@ -817,7 +865,7 @@ function App() {
       if (!vadPollRef.current) {
         vadPollRef.current = window.setInterval(async () => {
           try {
-            const silenceDetected = vadEnabledRef.current ? await invoke("check_silence") as boolean : false;
+            const silenceDetected = vadEnabledRef.current && !pttSessionRef.current ? await invoke("check_silence") as boolean : false;
             const timeoutReached = await invoke("check_timeout") as boolean;
             if ((silenceDetected || timeoutReached) && statusRef.current === "recording") {
               stopAndTranscribe();
@@ -826,6 +874,7 @@ function App() {
         }, 150);
       }
     } catch (e) {
+      pttSessionRef.current = false;
       setError(String(e));
     }
   }, [stopAndTranscribe, isStreamingSession]);
@@ -884,47 +933,79 @@ function App() {
     };
   }, [stopAndTranscribe, beginRecording]);
 
-  // Opt-in: saying "כתוב בעברית" / "כתוב באנגלית" mid-dictation (streaming.rs
-  // detects the exact trigger phrase and never injects/accumulates it) restarts
-  // the session in the new language — a Deepgram WS's language is fixed at
-  // connection time, so switching means stop-then-start with the new value.
-  // languageRef is updated FIRST so beginRecording (which reads it) picks up
-  // the new language on this same restart, not the next one.
+  // One path for every language change: the spoken trigger ("כתוב בעברית" /
+  // "כתוב באנגלית", detected in streaming.rs) and the language hotkey (Alt+X).
+  // A running streaming dictation keeps going: the backend swaps only its
+  // Deepgram connection, so the bar stays up, no window opens and no words are
+  // lost. The old stop-then-start restart did all three. A batch recording has
+  // no connection to swap, so the new language applies when it's transcribed.
+  // Session-only: persistSettings in this listener would write its closure's
+  // stale snapshot of every other setting.
+  const switchLanguage = useCallback(async (target: Language) => {
+    const previous = languageRef.current as Language;
+    if (target === previous) return;
+    setLanguage(target);
+    languageRef.current = target;
+    if (audioFeedbackEnabledRef.current) playCopyTone();
+    await emit("dictation-language", target).catch(() => {});
+    if (statusRef.current === "recording" && isStreamingSession()) {
+      try {
+        await invoke("switch_streaming_language", { language: target });
+      } catch (e) {
+        setLanguage(previous);
+        languageRef.current = previous;
+        await emit("dictation-language", previous).catch(() => {});
+        setError(String(e));
+        if (audioFeedbackEnabledRef.current) playErrorTone();
+      }
+    }
+  }, [isStreamingSession]);
+
   useEffect(() => {
-    const unlistenLanguageSwitch = listen<string>("language-switch-requested", async (event) => {
-      const target = event.payload as Language;
-      setLanguage(target);
-      languageRef.current = target;
-      await stopAndTranscribe();
-      await beginRecording();
+    const unlistenLanguageSwitch = listen<string>("language-switch-requested", (event) => {
+      switchLanguage(event.payload as Language);
+    });
+    const unlistenLanguageToggle = listen<string>("language-toggle-pressed", () => {
+      switchLanguage(languageRef.current === "he" ? "en" : "he");
     });
     return () => {
       unlistenLanguageSwitch.then((fn) => fn());
-    };
-  }, [stopAndTranscribe, beginRecording]);
-
-  // Alt+L (settings.language_hotkey): the keyboard twin of the spoken switch
-  // above, toggling Hebrew and English. The backend has registered it since
-  // 2.13.9, but nothing listened, so the key did nothing. Mid-dictation it
-  // restarts the session the same way; otherwise it only sets the language for
-  // the next dictation (never beginRecording from idle). Session-only, like the
-  // spoken switch: persistSettings here would write this closure's stale
-  // snapshot of every other setting.
-  useEffect(() => {
-    const unlistenLanguageToggle = listen<string>("language-toggle-pressed", async () => {
-      const target: Language = languageRef.current === "he" ? "en" : "he";
-      setLanguage(target);
-      languageRef.current = target;
-      if (audioFeedbackEnabledRef.current) playCopyTone();
-      if (statusRef.current === "recording") {
-        await stopAndTranscribe();
-        await beginRecording();
-      }
-    });
-    return () => {
       unlistenLanguageToggle.then((fn) => fn());
     };
-  }, [stopAndTranscribe, beginRecording]);
+  }, [switchLanguage]);
+
+  // Hold-to-talk (push_to_talk.rs watches Ctrl+Win): start on hold, type the
+  // text on release, and drop the recording if the chord turned out to be a
+  // Ctrl+Win+<key> Windows shortcut.
+  // A release can land while the start is still connecting (a short hold):
+  // remember it and act as soon as the recording is up, or it never ends.
+  const pttPendingEndRef = useRef<null | "stop" | "cancel">(null);
+  useEffect(() => {
+    const unlistenStart = listen("ptt-start", async () => {
+      if (statusRef.current !== "idle" || batchRecordingRef.current || !canRecordRef.current) return;
+      pttPendingEndRef.current = null;
+      await beginRecording({ ptt: true });
+      const pending = pttPendingEndRef.current;
+      pttPendingEndRef.current = null;
+      if (pending === "stop") await stopAndTranscribe();
+      else if (pending === "cancel") await discardRecording();
+    });
+    const unlistenStop = listen("ptt-stop", async () => {
+      if (!pttSessionRef.current) return;
+      if (statusRef.current === "recording") await stopAndTranscribe();
+      else pttPendingEndRef.current = "stop";
+    });
+    const unlistenCancel = listen("ptt-cancel", async () => {
+      if (!pttSessionRef.current) return;
+      if (statusRef.current === "recording") await discardRecording();
+      else pttPendingEndRef.current = "cancel";
+    });
+    return () => {
+      unlistenStart.then((fn) => fn());
+      unlistenStop.then((fn) => fn());
+      unlistenCancel.then((fn) => fn());
+    };
+  }, [beginRecording, stopAndTranscribe, discardRecording]);
 
   // Live transcription events (streaming mode). Accumulates final segments and
   // appends the latest interim chunk for in-flight preview.
@@ -1182,6 +1263,10 @@ function App() {
       if (typeof settings.pause_hotkey === "string" || settings.pause_hotkey === null) {
         setPauseHotkey(settings.pause_hotkey ?? null);
       }
+      if (typeof settings.language_hotkey === "string" || settings.language_hotkey === null) {
+        setLanguageHotkey(settings.language_hotkey ?? null);
+      }
+      if (typeof settings.push_to_talk_enabled === "boolean") setPushToTalkEnabled(settings.push_to_talk_enabled);
       if (typeof settings.vad_silence_secs === "number") setVadSilenceSecs(settings.vad_silence_secs);
       if (typeof settings.max_recording_secs === "number") setMaxRecordingSecs(settings.max_recording_secs);
       if (typeof settings.unlimited_recording === "boolean") setUnlimitedRecording(settings.unlimited_recording);
@@ -1270,6 +1355,8 @@ function App() {
       floating_toolbar_enabled: floatingToolbarEnabled,
       hotkey: hotkey,
       pause_hotkey: pauseHotkey,
+      language_hotkey: languageHotkey,
+      push_to_talk_enabled: pushToTalkEnabled,
       vad_silence_secs: vadSilenceSecs,
       max_recording_secs: maxRecordingSecs,
       unlimited_recording: unlimitedRecording,
@@ -1281,7 +1368,7 @@ function App() {
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, languageSwitchKeywordsEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, languageSwitchKeywordsEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, languageHotkey, pushToTalkEnabled, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -1306,6 +1393,11 @@ function App() {
   /** Apply a new Pause hotkey (or `null` to disable). Throws on parse / conflict. */
   const applyPauseHotkey = useCallback(async (combo: string | null) => {
     await invoke("set_pause_hotkey", { combo });
+  }, []);
+
+  /** Apply a new language-switch hotkey (or `null` to disable). Throws on parse / conflict. */
+  const applyLanguageHotkey = useCallback(async (combo: string | null) => {
+    await invoke("set_language_hotkey", { combo });
   }, []);
 
   /**
@@ -2494,7 +2586,9 @@ function App() {
               </button>
             ))}
           </div>
-          <p className="settings-hint">לחיצה על Alt+L מחליפה בין עברית לאנגלית, גם באמצע הכתבה.</p>
+          {languageHotkey && (
+            <p className="settings-hint">לחיצה על {formatHotkey(languageHotkey)} מחליפה בין עברית לאנגלית, גם באמצע הכתבה.</p>
+          )}
         </div>
 
         {/* Hotkey — configurable global shortcut (v2.7.0) */}
@@ -2615,6 +2709,99 @@ function App() {
             </div>
           )}
           {pauseHotkeyError && <p className="settings-error">{pauseHotkeyError}</p>}
+        </div>
+
+        {/* Hold-to-talk (Ctrl+Win) — Windows only, opt-in */}
+        {IS_WINDOWS && (
+          <div className="settings-section">
+            <h3>הכתבה בהחזקה</h3>
+            <label className="toggle-label">
+              <input
+                type="checkbox"
+                checked={pushToTalkEnabled}
+                onChange={async (e) => {
+                  const next = e.target.checked;
+                  try {
+                    await invoke("set_push_to_talk_enabled", { enabled: next });
+                    setPushToTalkEnabled(next);
+                  } catch (err) {
+                    setError(String(err));
+                  }
+                }}
+              />
+              <span className="toggle-text">מחזיקים Ctrl ו-Win יחד, מדברים, ומשחררים - הטקסט מוקלד</span>
+            </label>
+            <p className="settings-hint">בלי Alt, כך שאף תוכנה לא פותחת תפריט. הקיצור הרגיל להכתבה ממשיך לעבוד כרגיל.</p>
+          </div>
+        )}
+
+        {/* Language switch hotkey — toggles Hebrew/English, also mid-dictation */}
+        <div className="settings-section">
+          <h3>קיצור מקלדת להחלפת שפה</h3>
+          <p className="settings-hint">
+            מחליף בין עברית לאנגלית, גם באמצע הכתבה, בלי לעצור אותה.
+          </p>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={languageHotkey !== null}
+              onChange={async () => {
+                const next = languageHotkey === null ? "alt+x" : null;
+                try {
+                  await applyLanguageHotkey(next);
+                  setLanguageHotkey(next);
+                  setLanguageHotkeyError(null);
+                } catch (err) {
+                  setLanguageHotkeyError(String(err));
+                }
+              }}
+            />
+            <span className="toggle-text">הפעל קיצור להחלפת שפה</span>
+          </label>
+          {languageHotkey !== null && (
+            <div className="settings-row" style={{ alignItems: "center", gap: 12 }}>
+              <input
+                type="text"
+                readOnly
+                value={languageHotkeyCapturing ? "לחץ על השילוב הרצוי..." : formatHotkey(languageHotkey)}
+                className={`hotkey-input ${languageHotkeyCapturing ? "capturing" : ""}`}
+                onFocus={() => { setLanguageHotkeyCapturing(true); setLanguageHotkeyError(null); }}
+                onBlur={() => setLanguageHotkeyCapturing(false)}
+                onKeyDown={async (e) => {
+                  if (!languageHotkeyCapturing) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const combo = buildComboFromKeyEvent(e.nativeEvent);
+                  if (!combo) return;
+                  try {
+                    await applyLanguageHotkey(combo);
+                    setLanguageHotkey(combo);
+                    setLanguageHotkeyError(null);
+                    setLanguageHotkeyCapturing(false);
+                    (e.target as HTMLInputElement).blur();
+                  } catch (err) {
+                    setLanguageHotkeyError(String(err));
+                  }
+                }}
+                placeholder="Alt+X"
+              />
+              <button
+                className="btn-secondary"
+                onClick={async () => {
+                  try {
+                    await applyLanguageHotkey("alt+x");
+                    setLanguageHotkey("alt+x");
+                    setLanguageHotkeyError(null);
+                  } catch (err) {
+                    setLanguageHotkeyError(String(err));
+                  }
+                }}
+              >
+                איפוס ל-Alt+X
+              </button>
+            </div>
+          )}
+          {languageHotkeyError && <p className="settings-error">{languageHotkeyError}</p>}
         </div>
 
         {/* VAD — toggle + duration slider (v2.7.0) */}
@@ -3977,6 +4164,8 @@ export function ToolbarApp() {
   // "recording" = full bar; "idle" = small floating circle (one click to
   // start dictation). Backend emits `toolbar-mode` to switch between them.
   const [mode, setMode] = useState<"idle" | "recording">("recording");
+  // Set by the main window when a dictation starts and on every switch.
+  const [dictationLanguage, setDictationLanguage] = useState("he");
   const [vadState, setVadState] = useState<VadStatePayload>({
     state: "speaking",
     silent_secs: 0,
@@ -4043,6 +4232,9 @@ export function ToolbarApp() {
     const unlistenMode = listen<string>("toolbar-mode", (event) => {
       setMode(event.payload === "idle" ? "idle" : "recording");
     });
+    const unlistenLanguage = listen<string>("dictation-language", (event) => {
+      setDictationLanguage(event.payload);
+    });
 
     // Persist drag position so the toolbar reappears where the user left it.
     // Debounced so we don't hammer the disk on every pixel of a drag.
@@ -4067,6 +4259,7 @@ export function ToolbarApp() {
       unlistenLevel.then((fn) => fn());
       unlistenVad.then((fn) => fn());
       unlistenMode.then((fn) => fn());
+      unlistenLanguage.then((fn) => fn());
       unlistenMove.then((fn) => fn());
       if (saveTimer !== null) window.clearTimeout(saveTimer);
     };
@@ -4205,6 +4398,9 @@ export function ToolbarApp() {
           handleDragMouseDown via closest('button')). */}
       <div className="toolbar-row-top">
         <span className="toolbar-dot" aria-hidden="true" />
+        <span className="toolbar-lang" title="שפת ההכתבה">
+          {dictationLanguage === "en" ? "EN" : dictationLanguage === "multi" ? "רב" : "עב"}
+        </span>
         <div className="toolbar-meter" aria-hidden="true">
           <div className="toolbar-meter-fill" style={{ width: `${levelPct}%` }} />
         </div>

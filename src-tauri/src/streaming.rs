@@ -132,10 +132,15 @@ fn detect_language_switch(transcript: &str) -> Option<&'static str> {
 impl StreamingSession {
     /// Open a WebSocket connection to Deepgram streaming and start a receive task
     /// that emits `transcription-interim` events for each message.
+    ///
+    /// `live_injection = false` only collects the text: hold-to-talk types the
+    /// whole dictation once the keys are released, because typing while the
+    /// user still holds Ctrl+Win would turn every character into a shortcut.
     pub async fn start(
         api_key: &str,
         language: &str,
         language_switch_enabled: bool,
+        live_injection: bool,
         app: AppHandle,
     ) -> Result<Arc<Self>, String> {
         // day_ordinal_replace_params: Deepgram's smart_format reformats Hebrew
@@ -185,6 +190,7 @@ impl StreamingSession {
                             &app_clone,
                             &inject_err_reported,
                             language_switch_enabled,
+                            live_injection,
                             &injection_rx,
                         )
                         .await;
@@ -291,6 +297,7 @@ async fn handle_message(
     app: &AppHandle,
     inject_err_reported: &InjectErrReported,
     language_switch_enabled: bool,
+    live_injection: bool,
     injection: &Arc<SessionInjection>,
 ) {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
@@ -321,9 +328,10 @@ async fn handle_message(
     if is_final && language_switch_enabled {
         if let Some(target_lang) = detect_language_switch(transcript) {
             // A command, not content: never inject it, never accumulate it into
-            // the dictated text. The frontend restarts the streaming session
-            // with the new language (a WS connection's language is fixed at
-            // open time, so switching mid-stream means reconnecting).
+            // the dictated text. The frontend asks `switch_streaming_language`
+            // to swap this connection for one in the new language (a WS
+            // connection's language is fixed at open time); the microphone and
+            // the dictation itself keep running.
             let _ = app.emit("language-switch-requested", target_lang);
             return;
         }
@@ -339,6 +347,9 @@ async fn handle_message(
             }
             acc.push_str(transcript);
         }
+    }
+
+    if is_final && live_injection {
         // Inject this segment into the active text field immediately so the user
         // sees dictation appear in their target app as they speak (live streaming).
         // A trailing space separates consecutive segments. Goes through

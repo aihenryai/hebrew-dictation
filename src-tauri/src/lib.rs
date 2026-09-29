@@ -17,6 +17,7 @@ mod narration_process;
 #[cfg(target_os = "windows")]
 mod narration_provision;
 mod punctuation;
+mod push_to_talk;
 mod secure_keys;
 mod settings;
 mod srt;
@@ -37,6 +38,11 @@ struct ActiveStreaming {
     session: Arc<streaming::StreamingSession>,
     audio_tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
     dispatch_task: tokio::task::JoinHandle<Result<(), String>>,
+    /// Text of the earlier connections of this same dictation: a language
+    /// switch replaces the connection, not the dictation.
+    carried_text: String,
+    /// False for hold-to-talk: text is typed once, after the keys are released.
+    live_injection: bool,
 }
 
 struct AppState {
@@ -221,6 +227,17 @@ fn set_pause_hotkey(
     combo: Option<String>,
 ) -> Result<(), String> {
     set_secondary_hotkey(app, state, combo, SecondaryHotkey::Pause)
+}
+
+/// Turn hold-to-talk (Ctrl+Win) on or off. Takes effect immediately: the key
+/// watcher reads the flag on every tick.
+#[tauri::command]
+fn set_push_to_talk_enabled(state: State<AppState>, enabled: bool) -> Result<(), String> {
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    s.push_to_talk_enabled = enabled;
+    settings::save_settings(&s)?;
+    push_to_talk::ENABLED.store(enabled, Ordering::SeqCst);
+    Ok(())
 }
 
 /// Re-register or disable the language-toggle hotkey at runtime.
@@ -1403,12 +1420,55 @@ async fn pick_audio_files(app: AppHandle, state: State<'_, AppState>) -> Result<
     Ok(paths.map(|ps| ps.iter().map(|p| p.to_string_lossy().to_string()).collect()))
 }
 
+/// Deepgram key + whether the spoken language-switch trigger is on. Streaming
+/// is Deepgram-only.
+fn streaming_config(state: &AppState) -> Result<(String, bool), String> {
+    let s = state.settings.lock().map_err(|e| e.to_string())?;
+    if !matches!(s.api_provider, settings::ApiProvider::Deepgram) {
+        return Err("Streaming זמין רק עם Deepgram. עבור ל-Deepgram בהגדרות.".to_string());
+    }
+    let key = s
+        .deepgram_api_key
+        .clone()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?;
+    Ok((key, s.language_switch_keywords_enabled))
+}
+
+/// Feed microphone chunks from `audio_rx` into `session` until the channel closes.
+fn spawn_audio_dispatch(
+    session: Arc<streaming::StreamingSession>,
+    mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<f32>>,
+    app: AppHandle,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    tokio::spawn(async move {
+        while let Some(chunk) = audio_rx.recv().await {
+            if let Err(e) = session.send_audio_pcm16(&chunk).await {
+                let _ = app.emit("audio-stream-error", &e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The dictation's text so far: earlier connections, then the current one.
+fn join_dictation_text(carried: &str, current: &str) -> String {
+    match (carried.trim(), current.trim()) {
+        ("", c) => c.to_string(),
+        (p, "") => p.to_string(),
+        (p, c) => format!("{p} {c}"),
+    }
+}
+
 #[tauri::command]
 async fn start_streaming_transcription(
     state: State<'_, AppState>,
     app: AppHandle,
     language: Option<String>,
+    live_injection: Option<bool>,
 ) -> Result<(), String> {
+    let live_injection = live_injection.unwrap_or(true);
     // A long batch-view recording owns the recorder — starting a streaming session
     // would call `recorder.start_recording()` and wipe the meeting buffer (the old C1).
     if state.batch_recording_in_progress.load(Ordering::SeqCst) {
@@ -1427,21 +1487,10 @@ async fn start_streaming_transcription(
         Some("auto") | None => "he".to_string(),
         Some(other) => other.to_string(),
     };
-    let (api_key, language_switch_enabled) = {
-        let s = state.settings.lock().map_err(|e| e.to_string())?;
-        if !matches!(s.api_provider, settings::ApiProvider::Deepgram) {
-            return Err("Streaming זמין רק עם Deepgram. עבור ל-Deepgram בהגדרות.".to_string());
-        }
-        let key = s
-            .deepgram_api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?;
-        (key, s.language_switch_keywords_enabled)
-    };
+    let (api_key, language_switch_enabled) = streaming_config(&state)?;
 
     // Channel to pipe audio chunks from the CPAL callback (sync) to an async dispatcher.
-    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
 
     // Attach the chunk callback BEFORE starting the recorder, so the very first CPAL
     // callback (which may fire ~10ms after start) already has somewhere to send audio.
@@ -1473,6 +1522,7 @@ async fn start_streaming_transcription(
         &api_key,
         &lang,
         language_switch_enabled,
+        live_injection,
         app.clone(),
     )
     .await
@@ -1486,17 +1536,7 @@ async fn start_streaming_transcription(
         }
     };
 
-    let session_for_task = session.clone();
-    let app_for_dispatch = app.clone();
-    let dispatch_task = tokio::spawn(async move {
-        while let Some(chunk) = audio_rx.recv().await {
-            if let Err(e) = session_for_task.send_audio_pcm16(&chunk).await {
-                let _ = app_for_dispatch.emit("audio-stream-error", &e);
-                return Err(e);
-            }
-        }
-        Ok(())
-    });
+    let dispatch_task = spawn_audio_dispatch(session.clone(), audio_rx, app.clone());
 
     // Store the active session so stop_streaming_transcription can find it.
     let mut guard = state.streaming.lock().await;
@@ -1504,8 +1544,84 @@ async fn start_streaming_transcription(
         session,
         audio_tx,
         dispatch_task,
+        carried_text: String::new(),
+        live_injection,
     });
 
+    Ok(())
+}
+
+/// Change the language of the running dictation without stopping it.
+///
+/// A Deepgram connection's language is fixed when it opens, so this swaps the
+/// connection, not the dictation: the microphone keeps recording, the floating
+/// bar stays, no window is shown or hidden, and no audio is dropped. The old
+/// stop-then-start restart did all of those - the main window popped up in
+/// between, and about a second of speech was lost to the reconnect.
+///
+/// Order is what keeps the text in order: the new connection is opened first
+/// (if that fails, the old one simply keeps going), new audio is then routed
+/// into a buffer for it, the old connection is finished (its queued audio, last
+/// words and their typing), and only then does the buffered audio start
+/// flowing to the new one - so nothing it transcribes can be typed before the
+/// old connection's last words.
+#[tauri::command]
+async fn switch_streaming_language(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    language: String,
+) -> Result<(), String> {
+    let (api_key, language_switch_enabled) = streaming_config(&state)?;
+    // Held for the whole swap, so a stop that arrives meanwhile waits for it.
+    let mut guard = state.streaming.lock().await;
+    let Some(old) = guard.take() else {
+        return Err("אין הכתבה פעילה להחלפת שפה".to_string());
+    };
+
+    let session = match streaming::StreamingSession::start(
+        &api_key,
+        &language,
+        language_switch_enabled,
+        old.live_injection,
+        app.clone(),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            *guard = Some(old);
+            return Err(e);
+        }
+    };
+
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+    {
+        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        let tx_for_cb = audio_tx.clone();
+        // Replacing the callback drops its clone of the old sender.
+        recorder.set_chunk_callback(move |chunk: &[f32]| {
+            let _ = tx_for_cb.send(chunk.to_vec());
+        });
+    }
+
+    drop(old.audio_tx);
+    let mut warning = streaming::finish_task(old.dispatch_task, std::time::Duration::from_secs(3))
+        .await
+        .err();
+    let stopped = old.session.stop().await;
+    warning = warning.or(stopped.warning);
+    if let Some(w) = warning {
+        let _ = app.emit("audio-stream-error", w);
+    }
+
+    let dispatch_task = spawn_audio_dispatch(session.clone(), audio_rx, app.clone());
+    *guard = Some(ActiveStreaming {
+        session,
+        audio_tx,
+        dispatch_task,
+        carried_text: join_dictation_text(&old.carried_text, &stopped.text),
+        live_injection: old.live_injection,
+    });
     Ok(())
 }
 
@@ -1537,9 +1653,10 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     drop(active.audio_tx);
     let dispatch_warning = streaming::finish_task(active.dispatch_task, std::time::Duration::from_secs(3)).await.err();
 
-    // Close the WebSocket and return the accumulated final text.
+    // Close the WebSocket and return the accumulated final text, including
+    // what earlier connections of this dictation heard (language switches).
     let stopped = active.session.stop().await;
-    let text = stopped.text;
+    let text = join_dictation_text(&active.carried_text, &stopped.text);
     if let Some(warning) = dispatch_warning.or(stopped.warning) {
         let _ = app.emit("audio-stream-error", warning);
     }
@@ -2784,13 +2901,18 @@ pub fn run() {
 
             // Read the user's preferred hotkeys and register them
             // (toggle + optional pause + optional language toggle).
-            let (combo, pause_combo, language_combo) = {
+            let (combo, pause_combo, language_combo, push_to_talk) = {
                 let state = app.state::<AppState>();
                 let s = state
                     .settings
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                (s.hotkey.clone(), s.pause_hotkey.clone(), s.language_hotkey.clone())
+                (
+                    s.hotkey.clone(),
+                    s.pause_hotkey.clone(),
+                    s.language_hotkey.clone(),
+                    s.push_to_talk_enabled,
+                )
             };
             setup_global_shortcuts(
                 app.handle(),
@@ -2798,6 +2920,8 @@ pub fn run() {
                 pause_combo.as_deref(),
                 language_combo.as_deref(),
             );
+            push_to_talk::ENABLED.store(push_to_talk, Ordering::SeqCst);
+            push_to_talk::spawn_watcher(app.handle().clone());
             let _ = setup_tray(app.handle());
 
             // Opt-in local API — off unless explicitly enabled in settings.json,
@@ -2924,7 +3048,9 @@ pub fn run() {
             set_language_hotkey,
             transcribe,
             start_streaming_transcription,
+            switch_streaming_language,
             stop_streaming_transcription,
+            set_push_to_talk_enabled,
             mark_onboarding_complete,
             accept_terms,
             load_whisper_model,
