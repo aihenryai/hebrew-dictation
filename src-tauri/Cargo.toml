@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
@@ -34,6 +34,11 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"
+# One running copy only. Without it, opening the app from the Start menu or
+# Dock while it sat in the tray started a SECOND process with its own
+# in-memory settings; whichever saved last overwrote the other's settings.json
+# (the wizard and terms came back), and only one could hold the hotkey.
+tauri-plugin-single-instance = "2"
 # IMPORTANT: the platform backend features are REQUIRED. Without `windows-native`
 # (and `apple-native` for macOS) keyring v3 silently falls back to an in-memory
 # MOCK store — writes "succeed" but nothing reaches Windows Credential Manager /
@@ -54,6 +59,12 @@ tiny_http = "0.12"
 # WASAPI loopback capture of the default render device (system audio). Windows only.
 # Pinned to 0.23.x; the capture body below targets 0.23.0's StreamMode-based API
 # (three-arg initialize_client; loopback = default Render device + Direction::Capture).
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Local Whisper on the Apple Silicon GPU. Without `metal`, whisper-rs builds
+# with GGML_METAL=OFF and local transcription runs CPU-only on M-series Macs.
+# aarch64 only: Intel Macs keep the plain CPU build.
+whisper-rs = { version = "0.16", features = ["metal"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # CF types for AXIsProcessTrustedWithOptions (Accessibility prompt). 0.10 is
 # already in the tree via tao/wry — this adds no new build unit family.

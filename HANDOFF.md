@@ -1,5 +1,108 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-09-29 (evening) - Mac pass + "wizard came back after install" fix
+
+Henry: Mac feels second-class (no Alt key on a Mac), and a user who already
+dictated got the terms + engine choice (+ maybe the key) again when opening
+the app. Static audit of app + site, then fixes. Nothing here ran on a Mac.
+
+**Wizard coming back - root causes (both fixed):**
+1. Setup was persisted only by the final "התחל" button, but step 4 already
+   says "לחץ Alt+D ודבר". Dictating from there and closing the window
+   (close-to-tray) left onboarding_completed=false and the key unsaved.
+   Now `persistWizardSetup` runs when leaving the engine step, `accept_terms`
+   when leaving the terms step; "התחל" only switches view.
+2. No single-instance guard: opening the app from Start/desktop while it sat
+   in the tray started a second process with its own in-memory settings;
+   either one's next save overwrote the other's file. Added
+   `tauri-plugin-single-instance` (first plugin; the running copy shows main,
+   no set_focus). Also: settings.json is written atomically (tmp + rename),
+   and an unparseable file is copied to `settings.json.unreadable` instead of
+   being silently replaced by defaults.
+
+**Mac:**
+- Hotkeys render as ⌥ Option / ⌃ Control / ⌘ Command on Mac (`formatHotkey`,
+  `IS_MAC`), no hardcoded "Alt + D" left; the Alt-menu hint is Windows-only.
+  Option+E/I/U/N can now be captured (the "Dead" key was rejected).
+- ⌥D stays the default: the Sequoia 15.0/15.1 Option-only hotkey block was
+  lifted in 15.2. A failed registration is now shown to the user
+  (`take_startup_hotkey_warning`) instead of only going to stderr.
+- `MacPermissionCard`: Accessibility card in main view and wizard step 4,
+  deep link via `open_privacy_settings`, re-check every 2s/on focus, plus the
+  "already on but not working after an update" remove/re-add hint (ad-hoc
+  signed builds change identity on every update, TCC keeps the stale entry).
+- Injection waits for modifiers to be released on Mac too
+  (CGEventSourceFlagsState), like Windows.
+- `macOSPrivateApi` + `macos-private-api` feature (transparent toolbar/idle
+  circle), toolbar `visibleOnAllWorkspaces`, whisper-rs `metal` on aarch64,
+  -apple-system font, shortDescription/category.
+- CI: new `x86_64-apple-darwin` matrix entry (Intel Macs), assets `-x64.dmg`
+  / `-x64.app.tar.gz`, updater `darwin-x86_64`. `check-release.mjs` requires
+  them from 2.14.0. Compile not yet proven - run the workflow_dispatch dry run.
+- Arrows removed from Hebrew UI strings (RTL), "·" in settings paths.
+
+**Also this session:**
+- Local models: `get_model_recommendation` (RAM, cores, Apple Silicon ->
+  ivrit / small / base, `recommend_model_for` is pure + tested), plain-Hebrew
+  `display_name` + descriptions; settings show one "מומלץ למחשב שלך" card and
+  fold the catalog under "כל המודלים"; the wizard's local path downloads the
+  recommended model instead of always `small`.
+- Key test vs save split (reported by a Mac tester's agent): a valid key
+  whose Keychain save failed showed "המפתח לא תקין", and onBlur saves
+  swallowed errors. Now the test shows the real reason and a failed save shows
+  its own message, per field.
+- Visual check: temporary mockIPC harness with a faked Mac user agent (files
+  deleted after). Hotkey inputs are LTR, key labels in `<bdi>`.
+- Deep UX review (agent) - top items not done yet: zero-account trial instead
+  of a Deepgram key as the default, a 3-screen wizard, the recording bar
+  showing מתמלל / הוקלד / failed when main is hidden, one choke point that
+  maps errors to Hebrew, keeping audio for retry, settings under 3 headings +
+  "מתקדם", persisted history.
+
+Still open for Mac: Developer ID signing + notarization (the real fix for
+Gatekeeper, Keychain prompts after update and the stale Accessibility entry;
+needs Henry's Apple Developer account, $99/yr), a Mac hold-to-talk
+(Right-Option or Fn hold), a monochrome menu-bar icon. Everything above needs
+a real Mac to confirm.
+
+## 2026-09-29 - hold-to-talk (Ctrl+Win) and in-place language switching (Alt+X)
+
+Henry: Alt+L needs two hands, every language switch "reopens the app", and he
+wanted a non-Alt way to dictate. Decisions (his): a separate left-hand
+language key; hold-to-talk as an extra option next to the toggle shortcut.
+The toggle default stays Alt+D (every left-hand Alt/Ctrl letter collides with
+Zoom, Meet or a basic shortcut - checked before deciding).
+
+- **Language switch no longer restarts the dictation.** The old path was
+  stopAndTranscribe + beginRecording: the bar dropped, restore could pop main
+  in the ~1s WS reconnect, and speech in the gap was lost. Now
+  `switch_streaming_language` swaps only the Deepgram connection: open the new
+  one first (failure = old keeps going), route the mic callback to a new
+  buffer, drain the old session (its finals get typed), then start feeding the
+  new one. `ActiveStreaming.carried_text` keeps the whole dictation's text for
+  history. Batch recordings just change the language used at transcription.
+- **Language hotkey Alt+X** (was alt+l; `migrate_language_hotkey` moves stored
+  alt+l, which the UI never let anyone choose). Settings has a field for it
+  now; it was also missing from the frontend save payload, so any settings
+  save reset it to the default.
+- **Hold-to-talk** (`push_to_talk.rs`, opt-in, Windows): polls Ctrl+Win with
+  GetAsyncKeyState (RegisterHotKey can't bind modifier-only chords), arms
+  after 250ms alone, cancels if another key joins (Ctrl+Win+<key> shortcuts),
+  masks Win so Start stays shut. Sessions start with `live_injection=false`
+  and VAD off; the text is typed once on release via `inject_text`. A release
+  that lands while the start is still connecting is queued
+  (`pttPendingEndRef`), and `statusRef` is set synchronously for that reason.
+- Recording bar shows עב/EN (`dictation-language` event).
+
+Verified with `scripts/e2e-claude-double/ptt_probe.py` on the real app: bar up
+on a Ctrl+Win hold and down on release, Start never opened, Ctrl+Win+F24 never
+recorded, Alt+X mid-dictation turned the label עב→EN with no gap in the bar and
+main never shown, no app error. Twice across rounds the foreground jumped to
+one of Henry's windows ~1s after a scenario with no app window action - most
+likely the probe's AttachThreadInput focus forcing; watch for it if a user
+reports focus loss after a switch. Real speech through both paths: Henry is
+testing the debug build (running in place of his install, ptt enabled).
+
 ## 2026-09-28 - v2.13.10: Alt menu, paste button, line breaks, end-of-dictation focus
 
 Henry reported (1) Alt shortcuts open something in Claude Desktop and jam the

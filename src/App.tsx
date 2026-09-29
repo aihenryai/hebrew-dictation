@@ -27,6 +27,31 @@ const ONBOARDING_WINDOW_SIZE = { width: 480, height: 640 };
 // WebView2 on Windows always reports "Windows" in navigator.userAgent.
 const IS_WINDOWS =
   typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
+// WKWebView reports "Macintosh" in its user agent.
+const IS_MAC =
+  typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+
+/** macOS only: the one permission dictation cannot work without. Shown until
+ * the app is trusted; the parent re-checks every 2s and on window focus. */
+function MacPermissionCard() {
+  return (
+    <div className="mac-permission-card" role="alert">
+      <p className="mac-permission-title">עוד צעד אחד במק: הרשאת נגישות</p>
+      <p className="mac-permission-body">
+        בלי ההרשאה הזו ההכתבה מתמללת, אבל לא מקלידה בתוכנות אחרות. בחלון שייפתח, הדליקו את ״הכתבה בעברית״.
+      </p>
+      <button
+        className="btn-primary btn-small"
+        onClick={() => invoke("open_privacy_settings", { pane: "accessibility" }).catch(() => {})}
+      >
+        פתחו את הגדרות הנגישות
+      </button>
+      <p className="mac-permission-hint">
+        כבר מופעל ועדיין לא עובד? זה קורה אחרי עדכון. סמנו את ״הכתבה בעברית״ ברשימה, הסירו אותה בכפתור המינוס, הוסיפו אותה שוב בכפתור הפלוס, ופתחו את האפליקציה מחדש.
+      </p>
+    </div>
+  );
+}
 
 /** Hebrew label for a batch-transcription progress stage. */
 function stageLabel(stage: string): string {
@@ -245,8 +270,15 @@ interface InterimPayload {
   is_final: boolean;
 }
 
+interface ModelRecommendation {
+  model: string;
+  display_name: string;
+  reason: string;
+}
+
 interface ModelInfo {
   name: string;
+  display_name?: string;
   size_bytes: number;
   size_label: string;
   downloaded: boolean;
@@ -257,14 +289,28 @@ const MIN_TRANSCRIBE_SAMPLES = 8000;
 const MAX_RECORDING_LOCAL = 60;
 const MAX_RECORDING_API = 120; // 2 minutes max for API
 
-/** Human-readable label for a hotkey combo string (e.g. "alt+d" → "Alt + D"). */
+// Mac keyboards have no key labeled Alt or Win: the same physical keys are
+// Option (⌥) and Command (⌘). Show each platform the names printed on its keys.
+const MAC_KEY_LABELS: Record<string, string> = {
+  alt: "⌥ Option", option: "⌥ Option", ctrl: "⌃ Control", control: "⌃ Control",
+  shift: "⇧ Shift", super: "⌘ Command", cmd: "⌘ Command", command: "⌘ Command", meta: "⌘ Command",
+};
+const WINDOWS_KEY_LABELS: Record<string, string> = {
+  super: "Win", cmd: "Win", command: "Win", meta: "Win", control: "Ctrl",
+};
+
+/** Human-readable label for a hotkey combo string: "alt+d" is "Alt + D" on
+ * Windows and "⌥ Option + D" on a Mac. */
 function formatHotkey(combo: string): string {
   if (!combo) return "";
+  const labels = IS_MAC ? MAC_KEY_LABELS : WINDOWS_KEY_LABELS;
   return combo
     .split("+")
     .map((part) => {
       const trimmed = part.trim();
       if (!trimmed) return "";
+      const known = labels[trimmed.toLowerCase()];
+      if (known) return known;
       return trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase();
     })
     .filter(Boolean)
@@ -290,7 +336,9 @@ function buildComboFromKeyEvent(e: KeyboardEvent): string | null {
 
   // Modifier-only press — keep capturing until a real key arrives.
   // event.key is fine for detecting modifier-only since it's locale-stable for these.
-  if (["Control", "Alt", "Shift", "Meta", "Dead"].includes(e.key)) return null;
+  // "Dead" is NOT modifier-only: on a Mac, Option+E/I/U/N/` report key "Dead"
+  // with a real e.code, and rejecting it made those combos impossible to pick.
+  if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return null;
 
   const code = e.code;
   let mainKey: string | null = null;
@@ -500,10 +548,44 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // Real reasons behind a failed key test / a failed secure-storage save.
+  const [apiKeyTestError, setApiKeyTestError] = useState("");
+  const [groqCleanupTestError, setGroqCleanupTestError] = useState("");
+  const [apiKeySaveError, setApiKeySaveError] = useState("");
+  const [groqCleanupSaveError, setGroqCleanupSaveError] = useState("");
+  // macOS Accessibility trust (always true elsewhere). Re-checked while false,
+  // so the permission card disappears by itself once the user grants it.
+  const [accessibilityTrusted, setAccessibilityTrusted] = useState(true);
+  useEffect(() => {
+    if (!IS_MAC || accessibilityTrusted) return;
+    const check = () => {
+      invoke("is_accessibility_trusted")
+        .then((t) => { if (t) setAccessibilityTrusted(true); })
+        .catch(() => {});
+    };
+    const timer = window.setInterval(check, 2000);
+    window.addEventListener("focus", check);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", check);
+    };
+  }, [accessibilityTrusted]);
+
+  // Key-save problem found while persisting the wizard's choice; shown on the
+  // main view once the user leaves the wizard.
+  const [wizardSetupError, setWizardSetupError] = useState("");
   const [devices, setDevices] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState("small");
   const [activeModel, setActiveModel] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  // Which local model fits this computer (RAM, cores, Apple Silicon), so the
+  // user picks "the recommended one" instead of decoding model names.
+  const [modelRecommendation, setModelRecommendation] = useState<ModelRecommendation | null>(null);
+  useEffect(() => {
+    invoke("get_model_recommendation")
+      .then((r) => setModelRecommendation(r as ModelRecommendation))
+      .catch(() => { /* older backend: the full list still works */ });
+  }, []);
   const [language, setLanguage] = useState<Language>("he");
   const [vadEnabled, setVadEnabled] = useState(true);
   const [recordingTime, setRecordingTime] = useState(0);
@@ -1159,7 +1241,7 @@ function App() {
     const unlistenNoInput = listen("audio-no-input", () => {
       setError(
         "לא מתקבל שום קול מהמיקרופון. אם אתם על אוזניות Bluetooth (AirPods וכדומה), " +
-          "פתחו את הגדרות המערכת ← צליל ← קלט ובחרו אותן שם, ואז התחילו הקלטה מחדש. " +
+          "פתחו את הגדרות המערכת · צליל · קלט ובחרו אותן שם, ואז התחילו הקלטה מחדש. " +
           "כדאי גם לוודא שנתתם לאפליקציה הרשאת מיקרופון בהגדרות הפרטיות.",
       );
     });
@@ -1328,16 +1410,17 @@ function App() {
     }
 
     // macOS: without Accessibility trust, dictation transcribes but types
-    // nothing into other apps — say so up front instead of failing silently.
-    // Always true on Windows/Linux, so this is macOS-only in effect.
+    // nothing into other apps. The MacPermissionCard shows while this is false
+    // and re-checks on its own. Always true on Windows/Linux.
     try {
-      const trusted = await invoke("is_accessibility_trusted") as boolean;
-      if (!trusted && !needsOnboarding) {
-        setError(
-          "כדי שהטקסט יוקלד לאפליקציות אחרות, אשרו את ״הכתבה בעברית״ תחת " +
-          "הגדרות המערכת ← פרטיות ואבטחה ← נגישות, ואז הפעילו את האפליקציה מחדש."
-        );
-      }
+      setAccessibilityTrusted(await invoke("is_accessibility_trusted") as boolean);
+    } catch { /* older backend without the command */ }
+
+    // A hotkey that failed to register at startup used to be visible only in
+    // stderr; the user just saw a shortcut that did nothing.
+    try {
+      const hotkeyWarning = await invoke("take_startup_hotkey_warning") as string | null;
+      if (hotkeyWarning) setError(hotkeyWarning);
     } catch { /* older backend without the command */ }
   }
 
@@ -1886,18 +1969,35 @@ function App() {
     await invoke("set_preferred_audio_device", { device }).catch(() => {});
   }, []);
 
+  // Test and save are separate steps with separate messages. They used to
+  // share one catch, so a valid key whose Keychain/Credential Manager save
+  // failed was reported as "המפתח לא תקין", and a network failure looked the
+  // same as a wrong key.
   async function handleTestApiKey() {
     const activeKey = apiProvider === "groq" ? groqKey : deepgramKey;
     if (!activeKey) return;
     setTestingApiKey(true);
     setApiKeyValid(null);
+    setApiKeyTestError("");
+    let valid = false;
     try {
       await invoke("test_api_key", { provider: apiProvider, apiKey: activeKey });
+      valid = true;
       setApiKeyValid(true);
-      // Persist the key (the input onBlur may not have fired) and reflect it for
-      // the cleanup toggle — a successful test means we have a usable key.
-      await setApiKey(apiProvider, activeKey);
-    } catch { setApiKeyValid(false); }
+    } catch (e) {
+      setApiKeyValid(false);
+      setApiKeyTestError(String(e));
+    }
+    // Persist the key (the input onBlur may not have fired) and reflect it for
+    // the cleanup toggle — a successful test means we have a usable key.
+    if (valid && activeKey !== "••••••••") {
+      try {
+        await setApiKey(apiProvider, activeKey);
+        setApiKeySaveError("");
+      } catch (e) {
+        setApiKeySaveError(String(e));
+      }
+    }
     setTestingApiKey(false);
   }
 
@@ -1907,11 +2007,24 @@ function App() {
     if (!groqKey || groqKey === "••••••••") return;
     setTestingGroqCleanup(true);
     setGroqCleanupValid(null);
+    setGroqCleanupTestError("");
+    let valid = false;
     try {
       await invoke("test_api_key", { provider: "groq", apiKey: groqKey });
+      valid = true;
       setGroqCleanupValid(true);
-      await setApiKey("groq", groqKey);
-    } catch { setGroqCleanupValid(false); }
+    } catch (e) {
+      setGroqCleanupValid(false);
+      setGroqCleanupTestError(String(e));
+    }
+    if (valid) {
+      try {
+        await setApiKey("groq", groqKey);
+        setGroqCleanupSaveError("");
+      } catch (e) {
+        setGroqCleanupSaveError(String(e));
+      }
+    }
     setTestingGroqCleanup(false);
   }
 
@@ -1995,7 +2108,13 @@ function App() {
       setWizardKeyTesting(false);
     };
 
-    const completeOnboarding = async () => {
+    // Persist everything the wizard collected. Runs when the user LEAVES the
+    // engine step, not on the final "התחל": step 4 already invites "לחץ Alt+D
+    // ודבר", so users dictated from there and closed the window (close-to-tray)
+    // without ever pressing התחל - and the next time they opened the app the
+    // wizard, the terms and the key prompt were all back. Idempotent, so going
+    // back and changing the choice just saves again.
+    const persistWizardSetup = async () => {
       // Persist key first, but never let a keyring failure trap the user inside
       // the wizard on every launch. v2.8.x bug: setApiKey would throw on a
       // locked-down Credential Manager / antivirus block, the wizard would
@@ -2062,15 +2181,21 @@ function App() {
       // (the merge now latches too — this is belt and suspenders).
       try { await invoke("mark_onboarding_complete"); } catch { /* ok */ }
       try { await invoke("accept_terms"); } catch { /* ok */ }
-      setView("main");
 
       if (keyError) {
-        setError(
-          `המפתח לא נשמר באחסון המאובטח (Credential Manager). נסה שוב מההגדרות. פרטים: ${keyError}`
+        setWizardSetupError(
+          `המפתח לא נשמר באחסון המאובטח (${IS_MAC ? "Keychain" : "Credential Manager"}). נסו שוב מההגדרות. פרטים: ${keyError}`
         );
       } else if (keyMissing) {
-        setError("לא נשמר מפתח API. אפשר להוסיף אותו עכשיו דרך ⚙ הגדרות.");
+        setWizardSetupError("לא נשמר מפתח API. אפשר להוסיף אותו עכשיו דרך ⚙ הגדרות.");
+      } else {
+        setWizardSetupError("");
       }
+    };
+
+    const completeOnboarding = () => {
+      setView("main");
+      if (wizardSetupError) setError(wizardSetupError);
     };
 
     const termsAccepted = wizardTermsAsIs && wizardTermsKeys;
@@ -2090,10 +2215,10 @@ function App() {
             <div className="wizard-content">
               <p>הכתבה קולית בעברית מכל מקום במחשב.</p>
               <div className="wizard-highlight">
-                <span className="wizard-key">Alt + D</span>
+                <span className="wizard-key"><bdi>{formatHotkey(hotkey)}</bdi></span>
                 <span>להקלטה ועצירה</span>
               </div>
-              <p className="wizard-note">הטקסט מוקלד אוטומטית בשדה שבו העכבר נמצא.</p>
+              <p className="wizard-note">הטקסט מוקלד אוטומטית בתיבת הטקסט הפעילה, איפה שהסמן מהבהב.</p>
             </div>
             <button className="btn-wizard-next" onClick={() => setWizardStep(2)}>המשך</button>
           </div>
@@ -2146,7 +2271,7 @@ function App() {
                 className="link-text"
                 style={{ fontSize: "0.78rem", marginTop: "0.2rem" }}
               >
-                לתנאי השימוש המלאים באתר →
+                לתנאי השימוש המלאים באתר
               </a>
 
               <label className="toggle-label" style={{ marginTop: "0.4rem", alignItems: "flex-start", gap: "0.5rem" }}>
@@ -2174,7 +2299,10 @@ function App() {
               <button className="btn-wizard-back" onClick={() => setWizardStep(1)}>חזור</button>
               <button
                 className="btn-wizard-next"
-                onClick={() => setWizardStep(3)}
+                onClick={() => {
+                  invoke("accept_terms").catch(() => {});
+                  setWizardStep(3);
+                }}
                 disabled={!termsAccepted}
                 title={!termsAccepted ? "סמנו את שני התנאים כדי להמשיך" : ""}
               >
@@ -2222,7 +2350,7 @@ function App() {
                   <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
                   <ol>
                     <li>
-                      לחץ כאן →{" "}
+                      לחץ כאן{" "}
                       <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">
                         deepgram.com — הרשמה
                       </a>
@@ -2304,7 +2432,7 @@ function App() {
                   <p className="wizard-guide-title">📋 איך מוציאים מפתח (חינם):</p>
                   <ol>
                     <li>
-                      לחץ כאן →{" "}
+                      לחץ כאן{" "}
                       <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">
                         console.groq.com/keys
                       </a>
@@ -2340,7 +2468,11 @@ function App() {
 
             <div className="wizard-nav">
               <button className="btn-wizard-back" onClick={() => setWizardStep(2)}>חזור</button>
-              <button className="btn-wizard-next" onClick={() => setWizardStep(4)} disabled={!wizardChoice}>
+              <button
+                className="btn-wizard-next"
+                onClick={async () => { await persistWizardSetup(); setWizardStep(4); }}
+                disabled={!wizardChoice}
+              >
                 {wizardChoice ? "המשך" : "בחר מצב"}
               </button>
             </div>
@@ -2351,6 +2483,8 @@ function App() {
           <div className="wizard-step">
             <h2 className="wizard-step-title">✅ הכל מוכן!</h2>
             <div className="wizard-content">
+              {wizardSetupError && <p className="settings-note error-note">{wizardSetupError}</p>}
+              {IS_MAC && !accessibilityTrusted && <MacPermissionCard />}
               {wizardChoice === "api" && wizardApiKey ? (
                 <p className="wizard-success">Deepgram מוגדר — תמלול מהיר ומדויק</p>
               ) : wizardChoice === "groq" && wizardApiKey ? (
@@ -2362,11 +2496,12 @@ function App() {
                   // download itself only happened, if ever, from a separate trip to
                   // Settings. Offer it right here, reusing the same download command
                   // and progress state the settings screen uses.
-                  const smallModel = models.find((m) => m.name === "small");
+                  const wizardModelName = modelRecommendation?.model ?? "small";
+                  const smallModel = models.find((m) => m.name === wizardModelName);
                   if (smallModel?.downloaded) {
                     return <p className="wizard-success">מודל תמלול מקומי מותקן — מוכן להכתבה.</p>;
                   }
-                  if (status === "downloading" && downloadingModel === "small") {
+                  if (status === "downloading" && downloadingModel === wizardModelName) {
                     return (
                       <div className="wizard-note">
                         <p>מוריד מודל תמלול... {downloadProgress}%</p>
@@ -2376,10 +2511,11 @@ function App() {
                   }
                   return (
                     <div className="wizard-note">
-                      <p>מצב מקומי דורש מודל תמלול על המחשב — הורדה חד-פעמית.</p>
+                      <p>מצב מקומי דורש מודל תמלול על המחשב - הורדה חד-פעמית.</p>
+                      {modelRecommendation && <p style={{ fontSize: "0.75rem" }}>{modelRecommendation.reason}</p>}
                       <button
                         className="btn-primary btn-small"
-                        onClick={() => handleDownloadModel("small")}
+                        onClick={() => handleDownloadModel(wizardModelName)}
                       >
                         הורד עכשיו{smallModel ? ` (${smallModel.size_label})` : ""}
                       </button>
@@ -2391,7 +2527,7 @@ function App() {
               )}
               <div className="wizard-highlight">
                 <span>לחץ</span>
-                <span className="wizard-key">Alt + D</span>
+                <span className="wizard-key"><bdi>{formatHotkey(hotkey)}</bdi></span>
                 <span>ודבר בעברית</span>
               </div>
               <p className="wizard-note" style={{ fontSize: "0.7rem" }}>התוכנה רצה ברקע. גם בסגירת החלון <bdi>{formatHotkey(hotkey)}</bdi> ממשיך לעבוד.</p>
@@ -2539,7 +2675,10 @@ function App() {
                     } else {
                       await clearApiKey(provider);
                     }
-                  } catch { /* swallow — UI keeps its local state either way */ }
+                    setApiKeySaveError("");
+                  } catch (e) {
+                    setApiKeySaveError(String(e));
+                  }
                 }}
                 placeholder={apiProvider === "groq" ? "gsk_..." : "API key..."}
               />
@@ -2551,21 +2690,26 @@ function App() {
                 {testingApiKey ? "..." : apiKeyValid === true ? "✓" : apiKeyValid === false ? "✗" : "בדוק"}
               </button>
             </div>
-            {apiKeyValid === false && <p className="settings-note error-note">המפתח לא תקין</p>}
+            {apiKeyValid === false && <p className="settings-note error-note">הבדיקה נכשלה: {apiKeyTestError || "המפתח לא תקין"}</p>}
             {apiKeyValid === true && <p className="settings-note success-note">המפתח תקין</p>}
+            {apiKeySaveError && (
+              <p className="settings-note error-note">
+                המפתח לא נשמר ב{IS_MAC ? "-Keychain" : "אחסון המאובטח של Windows"}, ולכן ייעלם בהפעלה הבאה. {apiKeySaveError}
+              </p>
+            )}
             <div className="settings-links-row">
               <p className="settings-note">
                 {apiProvider === "deepgram" ? (
-                  <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → deepgram.com</a>
+                  <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם ב-deepgram.com</a>
                 ) : (
-                  <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם → groq.com</a>
+                  <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם ב-groq.com</a>
                 )}
               </p>
               <p className="settings-note">
                 {apiProvider === "deepgram" ? (
-                  <a href="https://console.deepgram.com/project/default/usage" target="_blank" rel="noopener" className="link-text">כמה קרדיט נשאר? →</a>
+                  <a href="https://console.deepgram.com/project/default/usage" target="_blank" rel="noopener" className="link-text">כמה קרדיט נשאר?</a>
                 ) : (
-                  <a href="https://console.groq.com/settings/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש →</a>
+                  <a href="https://console.groq.com/settings/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש</a>
                 )}
               </p>
             </div>
@@ -2587,7 +2731,7 @@ function App() {
             ))}
           </div>
           {languageHotkey && (
-            <p className="settings-hint">לחיצה על {formatHotkey(languageHotkey)} מחליפה בין עברית לאנגלית, גם באמצע הכתבה.</p>
+            <p className="settings-hint">לחיצה על <bdi>{formatHotkey(languageHotkey)}</bdi> מחליפה בין עברית לאנגלית, גם באמצע הכתבה.</p>
           )}
         </div>
 
@@ -2595,7 +2739,7 @@ function App() {
         <div className="settings-section">
           <h3>קיצור מקלדת להפעלה</h3>
           <p className="settings-hint">
-            לחץ על השדה ואז על השילוב הרצוי (למשל: Ctrl+Shift+D, Alt+Q, F8). חייב לכלול לפחות מקש פעיל.
+            לחץ על השדה ואז על השילוב הרצוי (למשל: <bdi>{IS_MAC ? "⌃ Control + D, ⌥ Option + Q, F8" : "Ctrl+Shift+D, Alt+Q, F8"}</bdi>). חייב לכלול לפחות מקש פעיל.
           </p>
           <div className="settings-row" style={{ alignItems: "center", gap: 12 }}>
             <input
@@ -2621,7 +2765,7 @@ function App() {
                   setHotkeyError(String(err));
                 }
               }}
-              placeholder="Alt+D"
+              placeholder={formatHotkey("alt+d")}
             />
             <button
               className="btn-secondary"
@@ -2635,11 +2779,13 @@ function App() {
                 }
               }}
             >
-              איפוס ל-Alt+D
+              איפוס ל-<bdi>{formatHotkey("alt+d")}</bdi>
             </button>
           </div>
           {hotkeyError && <p className="settings-error">{hotkeyError}</p>}
-          <p className="settings-hint">קיצור עם Alt כבר לא פותח את התפריט של התוכנה שאליה מכתיבים (כמו Claude). אם בתוכנה מסוימת משהו עדיין נפתח, בחרו כאן קיצור בלי Alt.</p>
+          {IS_WINDOWS && (
+            <p className="settings-hint">קיצור עם Alt כבר לא פותח את התפריט של התוכנה שאליה מכתיבים (כמו Claude). אם בתוכנה מסוימת משהו עדיין נפתח, בחרו כאן קיצור בלי Alt.</p>
+          )}
         </div>
 
         {/* Pause hotkey — separate global shortcut for Pause/Resume (v2.8.0) */}
@@ -2690,7 +2836,7 @@ function App() {
                     setPauseHotkeyError(String(err));
                   }
                 }}
-                placeholder="Alt+P"
+                placeholder={formatHotkey("alt+p")}
               />
               <button
                 className="btn-secondary"
@@ -2704,7 +2850,7 @@ function App() {
                   }
                 }}
               >
-                איפוס ל-Alt+P
+                איפוס ל-<bdi>{formatHotkey("alt+p")}</bdi>
               </button>
             </div>
           )}
@@ -2783,7 +2929,7 @@ function App() {
                     setLanguageHotkeyError(String(err));
                   }
                 }}
-                placeholder="Alt+X"
+                placeholder={formatHotkey("alt+x")}
               />
               <button
                 className="btn-secondary"
@@ -2797,7 +2943,7 @@ function App() {
                   }
                 }}
               >
-                איפוס ל-Alt+X
+                איפוס ל-<bdi>{formatHotkey("alt+x")}</bdi>
               </button>
             </div>
           )}
@@ -3098,7 +3244,10 @@ function App() {
                 try {
                   if (groqKey) await setApiKey("groq", groqKey);
                   else await clearApiKey("groq");
-                } catch { /* keep local state either way */ }
+                  setGroqCleanupSaveError("");
+                } catch (e) {
+                  setGroqCleanupSaveError(String(e));
+                }
               }}
             />
             <button
@@ -3109,10 +3258,15 @@ function App() {
               {testingGroqCleanup ? "..." : groqCleanupValid === true ? "✓" : groqCleanupValid === false ? "✗" : "בדוק"}
             </button>
           </div>
-          {groqCleanupValid === false && <p className="settings-note error-note">המפתח לא תקין</p>}
+          {groqCleanupValid === false && <p className="settings-note error-note">הבדיקה נכשלה: {groqCleanupTestError || "המפתח לא תקין"}</p>}
+          {groqCleanupSaveError && (
+            <p className="settings-note error-note">
+              המפתח לא נשמר ב{IS_MAC ? "-Keychain" : "אחסון המאובטח של Windows"}, ולכן ייעלם בהפעלה הבאה. {groqCleanupSaveError}
+            </p>
+          )}
           {groqCleanupValid === true && <p className="settings-note success-note">המפתח תקין — הרישוף מוכן</p>}
           <p className="settings-note">
-            <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח Groq חינם (ללא כרטיס אשראי) → groq.com</a>
+            <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח Groq חינם (ללא כרטיס אשראי) ב-groq.com</a>
           </p>
 
           {enhanceEnabled && transcriptionMode === "local" && (
@@ -3148,10 +3302,41 @@ function App() {
           )}
         </div>
 
-        {/* Models */}
+        {/* Models: one recommendation for THIS computer up front; the full
+            catalog (sizes, technical names) folded away for those who want it. */}
         <div className="settings-section">
-          <h3>מודלים מקומיים</h3>
-          {activeModel && <p className="settings-note active-note">פעיל: <strong>{activeModel}</strong></p>}
+          <h3>תמלול בלי אינטרנט</h3>
+          <p className="settings-hint">מודל שמותקן על המחשב ומתמלל בלי לשלוח קול לשום מקום.</p>
+          {activeModel && (
+            <p className="settings-note active-note">
+              פעיל עכשיו: <strong>{models.find((m) => m.name === activeModel)?.display_name ?? activeModel}</strong>
+            </p>
+          )}
+          {modelRecommendation && (() => {
+            const rec = models.find((m) => m.name === modelRecommendation.model);
+            const recActive = activeModel === modelRecommendation.model;
+            const recDownloading = downloadingModel === modelRecommendation.model;
+            return (
+              <div className="model-recommendation">
+                <p className="model-recommendation-title">מומלץ למחשב שלך: <strong>{modelRecommendation.display_name}</strong>{rec && <> (<bdi>{rec.size_label}</bdi>)</>}</p>
+                <p className="model-desc">{modelRecommendation.reason}</p>
+                {recActive ? (
+                  <span className="tag-downloaded">פעיל</span>
+                ) : rec?.downloaded ? (
+                  <button onClick={() => loadWhisperModel(modelRecommendation.model)} className="btn-primary btn-small" disabled={status === "loading-model"}>הפעל</button>
+                ) : recDownloading ? (
+                  <div className="mini-progress">
+                    <div className="progress-bar"><div className="progress-fill" style={{ width: `${downloadProgress}%` }} /></div>
+                    <span className="progress-label">{downloadProgress}%</span>
+                  </div>
+                ) : (
+                  <button onClick={() => handleDownloadModel(modelRecommendation.model)} className="btn-primary btn-small" disabled={status === "downloading"}>הורד והתקן</button>
+                )}
+              </div>
+            );
+          })()}
+          <details className="model-catalog">
+            <summary>כל המודלים</summary>
           <div className="model-cards">
             {[...models].sort((a, b) => {
               // Surface ivrit-* models first — they're the recommended Hebrew option.
@@ -3165,12 +3350,12 @@ function App() {
               return (
                 <div key={m.name} className={`model-card ${isActive ? "active" : ""} ${m.downloaded ? "downloaded" : ""} ${isHebrewModel ? "hebrew-recommended" : ""}`}>
                   <div className="model-card-header">
-                    <span className="model-name">
-                      {m.name}
-                      {isHebrewModel && <span className="badge-hebrew" title="מודל מותאם לעברית">🇮🇱 מומלץ לעברית</span>}
+                    <span className="model-name" title={m.name}>
+                      {m.display_name ?? m.name}
+                      {isHebrewModel && <span className="badge-hebrew" title="מודל מותאם לעברית">מותאם לעברית</span>}
                       {isActive && <span className="active-dot" />}
                     </span>
-                    <span className="model-size">{m.size_label}</span>
+                    <span className="model-size"><bdi>{m.size_label}</bdi></span>
                   </div>
                   <p className="model-desc">{m.description}</p>
                   <div className="model-card-actions">
@@ -3193,6 +3378,7 @@ function App() {
               );
             })}
           </div>
+          </details>
         </div>
 
         {/* Narration engine — shown whenever bytes exist on disk, NOT when
@@ -3621,7 +3807,7 @@ function App() {
           </p>
           <div className="wizard-content" style={{ display: "flex", flexDirection: "column", gap: "0.5rem", textAlign: "right" }}>
             <a href={TERMS_FULL_URL} target="_blank" rel="noopener" className="link-text" style={{ fontSize: "0.85rem" }}>
-              לתנאי השימוש המלאים באתר →
+              לתנאי השימוש המלאים באתר
             </a>
             <label className="toggle-label" style={{ alignItems: "flex-start", gap: "0.5rem" }}>
               <input type="checkbox" checked={wizardTermsAsIs} onChange={() => setWizardTermsAsIs(!wizardTermsAsIs)} />
@@ -4088,6 +4274,7 @@ function App() {
         </div>
       )}
 
+      {IS_MAC && !accessibilityTrusted && <MacPermissionCard />}
       {error && <p className="error" onClick={() => setError("")}>❌ {error}</p>}
       {exportNotice && <p className="success-note" style={{ wordBreak: "break-all" }}>{exportNotice}</p>}
 
@@ -4143,7 +4330,7 @@ function App() {
       )}
 
       <div className="footer">
-        <span>{formatHotkey(hotkey)} · {langLabels[language]} · {vadEnabled ? "עצירה אוטומטית" : "עצירה ידנית"}</span>
+        <span><bdi>{formatHotkey(hotkey)}</bdi> · {langLabels[language]} · {vadEnabled ? "עצירה אוטומטית" : "עצירה ידנית"}</span>
         <a href="https://taplink.cc/henry.ai" target="_blank" rel="noopener" className="footer-brand">BinTech AI</a>
       </div>
     </main>

@@ -328,9 +328,9 @@ fn set_secondary_hotkey(
 /// testable on any host; `mic_permission_path()` passes `std::env::consts::OS`.
 fn mic_permission_path_for(os: &str) -> &'static str {
     match os {
-        "macos" => "הגדרות המערכת ← פרטיות ואבטחה ← מיקרופון",
-        "windows" => "הגדרות Windows ← פרטיות ← מיקרופון",
-        _ => "הגדרות המערכת ← פרטיות ← מיקרופון",
+        "macos" => "הגדרות המערכת · פרטיות ואבטחה · מיקרופון",
+        "windows" => "הגדרות Windows · פרטיות · מיקרופון",
+        _ => "הגדרות המערכת · פרטיות · מיקרופון",
     }
 }
 
@@ -1745,6 +1745,12 @@ fn is_accessibility_trusted() -> bool {
     injector::is_accessibility_trusted()
 }
 
+/// Which local model fits this computer, and why, in plain Hebrew.
+#[tauri::command]
+fn get_model_recommendation() -> model::ModelRecommendation {
+    model::machine_recommendation()
+}
+
 #[tauri::command]
 fn is_model_downloaded(model_name: String) -> bool {
     model::is_model_downloaded(&model_name)
@@ -2772,15 +2778,70 @@ fn setup_global_shortcuts(
     pause_combo: Option<&str>,
     language_combo: Option<&str>,
 ) {
-    match reapply_all_shortcuts(app, combo, pause_combo, language_combo) {
-        Ok(Some(w)) => eprintln!("Secondary hotkey not registered: {}", w),
-        Ok(None) => {}
+    let warning = match reapply_all_shortcuts(app, combo, pause_combo, language_combo) {
+        Ok(Some(w)) => {
+            eprintln!("Secondary hotkey not registered: {}", w);
+            Some(format!("קיצור מקלדת משני לא נרשם: {}", w))
+        }
+        Ok(None) => None,
         Err(e) => {
             eprintln!("Hotkey '{}' failed to register: {}. Falling back to alt+d.", combo, e);
-            if let Err(e2) = reapply_all_shortcuts(app, "alt+d", pause_combo, language_combo) {
-                eprintln!("Fallback alt+d also failed: {}", e2);
+            match reapply_all_shortcuts(app, "alt+d", pause_combo, language_combo) {
+                Ok(_) => Some(
+                    "הקיצור שבחרתם להכתבה לא נרשם במערכת, ולכן ההכתבה חזרה לקיצור ברירת המחדל. אפשר לבחור קיצור אחר בהגדרות."
+                        .to_string(),
+                ),
+                Err(e2) => {
+                    eprintln!("Fallback alt+d also failed: {}", e2);
+                    Some(
+                        "קיצור ההכתבה לא נרשם במערכת, ולכן הוא לא יעבוד. בחרו קיצור אחר בהגדרות (למשל עם Control או Shift)."
+                            .to_string(),
+                    )
+                }
             }
         }
+    };
+    // The webview may not be listening yet at setup time, so the frontend
+    // pulls this once on init instead of relying on an event.
+    if let Ok(mut slot) = STARTUP_HOTKEY_WARNING.lock() {
+        *slot = warning;
+    }
+}
+
+/// A startup hotkey-registration failure, kept until the frontend reads it.
+/// Before this, failures only went to stderr, which a GUI user never sees -
+/// a dead shortcut looked exactly like a broken app.
+static STARTUP_HOTKEY_WARNING: Mutex<Option<String>> = Mutex::new(None);
+
+#[tauri::command]
+fn take_startup_hotkey_warning() -> Option<String> {
+    STARTUP_HOTKEY_WARNING.lock().ok().and_then(|mut w| w.take())
+}
+
+/// Open the OS privacy pane where the user grants a permission. macOS only
+/// (deep links into System Settings); a no-op elsewhere so the frontend can
+/// call it unconditionally.
+#[tauri::command]
+fn open_privacy_settings(pane: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let url = match pane.as_str() {
+            "accessibility" => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            }
+            "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            other => return Err(format!("unknown privacy pane: {}", other)),
+        };
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pane;
+        Ok(())
     }
 }
 
@@ -2832,6 +2893,18 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be the first plugin: a second launch exits before anything else
+        // (hotkeys, tray, settings) is touched, and the running copy shows its
+        // window instead. No set_focus(): from a background process Windows
+        // refuses it and Tao then fakes a lone Alt press (see HANDOFF.md).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            #[cfg(target_os = "macos")]
+            macos_unhide_if_needed(app);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -3056,6 +3129,9 @@ pub fn run() {
             load_whisper_model,
             is_whisper_loaded,
             is_accessibility_trusted,
+            open_privacy_settings,
+            take_startup_hotkey_warning,
+            get_model_recommendation,
             is_model_downloaded,
             download_model,
             delete_model,
@@ -3139,11 +3215,11 @@ mod tests {
         // that's the reported bug (a Mac user was sent to "הגדרות Windows").
         assert_eq!(
             mic_permission_path_for("macos"),
-            "הגדרות המערכת ← פרטיות ואבטחה ← מיקרופון"
+            "הגדרות המערכת · פרטיות ואבטחה · מיקרופון"
         );
         assert_eq!(
             mic_permission_path_for("windows"),
-            "הגדרות Windows ← פרטיות ← מיקרופון"
+            "הגדרות Windows · פרטיות · מיקרופון"
         );
         // Any other OS gets a generic system-settings path — never Windows-
         // specific instructions handed to a non-Windows user.

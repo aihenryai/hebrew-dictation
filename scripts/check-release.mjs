@@ -14,7 +14,13 @@ export async function checkRelease(version, request = fetch) {
     'windows-x86_64-nsis': `${base}-x64.exe`,
     'darwin-aarch64': `${base}-aarch64.app.tar.gz`,
     'darwin-aarch64-app': `${base}-aarch64.app.tar.gz`,
+    'darwin-x86_64': `${base}-x64.app.tar.gz`,
+    'darwin-x86_64-app': `${base}-x64.app.tar.gz`,
   };
+  // Intel Mac builds start at 2.14.0; older releases are checked without them.
+  const [major, minor] = version.split('.').map(Number);
+  const hasIntelMac = major > 2 || (major === 2 && minor >= 14);
+  const required = ['windows-x86_64', 'darwin-aarch64', ...(hasIntelMac ? ['darwin-x86_64'] : [])];
   async function get(url, method = 'GET') {
     const response = await request(url, { method, signal: AbortSignal.timeout(30_000) });
     if (!response.ok) throw new Error(`${method} ${url}: HTTP ${response.status}`);
@@ -22,7 +28,7 @@ export async function checkRelease(version, request = fetch) {
   }
   const manifest = await (await get(manifestUrl)).json();
   if (manifest.version !== version) throw new Error(`Latest version is ${manifest.version}, expected ${version}`);
-  for (const name of ['windows-x86_64', 'darwin-aarch64']) {
+  for (const name of required) {
     if (!manifest.platforms?.[name]) throw new Error(`Missing platform: ${name}`);
   }
   const verified = new Map();
@@ -45,8 +51,9 @@ export async function checkRelease(version, request = fetch) {
     }
     if (verified.get(platform.url) !== platform.signature.trim()) throw new Error(`Signature mismatch: ${name}`);
   }
-  await checkBinary(`${base}-aarch64.dmg`);
-  return { version, platforms: Object.keys(manifest.platforms), downloads: verified.size + 1 };
+  const dmgs = [`${base}-aarch64.dmg`, ...(hasIntelMac ? [`${base}-x64.dmg`] : [])];
+  for (const dmg of dmgs) await checkBinary(dmg);
+  return { version, platforms: Object.keys(manifest.platforms), downloads: verified.size + dmgs.length };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

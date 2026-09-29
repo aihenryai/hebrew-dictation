@@ -45,6 +45,13 @@ jobs:
           - platform: 'macos-latest'
             args: '--target aarch64-apple-darwin'
             rust-target: 'aarch64-apple-darwin'
+          # Intel Macs. Cross-compiled on the Apple Silicon runner; assets are
+          # named `-x64` (tauri-action's arch name), which cannot collide with
+          # the Windows `-x64.exe` because the extensions differ, and the
+          # updater entry lands under `darwin-x86_64`.
+          - platform: 'macos-latest'
+            args: '--target x86_64-apple-darwin'
+            rust-target: 'x86_64-apple-darwin'
 
     runs-on: ${{ matrix.platform }}
 

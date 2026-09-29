@@ -428,10 +428,20 @@ pub fn load_settings() -> LoadResult {
         None
     };
 
-    let mut settings: AppSettings = raw_json
+    let parsed: Option<AppSettings> = raw_json
         .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    // An existing file we cannot read would otherwise be overwritten by the
+    // defaults on the next save, losing the user's setup for good. Keep a copy
+    // so it can be recovered (and diagnosed) instead.
+    if parsed.is_none() && path.exists() {
+        let backup = path.with_extension("json.unreadable");
+        match std::fs::copy(&path, &backup) {
+            Ok(_) => eprintln!("[settings] unreadable settings.json, kept a copy at {}", backup.display()),
+            Err(e) => eprintln!("[settings] unreadable settings.json and backup failed: {}", e),
+        }
+    }
+    let mut settings: AppSettings = parsed.unwrap_or_default();
 
     // Backward-compat: if onboarding was completed in a previous version, the
     // user already accepted the terms once via the wizard (or skipped them in
@@ -545,9 +555,25 @@ pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
     // #[serde(skip)] on the key fields ensures they never reach the file.
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-    std::fs::write(get_settings_path(), json)
-        .map_err(|e| format!("Failed to write settings: {}", e))?;
-    Ok(())
+    write_atomically(&get_settings_path(), json.as_bytes())
+        .map_err(|e| format!("Failed to write settings: {}", e))
+}
+
+/// Write via a temp file + rename. A plain `fs::write` truncates first, so a
+/// crash, a power cut or a concurrent read mid-write left a half file; the
+/// next launch failed to parse it and silently fell back to ALL defaults -
+/// onboarding_completed=false, the wizard and terms back, every setting lost.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    // rename replaces the destination atomically on both Windows (MoveFileEx
+    // with REPLACE_EXISTING) and macOS.
+    std::fs::rename(&tmp, path)
 }
 
 impl AppSettings {
@@ -673,5 +699,17 @@ mod merge_tests {
         let incoming = AppSettings::default(); // routine save, field not carried
         let merged = current.merge_frontend_update(incoming);
         assert!(merged.onboarding_completed, "a routine save must not resurrect the wizard");
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("hd-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{\"old\":true, and a longer tail that must not survive}").unwrap();
+        write_atomically(&path, b"{\"onboarding_completed\":true}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"onboarding_completed\":true}");
+        assert!(!path.with_extension("json.tmp").exists(), "temp file must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

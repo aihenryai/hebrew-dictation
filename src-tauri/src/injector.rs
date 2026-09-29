@@ -74,7 +74,7 @@ pub fn prompt_accessibility_if_needed() -> bool {
 /// actually shown on macOS (see `inject_text`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn accessibility_permission_hint() -> &'static str {
-    "לא ניתן להקליד את הטקסט — חסרה הרשאת נגישות. אשרו את \"הכתבה בעברית\" תחת הגדרות המערכת ← פרטיות ואבטחה ← נגישות, ואז נסו שוב."
+    "לא ניתן להקליד את הטקסט - חסרה הרשאת נגישות. הפעילו את ״הכתבה בעברית״ תחת הגדרות המערכת · פרטיות ואבטחה · נגישות, ואז נסו שוב."
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +208,9 @@ pub fn inject_text(text: &str) -> Result<(), String> {
     {
         if !accessibility_trusted() {
             return Err(accessibility_permission_hint().to_string());
+        }
+        if !wait_until(modifiers_released, std::time::Duration::from_secs(2), FOREGROUND_POLL_INTERVAL) {
+            return Err("ההקלדה נעצרה כי מקש קיצור עדיין לחוץ. שחררו את המקשים ונסו שוב; הטקסט נשמר בתמלול.".into());
         }
     }
 
@@ -368,6 +371,24 @@ fn modifiers_released() -> bool {
     [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
         .iter()
         .all(|key| unsafe { GetAsyncKeyState(*key as i32) >= 0 })
+}
+
+// macOS twin of the Windows check: typed characters inherit whatever modifier
+// is physically held, so text typed while Option (the default ⌥D shortcut) is
+// still down would arrive as Option-characters (∂, ß...) or shortcuts.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
+}
+
+#[cfg(target_os = "macos")]
+fn modifiers_released() -> bool {
+    // kCGEventSourceStateCombinedSessionState
+    const COMBINED_SESSION_STATE: i32 = 0;
+    // Shift | Control | Option | Command (kCGEventFlagMask*)
+    const HELD_MODIFIERS: u64 = 0x0002_0000 | 0x0004_0000 | 0x0008_0000 | 0x0010_0000;
+    unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) & HELD_MODIFIERS == 0 }
 }
 
 /// Split `text` into pieces of at most `size` Unicode scalar values (`char`s),

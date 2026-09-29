@@ -341,10 +341,69 @@ pub fn is_model_downloaded(model_name: &str) -> bool {
 #[derive(serde::Serialize)]
 pub struct ModelInfo {
     pub name: String,
+    /// Plain-Hebrew name for people who don't know what "small" or
+    /// "large-v3-turbo" means. The technical name stays in `name`.
+    pub display_name: String,
     pub size_bytes: u64,
     pub size_label: String,
     pub downloaded: bool,
     pub description: String,
+}
+
+/// The model this machine should use, and why, in plain Hebrew.
+#[derive(serde::Serialize)]
+pub struct ModelRecommendation {
+    pub model: String,
+    pub display_name: String,
+    pub reason: String,
+}
+
+/// Pick a local model from the hardware alone, so nobody has to understand
+/// model sizes or RAM figures. Pure so every branch is unit-tested.
+///
+/// - The Hebrew fine-tune (ivrit) is the most accurate for Hebrew. It needs
+///   about 6GB of free RAM while it runs, and turbo's 4-layer decoder keeps it
+///   usable on CPU with enough cores; on Apple Silicon it runs on the GPU.
+/// - "small" is the safe middle for ordinary laptops.
+/// - "base" only for machines with very little memory.
+pub fn recommend_model_for(total_ram_gb: f64, cpu_cores: usize, apple_silicon: bool) -> &'static str {
+    if total_ram_gb >= 8.0 && (apple_silicon || cpu_cores >= 6) {
+        "ivrit-large-v3-turbo"
+    } else if total_ram_gb >= 4.0 {
+        "small"
+    } else {
+        "base"
+    }
+}
+
+pub fn machine_recommendation() -> ModelRecommendation {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let ram_gb = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let apple_silicon = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let model = recommend_model_for(ram_gb, cores, apple_silicon);
+    let machine = format!("למחשב שלך יש {:.0}GB זיכרון ו-{} ליבות מעבד", ram_gb.round(), cores);
+    let reason = match model {
+        "ivrit-large-v3-turbo" => format!("{}, כך שהוא יריץ בנוחות את המודל המדויק ביותר לעברית.", machine),
+        "small" => format!("{}. המודל המאוזן ירוץ עליו בנוחות. המודל העברי המדויק דורש 8GB זיכרון ומעבד חזק יותר.", machine),
+        _ => format!("{}, מעט יחסית. המודל הקל ירוץ עליו בלי להאט את המחשב.", machine),
+    };
+    ModelRecommendation { model: model.to_string(), display_name: display_name(model), reason }
+}
+
+/// Plain-Hebrew model name shown in the UI.
+pub fn display_name(model_name: &str) -> String {
+    match model_name {
+        "tiny" => "קל מאוד",
+        "base" => "קל",
+        "small" => "מאוזן",
+        "medium" => "מדויק",
+        "large-v3-turbo" => "גדול (כללי)",
+        "ivrit-large-v3-turbo" => "עברית מדויקת",
+        other => other,
+    }
+    .to_string()
 }
 
 pub fn get_all_models_status() -> Vec<ModelInfo> {
@@ -353,22 +412,23 @@ pub fn get_all_models_status() -> Vec<ModelInfo> {
         .map(|(name, _, size, _)| {
             let downloaded = get_model_path(name).exists();
             let (size_label, description) = match *name {
-                "tiny" => ("~75MB".to_string(), "מיידי, דיוק נמוך בעברית".to_string()),
-                "base" => ("~140MB".to_string(), "מהיר, דיוק סביר".to_string()),
-                "small" => ("~500MB".to_string(), "מאוזן, מומלץ לרוב המשתמשים".to_string()),
-                "medium" => ("~1.5GB".to_string(), "מדויק לעברית, דורש 4GB+ RAM".to_string()),
+                "tiny" => ("~75MB".to_string(), "הכי מהיר, אבל טועה הרבה בעברית. רק למחשבים חלשים מאוד.".to_string()),
+                "base" => ("~140MB".to_string(), "מהיר וקל. דיוק בינוני בעברית.".to_string()),
+                "small" => ("~500MB".to_string(), "מאוזן. עובד טוב כמעט בכל מחשב.".to_string()),
+                "medium" => ("~1.5GB".to_string(), "מדויק יותר, אבל איטי. המודל העברי מדויק ממנו וגם מהיר ממנו.".to_string()),
                 "large-v3-turbo" => (
                     "~1.6GB".to_string(),
-                    "Whisper סטנדרטי, איכות גבוהה, דורש 6GB+ RAM".to_string(),
+                    "מודל כללי לכל השפות. לעברית עדיף המודל העברי, באותו גודל.".to_string(),
                 ),
                 "ivrit-large-v3-turbo" => (
                     "~1.6GB".to_string(),
-                    "מותאם לעברית — מודל ivrit.ai מאומן ~5,000 שעות (כנסת + ויקי). מומלץ לעברית. דורש 6GB+ RAM".to_string(),
+                    "הכי מדויק בעברית. אומן על אלפי שעות של דיבור בעברית. צריך מחשב עם 8GB זיכרון ומעלה.".to_string(),
                 ),
                 _ => (format!("{}B", size), String::new()),
             };
             ModelInfo {
                 name: name.to_string(),
+                display_name: display_name(name),
                 size_bytes: *size,
                 size_label,
                 downloaded,
@@ -447,6 +507,22 @@ fn friendly_model_label(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recommendation_follows_the_hardware() {
+        // A typical modern laptop gets the Hebrew model.
+        assert_eq!(recommend_model_for(16.0, 8, false), "ivrit-large-v3-turbo");
+        // Any Apple Silicon Mac with 8GB runs it on the GPU.
+        assert_eq!(recommend_model_for(8.0, 4, true), "ivrit-large-v3-turbo");
+        // 8GB but a weak CPU: turbo on 4 cores is too slow for dictation.
+        assert_eq!(recommend_model_for(8.0, 4, false), "small");
+        assert_eq!(recommend_model_for(4.0, 4, false), "small");
+        assert_eq!(recommend_model_for(3.0, 2, false), "base");
+        // Every recommendation is a model we can actually download.
+        for (ram, cores, mac) in [(16.0, 8, false), (4.0, 4, false), (2.0, 2, false)] {
+            assert!(VALID_MODEL_NAMES.contains(&recommend_model_for(ram, cores, mac)));
+        }
+    }
     use sha2::{Digest, Sha256};
 
     // The listener thread's `incoming_requests()` loop runs for the life of

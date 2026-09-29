@@ -37,6 +37,37 @@ test('checks both operating systems and DMG without downloading installers', asy
   assert.equal(f.calls.length, 6); // Duplicate platform aliases reuse network checks.
 });
 
+function intelFixture() {
+  const f = fixture();
+  const base = 'https://github.com/aihenryai/hebrew-dictation/releases/download/v2.14.0/hebrew-dictation-v2.14.0';
+  const intel = { url: `${base}-x64.app.tar.gz`, signature: 'intel-signature' };
+  const entries = Object.entries(f.manifest.platforms).map(([name, p]) => [name, { ...p, url: p.url.replaceAll('2.13.9', '2.14.0') }]);
+  f.manifest.version = '2.14.0';
+  f.manifest.platforms = Object.fromEntries([...entries, ['darwin-x86_64', { ...intel }], ['darwin-x86_64-app', { ...intel }]]);
+  const binary = () => new Response(null, { headers: { 'content-type': 'application/octet-stream', 'content-length': '1000' } });
+  f.responses.clear();
+  f.responses.set(manifestUrl, () => Response.json(f.manifest));
+  for (const url of [`${base}-x64.exe`, `${base}-aarch64.app.tar.gz`, intel.url, `${base}-aarch64.dmg`, `${base}-x64.dmg`]) f.responses.set(url, binary);
+  f.responses.set(`${base}-x64.exe.sig`, () => new Response('windows-signature\n'));
+  f.responses.set(`${base}-aarch64.app.tar.gz.sig`, () => new Response('mac-signature\n'));
+  f.responses.set(`${intel.url}.sig`, () => new Response('intel-signature\n'));
+  return { ...f, base };
+}
+
+test('from 2.14.0 an Intel Mac build and DMG are required', async () => {
+  const f = intelFixture();
+  const result = await checkRelease('2.14.0', f.request);
+  assert.equal(result.downloads, 5);
+  assert.equal(result.platforms.length, 6);
+  const missing = intelFixture();
+  delete missing.manifest.platforms['darwin-x86_64'];
+  delete missing.manifest.platforms['darwin-x86_64-app'];
+  await assert.rejects(checkRelease('2.14.0', missing.request), /Missing platform: darwin-x86_64/);
+  const noDmg = intelFixture();
+  noDmg.responses.set(`${noDmg.base}-x64.dmg`, () => new Response(null, { status: 404 }));
+  await assert.rejects(checkRelease('2.14.0', noDmg.request), /HTTP 404/);
+});
+
 const failures = [
   ['stale latest release', f => { f.manifest.version = '2.13.6'; }, /Latest version/],
   ['missing Mac platform', f => { delete f.manifest.platforms['darwin-aarch64']; }, /Missing platform/],

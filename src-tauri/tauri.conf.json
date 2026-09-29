@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -37,6 +38,7 @@
         "skipTaskbar": true,
         "focus": false,
         "focusable": false,
+        "visibleOnAllWorkspaces": true,
         "shadow": false
       }
     ],
@@ -55,7 +57,8 @@
     "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "publisher": "BinTech AI",
-    "shortDescription": "הכתבה בעברית — Hebrew voice dictation for Windows",
+    "shortDescription": "הכתבה בעברית - Hebrew voice dictation for Windows and macOS",
+    "category": "Productivity",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
