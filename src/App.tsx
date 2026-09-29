@@ -726,6 +726,7 @@ function App() {
   // and needs a fresh read without re-subscribing the Tauri event listener on every
   // key/model status change.
   const canRecordRef = useRef(false);
+  const setupProblemRef = useRef("");
 
   useEffect(() => { statusRef.current = status; }, [status]);
   useEffect(() => { batchRecordingRef.current = batchRecording; }, [batchRecording]);
@@ -978,7 +979,7 @@ function App() {
           // deep inside a Tauri invoke, and setError writes into a window the user
           // can't see (the app is normally closed to tray). Surface the real window
           // with a clear message instead of a silent no-op.
-          setError("לא הוגדר מנוע תמלול — הגדר מפתח API או הורד מודל מקומי בהגדרות.");
+          setError(setupProblemRef.current);
           await invoke("hide_toolbar_window", { forceShowMain: true }).catch(() => {});
           return;
         }
@@ -2092,6 +2093,14 @@ function App() {
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
   useEffect(() => { canRecordRef.current = canRecord; }, [canRecord]);
+  // What exactly is missing, in words. The old generic "set an API key or
+  // download a model" read as "the app forgot my key" to a user whose mode had
+  // been switched to local with no model installed.
+  const providerName = apiProvider === "groq" ? "Groq" : "Deepgram";
+  const setupProblem = transcriptionMode === "local"
+    ? "מצב ״בלי אינטרנט״ פעיל, אבל עוד לא הותקן מודל. הורידו את המודל המומלץ, או עברו ל-API בהגדרות."
+    : `חסר מפתח ${providerName}. הוסיפו אותו בהגדרות.`;
+  useEffect(() => { setupProblemRef.current = setupProblem; }, [setupProblem]);
   const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית" };
   const modeLabel = transcriptionMode === "api" ? "API" : transcriptionMode === "local" ? "מקומי" : "אוטומטי";
 
@@ -4198,7 +4207,17 @@ function App() {
       {/* No setup — first-time prompt */}
       {models.length > 0 && downloadedCount === 0 && !apiKeyConfigured && status !== "downloading" && (
         <div className="setup-section compact-setup">
-          <p>הגדר מפתח API או הורד מודל בהגדרות ⚙</p>
+          <p>{setupProblem}</p>
+          <div className="setup-actions">
+            {transcriptionMode === "local" && modelRecommendation && (
+              <button className="btn-primary btn-small" onClick={() => handleDownloadModel(modelRecommendation.model)}>
+                הורד את המודל המומלץ
+              </button>
+            )}
+            <button className="btn-secondary btn-small" onClick={() => setView("settings")}>
+              פתח הגדרות
+            </button>
+          </div>
         </div>
       )}
 
@@ -4213,7 +4232,7 @@ function App() {
       {/* Status */}
       <div className="status-section">
         <div className={`status-indicator ${status} ${showTimeWarning ? "warning" : ""}`}>
-          {status === "idle" && (canRecord ? `מוכן — ${langLabels[language]} · ${modeLabel}` : "הגדר API / מודל")}
+          {status === "idle" && (canRecord ? `מוכן — ${langLabels[language]} · ${modeLabel}` : "צריך הגדרה")}
           {status === "recording" && `🔴 מקליט ${recordingTime.toFixed(0)}s`}
           {status === "transcribing" && "⏳ מתמלל..."}
           {status === "enhancing" && "✨ משכתב..."}

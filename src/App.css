@@ -2485,3 +2485,11 @@ body:has(.toolbar-idle) #root {
   outline: none;
   border-color: #4da6ff;
 }
+
+.setup-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
