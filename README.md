@@ -36,8 +36,8 @@
 **⬇️ הורדה והתקנה דרך האתר → [bintechai.com/hebrew-dictation](https://bintechai.com/hebrew-dictation)**
 
 או הורדה ישירה מ-GitHub:
-- **Windows** (גרסה אחרונה): [עמוד ה-Releases](https://github.com/aihenryai/hebrew-dictation/releases/latest) → `hebrew-dictation-…-setup.exe`
-- **macOS** (Apple Silicon, v2.8.1): [DMG](https://github.com/aihenryai/hebrew-dictation/releases/download/v2.8.1/hebrew-dictation-v2.8.1-aarch64.dmg)
+- **Windows** (גרסה אחרונה): [עמוד ה-Releases](https://github.com/aihenryai/hebrew-dictation/releases/latest), הקובץ `hebrew-dictation-v…-x64.exe`
+- **macOS** (גרסה אחרונה): [עמוד ה-Releases](https://github.com/aihenryai/hebrew-dictation/releases/latest), הקובץ `hebrew-dictation-v…-aarch64.dmg` לשבב Apple (M1 ומעלה), או `hebrew-dictation-v…-x64.dmg` למחשבי Intel. קיצור ההכתבה במק: ⌥ Option+D.
 
 דאבל-קליק להתקנה — לא דורש הרשאות מנהל. עדכונים מגיעים אוטומטית דרך האפליקציה.
 
