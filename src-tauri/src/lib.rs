@@ -2,6 +2,7 @@ mod api_transcribe;
 mod audio;
 mod batch;
 mod decode;
+mod dictionary;
 mod enhance;
 mod export;
 mod hebrew;
@@ -366,7 +367,7 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
         )
     };
 
-    match mode {
+    let result = match mode {
         settings::TranscriptionMode::Api => {
             let key = api_key.ok_or("מפתח API לא מוגדר — הגדר אותו בהגדרות")?;
             api_transcribe::transcribe_api(&provider, &samples, &key, &lang).await
@@ -390,7 +391,8 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
                 transcribe_local(&state, &samples, &lang)
             }
         }
-    }
+    };
+    result.map(|t| dictionary::apply(&t))
 }
 
 /// Smart Cleanup (רישוף חכם) — opt-in post-transcription enhancement via Groq.
@@ -451,6 +453,19 @@ async fn transcribe_file(
     let result = run_transcribe_file(&app, &state, file_path, opts).await;
     state.batch_in_progress.store(false, Ordering::SeqCst);
     result
+}
+
+/// Run the personal dictionary's replacements over a finished file transcript,
+/// including each timed cue so SRT export matches the text.
+fn dictionary_applied(text: String, segments: Vec<srt::TimedSegment>) -> TranscribeFileResult {
+    let segments = segments
+        .into_iter()
+        .map(|mut s| {
+            s.text = dictionary::apply(&s.text);
+            s
+        })
+        .collect();
+    TranscribeFileResult { text: dictionary::apply(&text), segments }
 }
 
 async fn run_transcribe_file(
@@ -527,7 +542,7 @@ async fn run_transcribe_file(
                 _ = notify.notified() => return Err(batch::CANCELLED.to_string()),
             };
             let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
-            Ok(TranscribeFileResult { text, segments })
+            Ok(dictionary_applied(text, segments))
         }
         batch::BatchRoute::Local => {
             // Lock the engine ONLY to create a fresh state, then drop it so the
@@ -573,7 +588,7 @@ async fn run_transcribe_file(
 
             progress_task.abort();
             let _ = app.emit("batch-progress", serde_json::json!({ "stage": "done", "pct": 100 }));
-            Ok(TranscribeFileResult { text, segments })
+            Ok(dictionary_applied(text, segments))
         }
     }
 }
@@ -803,7 +818,13 @@ async fn stop_batch_recording_to_file(
             batch::RecordingSource::CallLocal => {
                 "לא נקלט אודיו בפגישה — ודאו שהמיקרופון פעיל ושמתנגן קול במחשב."
             }
-            _ => "לא נקלט אודיו — ודא שהמיקרופון מחובר ופעיל.",
+            _ => {
+                return Err(format!(
+                    "לא נקלט אודיו מהמיקרופון ({}). ודא שהמיקרופון מחובר, לא מושתק, ושלאפליקציה יש הרשאה: {}. אפשר לבדוק ולהחליף מיקרופון בהגדרות.",
+                    current_mic_name(&state),
+                    mic_permission_path()
+                ));
+            }
         };
         return Err(msg.to_string());
     }
@@ -2266,6 +2287,89 @@ async fn export_srt(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Name of the input device a new recording would use: the one chosen in
+/// settings if it still exists, otherwise the system default.
+fn current_mic_name(state: &State<AppState>) -> String {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let preferred = state.settings.lock().ok().and_then(|s| s.preferred_audio_device.clone());
+    let host = cpal::default_host();
+    if let Some(name) = preferred.filter(|n| !n.is_empty()) {
+        let exists = host
+            .input_devices()
+            .ok()
+            .is_some_and(|mut d| d.any(|x| x.name().ok().as_deref() == Some(name.as_str())));
+        if exists {
+            return name;
+        }
+    }
+    host.default_input_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_else(|| "לא נמצא מיקרופון".to_string())
+}
+
+#[derive(serde::Serialize)]
+struct MicTestResult {
+    device: String,
+    /// Loudest sample heard, 0.0-1.0.
+    peak: f32,
+    /// True when something above the silence threshold was captured.
+    heard_sound: bool,
+    permission_path: String,
+}
+
+/// Records about two seconds and reports what the chosen microphone delivered, so
+/// a user whose recordings come out empty can see whether the mic, the device
+/// choice or the OS permission is the problem.
+#[tauri::command]
+async fn test_microphone(state: State<'_, AppState>) -> Result<MicTestResult, String> {
+    if state.batch_recording_in_progress.load(Ordering::SeqCst) {
+        return Err("הקלטה בתהליך - עצור אותה לפני בדיקת המיקרופון".to_string());
+    }
+    let device = current_mic_name(&state);
+    {
+        let mut rec = state.recorder.lock().map_err(|e| e.to_string())?;
+        if rec.is_recording() {
+            return Err("הקלטה כבר פעילה - עצור אותה לפני בדיקת המיקרופון".to_string());
+        }
+        rec.set_vad_enabled(false);
+        rec.set_max_recording_secs(10.0);
+        rec.start_recording()?;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+    let samples = {
+        let mut rec = state.recorder.lock().map_err(|e| e.to_string())?;
+        rec.stop_recording()
+    };
+    restore_recorder_settings(&state);
+    let samples = samples?;
+    let peak = audio::peak_amplitude(&samples).min(1.0);
+    Ok(MicTestResult {
+        device,
+        peak,
+        heard_sound: !audio::is_effectively_silent(&samples, 0.01),
+        permission_path: mic_permission_path().to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_custom_dictionary(state: State<AppState>) -> Result<Vec<String>, String> {
+    let s = state.settings.lock().map_err(|e| e.to_string())?;
+    Ok(s.custom_dictionary.clone())
+}
+
+/// Save the personal dictionary and make it live for the next transcription.
+#[tauri::command]
+fn set_custom_dictionary(state: State<AppState>, lines: Vec<String>) -> Result<Vec<String>, String> {
+    let cleaned = dictionary::normalize(&lines);
+    let mut s = state.settings.lock().map_err(|e| e.to_string())?;
+    let mut updated = s.clone();
+    updated.custom_dictionary = cleaned.clone();
+    settings::save_settings(&updated)?;
+    *s = updated;
+    dictionary::set(&cleaned);
+    Ok(cleaned)
+}
+
 #[tauri::command]
 fn get_audio_devices() -> Result<Vec<String>, String> {
     use cpal::traits::{DeviceTrait, HostTrait};
@@ -2917,6 +3021,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage({
             let load_result = settings::load_settings();
+            dictionary::set(&load_result.settings.custom_dictionary);
             AppState {
                 recorder: Mutex::new(AudioRecorder::new()),
                 #[cfg(target_os = "windows")]
@@ -3163,6 +3268,9 @@ pub fn run() {
             export_history,
             export_srt,
             get_audio_devices,
+            test_microphone,
+            get_custom_dictionary,
+            set_custom_dictionary,
             set_window_always_on_top,
             set_autostart_enabled,
             show_toolbar_window,

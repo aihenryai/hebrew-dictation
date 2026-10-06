@@ -193,6 +193,10 @@ pub struct AppSettings {
     /// file simply gets the default rather than failing to parse.
     #[serde(default = "default_narration_voice")]
     pub narration_voice: String,
+    /// Personal dictionary lines (see `dictionary`). Managed only by
+    /// `set_custom_dictionary`, so `merge_frontend_update` preserves it.
+    #[serde(default)]
+    pub custom_dictionary: Vec<String>,
 }
 
 /// Settings sent to the webview — API keys are redacted to booleans.
@@ -375,6 +379,7 @@ impl Default for AppSettings {
             local_api_port: default_local_api_port(),
             narration_port: default_narration_port(),
             narration_voice: default_narration_voice(),
+            custom_dictionary: Vec::new(),
         }
     }
 }
@@ -609,6 +614,7 @@ impl AppSettings {
         incoming.local_api_port = self.local_api_port;
         incoming.narration_port = self.narration_port;
         incoming.narration_voice = self.narration_voice.clone();
+        incoming.custom_dictionary = self.custom_dictionary.clone();
         incoming.debug_save_audio = self.debug_save_audio;
         incoming
     }

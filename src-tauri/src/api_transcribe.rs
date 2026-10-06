@@ -373,10 +373,11 @@ async fn transcribe_deepgram_inner(
 
     let lang = normalize_language(language);
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}{}",
         lang,
         day_ordinal_replace_params(lang),
-        dictation_params(lang)
+        dictation_params(lang),
+        crate::dictionary::keyterm_params()
     );
 
     let response = reqwest::Client::new()
@@ -426,9 +427,10 @@ pub(crate) async fn transcribe_deepgram_batch(
     // change the transcript text, so it's safe to send on every batch request
     // (single-speaker audio simply reports one speaker → no SRT label).
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true{}",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true{}{}",
         lang,
-        day_ordinal_replace_params(lang)
+        day_ordinal_replace_params(lang),
+        crate::dictionary::keyterm_params()
     );
 
     let response = client

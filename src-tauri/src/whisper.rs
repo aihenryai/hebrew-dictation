@@ -98,6 +98,10 @@ impl WhisperEngine {
             } else {
                 params.set_language(Some(&lang_owned));
             }
+            let prompt = crate::dictionary::whisper_prompt();
+            if let Some(p) = prompt.as_deref() {
+                params.set_initial_prompt(p);
+            }
             params.set_translate(false);
             params.set_no_timestamps(true);
             params.set_single_segment(false);
@@ -196,6 +200,10 @@ pub fn run_long_transcription<F: FnMut(i32) + 'static>(
         params.set_language(None);
     } else {
         params.set_language(Some(&effective_lang));
+    }
+    let prompt = crate::dictionary::whisper_prompt();
+    if let Some(p) = prompt.as_deref() {
+        params.set_initial_prompt(p);
     }
     params.set_translate(false);
     // SRT needs real segment timing (was `true`) — see spec's "Open risk to

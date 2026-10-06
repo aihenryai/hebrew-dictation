@@ -2493,3 +2493,35 @@ body:has(.toolbar-idle) #root {
   flex-wrap: wrap;
   margin-top: 0.5rem;
 }
+
+.dictionary-section .settings-hint {
+  margin: 0 0 0.6rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.dictionary-textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.6rem;
+  margin: 0 0 0.6rem;
+  background: #0e1630;
+  color: #e8e8e8;
+  border: 1px solid #2a3a5e;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  resize: vertical;
+}
+.dictionary-textarea::placeholder {
+  color: #6d7a99;
+}
+.dictionary-textarea:focus {
+  outline: none;
+  border-color: #4da6ff;
+}
+.dictionary-section .btn-secondary {
+  display: block;
+  margin: 0 0 0.6rem;
+}

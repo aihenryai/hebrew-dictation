@@ -575,6 +575,14 @@ function App() {
   // main view once the user leaves the wizard.
   const [wizardSetupError, setWizardSetupError] = useState("");
   const [devices, setDevices] = useState<string[]>([]);
+  // Mic check (settings): what the chosen microphone delivered in a 2 second test.
+  const [micTesting, setMicTesting] = useState(false);
+  const [micTest, setMicTest] = useState<
+    { device: string; peak: number; heard_sound: boolean; permission_path: string } | null
+  >(null);
+  // Personal dictionary: one entry per line, "word" or "heard => written".
+  const [dictionaryText, setDictionaryText] = useState("");
+  const [dictionarySaved, setDictionarySaved] = useState(false);
   const [selectedModel, setSelectedModel] = useState("small");
   const [activeModel, setActiveModel] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -2034,6 +2042,33 @@ function App() {
       const devs = await invoke("get_audio_devices");
       setDevices(devs as string[]);
     } catch (e) { setError(String(e)); }
+    try {
+      const lines = await invoke<string[]>("get_custom_dictionary");
+      setDictionaryText(lines.join("\n"));
+    } catch { /* older backend: no dictionary yet */ }
+  }
+
+  async function handleTestMic() {
+    setMicTesting(true);
+    setMicTest(null);
+    try {
+      setMicTest(await invoke("test_microphone"));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMicTesting(false);
+    }
+  }
+
+  async function handleSaveDictionary() {
+    try {
+      const saved = await invoke<string[]>("set_custom_dictionary", { lines: dictionaryText.split("\n") });
+      setDictionaryText(saved.join("\n"));
+      setDictionarySaved(true);
+      setTimeout(() => setDictionarySaved(false), 2500);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function loadWhisperModel(modelName?: string, background = false) {
@@ -3066,6 +3101,40 @@ function App() {
           </select>
           <p className="settings-hint">
             השינוי חל בהקלטה הבאה — הקלטה פעילה לא נקטעת.
+          </p>
+          <button className="btn-secondary btn-small" onClick={handleTestMic} disabled={micTesting}>
+            {micTesting ? "מקליט שתי שניות... דבר עכשיו" : "בדוק מיקרופון"}
+          </button>
+          {micTest && (
+            <p className="settings-hint">
+              {micTest.heard_sound
+                ? `המיקרופון \"${micTest.device}\" עובד - נקלט קול (עוצמה ${Math.round(micTest.peak * 100)}%).`
+                : `לא נקלט קול מהמיקרופון \"${micTest.device}\". נסה לבחור מיקרופון אחר ברשימה, ודא שהוא לא מושתק, ובדוק שלאפליקציה יש הרשאה: ${micTest.permission_path}.`}
+            </p>
+          )}
+        </div>
+
+        {/* Personal dictionary */}
+        <div className="settings-section dictionary-section">
+          <h3>מילון אישי</h3>
+          <p className="settings-hint">
+            מילים שהאפליקציה צריכה לזהות ולכתוב נכון: מונחים מקצועיים או אקדמיים, שמות, ומילים באנגלית. מילה בכל שורה.
+            כדי לתקן כתיב קבוע כתוב את המילה שנשמעת, אחריה =&gt; ואחריה המילה הנכונה, למשל{" "}
+            <span dir="ltr">קוברנטס =&gt; Kubernetes</span>.
+          </p>
+          <textarea
+            className="dictionary-textarea"
+            dir="auto"
+            rows={6}
+            value={dictionaryText}
+            onChange={(e) => setDictionaryText(e.target.value)}
+            placeholder={"Kubernetes\nפנומנולוגיה\nקוברנטס => Kubernetes"}
+          />
+          <button className="btn-secondary btn-small" onClick={handleSaveDictionary}>
+            {dictionarySaved ? "נשמר" : "שמור מילון"}
+          </button>
+          <p className="settings-hint">
+            במנוע הענן המילים משמשות כרמז לזיהוי, ובמודל המקומי כהנחיה פתוחה. התיקונים (עם החץ) פועלים בכל המנועים, על מילה שלמה בלבד.
           </p>
         </div>
 
