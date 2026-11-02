@@ -17,6 +17,8 @@ export interface Env {
   EMAIL_BONUS_MINUTES: string;
   GROQ_MODEL: string;
   BACKEND: "groq" | "deepgram";
+  GLOBAL_DAILY_MINUTES?: string;
+  NEW_DEVICES_PER_IP_PER_DAY?: string;
 }
 
 /**

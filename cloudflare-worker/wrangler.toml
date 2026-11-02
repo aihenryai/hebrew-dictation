@@ -25,6 +25,10 @@ GROQ_MODEL = "whisper-large-v3-turbo"
 # BACKEND: switches transcription provider. Values: "groq" | "deepgram"
 # Default to "groq" — change to "deepgram" if Phase 0 benchmark gate fails for Groq.
 BACKEND = "groq"
+# Spend ceilings that do not trust the client-chosen device hash (security audit 2026-11-02):
+# all devices together per UTC day, and new devices one IP may register per day.
+GLOBAL_DAILY_MINUTES = "120"
+NEW_DEVICES_PER_IP_PER_DAY = "3"
 
 # Secrets — set via:
 #   wrangler secret put GROQ_API_KEY

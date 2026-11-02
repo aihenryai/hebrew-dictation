@@ -8,11 +8,21 @@ import type {
   QuotaResponse,
   TranscribeResponse,
 } from "./types";
-import { consumeMinutes, getOrCreateDevice, getQuotaLimit } from "./quota";
+import {
+  addGlobalMinutes,
+  allowNewDevice,
+  consumeMinutes,
+  deviceExists,
+  getOrCreateDevice,
+  getQuotaLimit,
+  globalMinutesLeft,
+  peekDevice,
+} from "./quota";
 import { transcribeGroq } from "./groq-client";
 import { transcribeDeepgram } from "./deepgram-client";
 
-const MIN_DEVICE_HASH_LENGTH = 16;
+// The hash doubles as a KV key: a fixed alphabet and length keep "global:..." / "newdev:..." out of reach.
+const DEVICE_HASH_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25MB hard cap (Groq limit)
 
 /**
@@ -27,8 +37,13 @@ export async function handleTranscribe(
   env: Env
 ): Promise<Response> {
   const deviceHash = request.headers.get("X-Device-Hash");
-  if (!deviceHash || deviceHash.length < MIN_DEVICE_HASH_LENGTH) {
+  if (!deviceHash || !DEVICE_HASH_RE.test(deviceHash)) {
     return jsonError(400, "Missing or invalid X-Device-Hash header");
+  }
+
+  const declared = Number(request.headers.get("Content-Length") ?? "0");
+  if (declared > MAX_AUDIO_BYTES) {
+    return jsonError(413, `Audio exceeds ${MAX_AUDIO_BYTES} byte limit`);
   }
 
   const audio = await request.arrayBuffer();
@@ -41,6 +56,16 @@ export async function handleTranscribe(
 
   // Always compute duration server-side from audio byte size (never trust client headers).
   const minutesUsed = computeMinutesFromAudioSize(audio.byteLength);
+
+  if ((await globalMinutesLeft(env)) < minutesUsed) {
+    return jsonError(503, "Service busy, try again later");
+  }
+  if (!(await deviceExists(env, deviceHash))) {
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (!(await allowNewDevice(env, ip))) {
+      return jsonError(429, "Too many new devices from this network today");
+    }
+  }
 
   const device = await getOrCreateDevice(env, deviceHash);
   const limit = getQuotaLimit(env, device);
@@ -67,6 +92,7 @@ export async function handleTranscribe(
   }
 
   const updated = await consumeMinutes(env, device, minutesUsed);
+  await addGlobalMinutes(env, minutesUsed);
   const remaining = Math.max(0, limit - updated.minutes_used_this_month);
 
   const body: TranscribeResponse = {
@@ -87,11 +113,11 @@ export async function handleQuota(
   env: Env
 ): Promise<Response> {
   const deviceHash = request.headers.get("X-Device-Hash");
-  if (!deviceHash || deviceHash.length < MIN_DEVICE_HASH_LENGTH) {
+  if (!deviceHash || !DEVICE_HASH_RE.test(deviceHash)) {
     return jsonError(400, "Missing or invalid X-Device-Hash header");
   }
 
-  const device = await getOrCreateDevice(env, deviceHash);
+  const device = await peekDevice(env, deviceHash);
   const limit = getQuotaLimit(env, device);
 
   const body: QuotaResponse = {
