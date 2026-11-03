@@ -1456,6 +1456,27 @@ fn streaming_config(state: &AppState) -> Result<(String, bool), String> {
     Ok((key, s.language_switch_keywords_enabled))
 }
 
+/// Up to one second of 16kHz audio per WebSocket message.
+const MAX_DISPATCH_SAMPLES: usize = 16_000;
+
+/// Take one chunk plus whatever else is already queued, up to
+/// `MAX_DISPATCH_SAMPLES`. On a slow upload the microphone's ~10ms chunks pile
+/// up; sending them one per message made a backlog drain far slower than it
+/// needed to, so the end of the dictation reached Deepgram late.
+fn take_dispatch_batch(
+    first: Vec<f32>,
+    audio_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<f32>>,
+) -> Vec<f32> {
+    let mut batch = first;
+    while batch.len() < MAX_DISPATCH_SAMPLES {
+        match audio_rx.try_recv() {
+            Ok(more) => batch.extend_from_slice(&more),
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
 /// Feed microphone chunks from `audio_rx` into `session` until the channel closes.
 fn spawn_audio_dispatch(
     session: Arc<streaming::StreamingSession>,
@@ -1463,7 +1484,8 @@ fn spawn_audio_dispatch(
     app: AppHandle,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
-        while let Some(chunk) = audio_rx.recv().await {
+        while let Some(first) = audio_rx.recv().await {
+            let chunk = take_dispatch_batch(first, &mut audio_rx);
             if let Err(e) = session.send_audio_pcm16(&chunk).await {
                 let _ = app.emit("audio-stream-error", &e);
                 return Err(e);
@@ -1471,6 +1493,21 @@ fn spawn_audio_dispatch(
         }
         Ok(())
     })
+}
+
+/// Wait for queued audio to reach Deepgram for as long as it keeps moving.
+async fn finish_dispatch(
+    session: &streaming::StreamingSession,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+) -> Option<String> {
+    streaming::finish_task(
+        task,
+        session.activity(),
+        streaming::DISPATCH_LIMITS,
+        streaming::DISPATCH_TIMEOUT,
+    )
+    .await
+    .err()
 }
 
 /// The dictation's text so far: earlier connections, then the current one.
@@ -1495,12 +1532,12 @@ async fn start_streaming_transcription(
     if state.batch_recording_in_progress.load(Ordering::SeqCst) {
         return Err("הקלטת ישיבה בתהליך — עצור אותה לפני הקלטה חדשה".to_string());
     }
-    // Only one active session at a time.
-    {
-        let guard = state.streaming.lock().await;
-        if guard.is_some() {
-            return Err("כבר פעיל חיבור streaming קיים — המתן רגע ונסה שוב".to_string());
-        }
+    // Only one active session at a time. The guard is held until the new
+    // session is stored: with a check-then-store pair, two quick starts both
+    // passed the check and the second silently replaced (and leaked) the first.
+    let mut guard = state.streaming.lock().await;
+    if guard.is_some() {
+        return Err("כבר פעיל חיבור streaming קיים — המתן רגע ונסה שוב".to_string());
     }
 
     // Deepgram streaming rejects "auto" — map it to "he" to match the batch path behavior.
@@ -1560,7 +1597,6 @@ async fn start_streaming_transcription(
     let dispatch_task = spawn_audio_dispatch(session.clone(), audio_rx, app.clone());
 
     // Store the active session so stop_streaming_transcription can find it.
-    let mut guard = state.streaming.lock().await;
     *guard = Some(ActiveStreaming {
         session,
         audio_tx,
@@ -1617,7 +1653,15 @@ async fn switch_streaming_language(
 
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
     {
-        let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
+        // A `?` here would drop `old` after `guard.take()`: the dictation
+        // would vanish while the microphone kept recording.
+        let recorder = match state.recorder.lock() {
+            Ok(r) => r,
+            Err(e) => {
+                *guard = Some(old);
+                return Err(e.to_string());
+            }
+        };
         let tx_for_cb = audio_tx.clone();
         // Replacing the callback drops its clone of the old sender.
         recorder.set_chunk_callback(move |chunk: &[f32]| {
@@ -1626,9 +1670,7 @@ async fn switch_streaming_language(
     }
 
     drop(old.audio_tx);
-    let mut warning = streaming::finish_task(old.dispatch_task, std::time::Duration::from_secs(3))
-        .await
-        .err();
+    let mut warning = finish_dispatch(&old.session, old.dispatch_task).await;
     let stopped = old.session.stop().await;
     warning = warning.or(stopped.warning);
     if let Some(w) = warning {
@@ -1670,9 +1712,16 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
         return Err("אין חיבור streaming פעיל".to_string());
     };
 
+    // Again, now that no language switch can be in progress: a switch that
+    // was mid-swap when this stop began installed a fresh callback holding
+    // its own sender, and the channel would never close.
+    if let Ok(recorder) = state.recorder.lock() {
+        recorder.clear_chunk_callback();
+    }
+
     // Drop the sender so the dispatch task terminates when the channel drains.
     drop(active.audio_tx);
-    let dispatch_warning = streaming::finish_task(active.dispatch_task, std::time::Duration::from_secs(3)).await.err();
+    let dispatch_warning = finish_dispatch(&active.session, active.dispatch_task).await;
 
     // Close the WebSocket and return the accumulated final text, including
     // what earlier connections of this dictation heard (language switches).
@@ -3307,6 +3356,21 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_batches_a_backlog_in_order_and_within_the_cap() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+        for i in 0..200 {
+            tx.send(vec![i as f32; 160]).unwrap();
+        }
+        let first = rx.try_recv().unwrap();
+        let batch = take_dispatch_batch(first, &mut rx);
+        assert_eq!(batch.len(), MAX_DISPATCH_SAMPLES);
+        assert_eq!(batch[0], 0.0);
+        assert_eq!(batch[MAX_DISPATCH_SAMPLES - 1], 99.0);
+        // The rest stays queued, in order, for the next message.
+        assert_eq!(rx.try_recv().unwrap()[0], 100.0);
+    }
 
     #[test]
     fn main_waits_longer_after_longer_injections_within_bounds() {

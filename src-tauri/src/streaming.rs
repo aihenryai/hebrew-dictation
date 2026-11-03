@@ -1,7 +1,7 @@
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -30,6 +30,7 @@ pub struct StreamingSession {
     recv_task: Mutex<Option<JoinHandle<Result<(), String>>>>,
     stop_requested: Arc<AtomicBool>,
     injection: Arc<SessionInjection>,
+    activity: Activity,
 }
 
 pub(crate) struct StreamingStop {
@@ -70,20 +71,64 @@ impl SessionInjection {
     }
 }
 
+/// Bumped on every audio chunk sent, transcript message received and segment
+/// typed. Shutdown waits as long as this keeps moving, so a slow connection or
+/// a slow machine that is still delivering the last words is never cut off.
+pub(crate) type Activity = Arc<AtomicU64>;
+
+/// How long shutdown waits with no activity at all before giving up, and the
+/// hard ceiling however much activity there is.
+#[derive(Clone, Copy)]
+pub(crate) struct WaitLimits {
+    pub idle: Duration,
+    pub cap: Duration,
+}
+
+/// Real failure (2026-11-03, a user's slower computer): a flat 5 seconds for
+/// Deepgram to finish AND for the last segments to be typed was not enough;
+/// the dictation ended with "שירות התמלול לא סיים בזמן" while text was still
+/// arriving. Idle-based waiting gives a working connection all the time it
+/// needs and still stops a dead one after `idle`.
+pub(crate) const RECEIVE_LIMITS: WaitLimits = WaitLimits {
+    idle: Duration::from_secs(10),
+    cap: Duration::from_secs(90),
+};
+pub(crate) const DISPATCH_LIMITS: WaitLimits = WaitLimits {
+    idle: Duration::from_secs(8),
+    cap: Duration::from_secs(90),
+};
+
 /// Timeout must abort AND join: dropping a JoinHandle merely detaches its task.
 pub(crate) async fn finish_task(
     mut task: JoinHandle<Result<(), String>>,
-    timeout: Duration,
+    activity: &AtomicU64,
+    limits: WaitLimits,
+    timeout_error: &str,
 ) -> Result<(), String> {
-    match tokio::time::timeout(timeout, &mut task).await {
-        Ok(result) => result.map_err(|e| format!("משימת התמלול נקטעה: {e}"))?,
-        Err(_) => {
-            task.abort();
-            let _ = task.await;
-            Err("שירות התמלול לא סיים בזמן; ייתכן שחסר סוף ההכתבה. הטקסט שכבר התקבל נשמר.".into())
+    let started = tokio::time::Instant::now();
+    let mut seen = activity.load(Ordering::SeqCst);
+    loop {
+        let left = limits.cap.saturating_sub(started.elapsed());
+        match tokio::time::timeout(limits.idle.min(left), &mut task).await {
+            Ok(result) => return result.map_err(|e| format!("משימת התמלול נקטעה: {e}"))?,
+            Err(_) => {
+                let now = activity.load(Ordering::SeqCst);
+                if now != seen && started.elapsed() < limits.cap {
+                    seen = now;
+                    continue;
+                }
+                task.abort();
+                let _ = task.await;
+                return Err(timeout_error.into());
+            }
         }
     }
 }
+
+const RECEIVE_TIMEOUT: &str =
+    "שירות התמלול לא החזיר את סוף ההכתבה. ייתכן שהחיבור לאינטרנט איטי. הטקסט שכבר התקבל נשמר.";
+pub(crate) const DISPATCH_TIMEOUT: &str =
+    "סוף ההקלטה לא נשלח לשירות התמלול, כנראה בגלל חיבור איטי. הטקסט שכבר התקבל נשמר.";
 
 /// Per-session latch so a repeating per-segment injection failure (e.g. missing
 /// macOS Accessibility permission) surfaces exactly once, not once per segment.
@@ -176,6 +221,8 @@ impl StreamingSession {
         let stopping = stop_requested.clone();
         let injection = Arc::new(SessionInjection::new());
         let injection_rx = injection.clone();
+        let activity: Activity = Arc::new(AtomicU64::new(0));
+        let activity_rx = activity.clone();
 
         let final_text_rx = final_text.clone();
         let app_clone = app.clone();
@@ -183,6 +230,7 @@ impl StreamingSession {
             Arc::new(std::sync::atomic::AtomicBool::new(false));
         let recv_task = tokio::spawn(async move {
             while let Some(msg) = reader.next().await {
+                activity_rx.fetch_add(1, Ordering::SeqCst);
                 match msg {
                     Ok(Message::Text(txt)) => {
                         handle_message(
@@ -195,8 +243,14 @@ impl StreamingSession {
                             &injection_rx,
                         )
                         .await;
+                        // Typing a long segment on a slow machine is progress too.
+                        activity_rx.fetch_add(1, Ordering::SeqCst);
                     }
                     Ok(Message::Close(_)) => break,
+                    // After CloseStream Deepgram may drop the socket without a
+                    // close handshake. Every word it sent has arrived by then,
+                    // so a red "recording was cut" banner would be false.
+                    Err(_) if stopping.load(Ordering::SeqCst) => return Ok(()),
                     Err(e) => {
                         let error = map_ws_error(&e);
                         let _ = app_clone.emit("audio-stream-error", &error);
@@ -215,13 +269,20 @@ impl StreamingSession {
             }
         });
 
+        spawn_keep_alive(Arc::downgrade(&writer), KEEP_ALIVE_EVERY);
+
         Ok(Arc::new(Self {
             writer,
             final_text,
             recv_task: Mutex::new(Some(recv_task)),
             stop_requested,
             injection,
+            activity,
         }))
+    }
+
+    pub(crate) fn activity(&self) -> &AtomicU64 {
+        &self.activity
     }
 
     /// Convert f32 samples (assumed 16kHz mono) to PCM16 LE bytes and send over the WS.
@@ -237,7 +298,8 @@ impl StreamingSession {
             writer
                 .send(Message::Binary(bytes.into()))
                 .await
-                .map_err(|e| format!("WS send error: {}", e))?;
+                .map_err(|e| map_ws_error(&e))?;
+            self.activity.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -245,15 +307,14 @@ impl StreamingSession {
     /// Ask Deepgram to flush and let the SERVER close the WebSocket afterwards.
     /// Never discard received text because shutdown failed or timed out.
     pub async fn stop(&self) -> StreamingStop {
-        self.stop_with_timeout(Duration::from_secs(5)).await
+        self.stop_with_limits(RECEIVE_LIMITS).await
     }
 
-    async fn stop_with_timeout(&self, timeout: Duration) -> StreamingStop {
+    async fn stop_with_limits(&self, limits: WaitLimits) -> StreamingStop {
         // Holding this guard also serializes concurrent stop requests.
         let mut receiver = self.recv_task.lock().await;
         self.stop_requested.store(true, Ordering::SeqCst);
-        let deadline = tokio::time::Instant::now() + timeout;
-        let close_result = tokio::time::timeout_at(deadline, async {
+        let close_result = tokio::time::timeout(limits.idle, async {
             let mut guard = self.writer.lock().await;
             if let Some(mut writer) = guard.take() {
                 writer
@@ -274,12 +335,7 @@ impl StreamingSession {
             Err(_) => Some("בקשת סיום ההכתבה התעכבה; ייתכן שחסר סוף התמלול.".into()),
         };
         if let Some(task) = receiver.take() {
-            if let Err(error) = finish_task(
-                task,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            {
+            if let Err(error) = finish_task(task, &self.activity, limits, RECEIVE_TIMEOUT).await {
                 warning.get_or_insert(error);
             }
         }
@@ -290,6 +346,33 @@ impl StreamingSession {
             warning,
         }
     }
+}
+
+/// Deepgram closes a stream that gets no audio for about 10 seconds. The
+/// microphone sends nothing while dictation is paused, and a language switch
+/// holds the new connection's audio back while the old one finishes; without
+/// this the connection died there and every later word was lost.
+const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(4);
+
+/// Weak, so a session that is dropped without `stop` does not stay alive.
+/// Stops by itself once `stop` takes the writer, before CloseStream goes out
+/// on the same lock, so no KeepAlive can follow it.
+fn spawn_keep_alive(writer: std::sync::Weak<Mutex<Option<WsWriter>>>, every: Duration) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let Some(writer) = writer.upgrade() else { return };
+            let mut guard = writer.lock().await;
+            let Some(w) = guard.as_mut() else { return };
+            if w
+                .send(Message::Text(r#"{"type":"KeepAlive"}"#.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
 }
 
 async fn handle_message(
@@ -411,6 +494,11 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
 mod tests {
     use super::*;
 
+    const SHORT: WaitLimits = WaitLimits {
+        idle: Duration::from_millis(50),
+        cap: Duration::from_millis(200),
+    };
+
     // Loopback-only fake service: no API key, microphone, or real text field.
     async fn local_session() -> (Arc<StreamingSession>, WebSocketStream<TcpStream>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -451,6 +539,7 @@ mod tests {
                 recv_task: Mutex::new(Some(receiver)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 injection: Arc::new(SessionInjection::new()),
+                activity: Arc::new(AtomicU64::new(0)),
             }),
             server,
         )
@@ -480,6 +569,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keep_alive_holds_a_silent_stream_open_and_never_follows_close_stream() {
+        let (session, mut server) = local_session().await;
+        spawn_keep_alive(Arc::downgrade(&session.writer), Duration::from_millis(15));
+        let first = tokio::time::timeout(Duration::from_secs(2), server.next())
+            .await
+            .expect("a silent stream must get a KeepAlive")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Message::Text(r#"{"type":"KeepAlive"}"#.into()));
+        let service = tokio::spawn(async move {
+            // Skip KeepAlives already in flight, up to CloseStream.
+            loop {
+                let m = server.next().await.unwrap().unwrap();
+                if m == Message::Text(r#"{"type":"CloseStream"}"#.into()) {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(60), server.next())
+                    .await
+                    .is_err(),
+                "nothing may be sent after CloseStream"
+            );
+            server.close(None).await.unwrap();
+        });
+        let result = session.stop().await;
+        service.await.unwrap();
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+    }
+
+    #[tokio::test]
     async fn stalled_shutdown_preserves_received_text_and_closes_injection() {
         let (session, mut server) = local_session().await;
         *session.final_text.lock().await = "טקסט שכבר התקבל".into();
@@ -488,7 +608,7 @@ mod tests {
             std::future::pending::<()>().await;
             drop(server);
         });
-        let result = session.stop_with_timeout(Duration::from_millis(50)).await;
+        let result = session.stop_with_limits(SHORT).await;
         assert_eq!(result.text, "טקסט שכבר התקבל");
         assert!(result.warning.is_some());
         assert!(session.recv_task.lock().await.is_none());
@@ -517,11 +637,55 @@ mod tests {
             Ok(())
         });
         running.await.unwrap();
-        assert!(finish_task(task, Duration::from_millis(10)).await.is_err());
+        let idle = AtomicU64::new(0);
+        assert!(finish_task(task, &idle, SHORT, "x").await.is_err());
         assert!(
             dropped.load(Ordering::SeqCst),
             "task must have been destroyed before returning"
         );
+    }
+
+    /// The 2026-11-03 failure: the end of a dictation took longer than the old
+    /// flat timeout while text was still arriving. Activity keeps it waiting.
+    #[tokio::test]
+    async fn shutdown_that_keeps_making_progress_is_not_cut_off() {
+        let activity: Activity = Arc::new(AtomicU64::new(0));
+        let ticking = activity.clone();
+        let task = tokio::spawn(async move {
+            // 6 x 30ms = well past the 50ms idle limit, but never idle for 50ms.
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                ticking.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        let limits = WaitLimits {
+            idle: Duration::from_millis(50),
+            cap: Duration::from_secs(5),
+        };
+        assert!(finish_task(task, &activity, limits, "x").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn endless_activity_still_stops_at_the_cap() {
+        let activity: Activity = Arc::new(AtomicU64::new(0));
+        let ticking = activity.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticking.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let limits = WaitLimits {
+            idle: Duration::from_millis(40),
+            cap: Duration::from_millis(150),
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(
+            finish_task(task, &activity, limits, "cap").await,
+            Err("cap".to_string())
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
