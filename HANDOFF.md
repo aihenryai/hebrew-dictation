@@ -1,5 +1,24 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-03 - v2.15.1: end of dictation cut off on a slow computer
+
+Henry photographed the app on someone else's computer: red banner "ההקלטה נקטעה:
+שירות התמלול לא סיים בזמן". Cause: `StreamingSession::stop` gave Deepgram's flush
+AND the typing of the last segments one flat 5s (dispatch: flat 3s). Now
+`streaming::finish_task` waits while an `Activity` counter moves (bumped per audio
+send, WS message, typed segment): receive idle 10s / cap 90s, dispatch idle 8s / cap
+90s. Dispatch batches queued chunks up to 1s per message (`take_dispatch_batch`).
+A review of the live path added: KeepAlive every 4s (pause / language switch went
+silent >10s and Deepgram closed the stream), no false error when the socket drops
+after CloseStream, stop re-clears the chunk callback after taking the session (race
+with a switch), switch no longer drops the session on a poisoned recorder lock,
+start holds the session lock until it stores. 213 Rust tests pass. Not tested with
+real speech; the other computer gets it through the in-app updater.
+Trap from this release: a PowerShell here-string commit message with a Hebrew quote
+broke `git commit`, and the chained `git tag` + push still ran on the OLD commit and
+started a release run. Use `git commit -F <file>` and check `$LASTEXITCODE` before
+tagging.
+
 ## 2026-09-29 (night) - Usage analytics baseline + anonymous usage ping (PROPOSAL, declined for now)
 
 Henry asked how many people use and download the app. What exists, measured today:
