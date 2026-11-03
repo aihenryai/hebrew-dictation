@@ -1,5 +1,22 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-03 - v2.15.2: reconnect when Deepgram drops the stream
+
+Second photo from the other computer (still on 2.15.0): "WS send error: IO error: An
+existing connection was forcibly closed by the remote host (os error 10054)". Any drop
+used to end the dictation. Now `StreamingSession` owns a replaceable connection:
+- `Unacked` keeps audio sent but not yet covered by a final (`start + duration`, empty
+  finals count), capped at 60s; a reconnect resends it, with `conn_base` mapping each
+  connection's zero-based timestamps back to session positions.
+- The receiver marks `dead` instead of emitting an error; the next `send_audio_pcm16`
+  (or `stop`, if audio is pending) reconnects: 3 connect attempts, 10s timeout each, and
+  at most 3 reconnects without any message from the service in between, then
+  `RECONNECT_FAILED`. `stop` on a dead socket with nothing pending skips CloseStream.
+- Lock order is always receiver then writer (`reconnect_locked` takes the guard from
+  `stop`). KeepAlive no longer exits on a failed send, since the slot gets a new socket.
+- Tests use a real loopback service via `open_session(Endpoint, None, ..)`; `app: None`
+  means no typing or events. 217 tests pass. Not tested against real Deepgram drops.
+
 ## 2026-11-03 - v2.15.1: end of dictation cut off on a slow computer
 
 Henry photographed the app on someone else's computer: red banner "ההקלטה נקטעה:

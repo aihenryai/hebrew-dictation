@@ -1,7 +1,8 @@
-use futures_util::stream::SplitSink;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -14,6 +15,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
+type WsReader = SplitStream<WsStream>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InterimPayload {
@@ -26,11 +28,155 @@ pub struct InterimPayload {
 /// between the audio dispatch task and the Tauri command handler.
 pub struct StreamingSession {
     writer: Arc<Mutex<Option<WsWriter>>>,
-    final_text: Arc<Mutex<String>>,
     recv_task: Mutex<Option<JoinHandle<Result<(), String>>>>,
-    stop_requested: Arc<AtomicBool>,
+    ctx: Arc<ReceiveContext>,
+    endpoint: Endpoint,
+}
+
+/// Where to (re)connect. Kept so a dropped connection can be reopened.
+struct Endpoint {
+    url: String,
+    auth: Option<String>,
+}
+
+/// State shared by every connection of one session: a reconnect replaces the
+/// socket, not the dictation.
+struct ReceiveContext {
+    final_text: Arc<Mutex<String>>,
+    app: Option<AppHandle>,
+    inject_err_reported: InjectErrReported,
+    language_switch_enabled: bool,
+    live_injection: bool,
     injection: Arc<SessionInjection>,
     activity: Activity,
+    stopping: AtomicBool,
+    /// The service dropped the connection before CloseStream.
+    dead: AtomicBool,
+    unacked: std::sync::Mutex<Unacked>,
+    /// Reconnects since the service last sent anything; reset on every message.
+    failed_reconnects: AtomicU32,
+}
+
+impl ReceiveContext {
+    fn unacked(&self) -> std::sync::MutexGuard<'_, Unacked> {
+        self.unacked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Audio sent but not yet covered by a final result, so a reconnect can
+/// resend it and the words spoken just before a drop are not lost.
+/// Positions count samples from the start of the session.
+#[derive(Default)]
+struct Unacked {
+    start: u64,
+    samples: VecDeque<i16>,
+}
+
+/// 60 seconds. Finals arrive every few seconds, so this is never reached on
+/// a working connection; it only bounds memory on a broken one.
+const MAX_UNACKED_SAMPLES: usize = 16_000 * 60;
+
+impl Unacked {
+    fn push(&mut self, pcm: &[i16]) {
+        self.samples.extend(pcm.iter().copied());
+        let over = self.samples.len().saturating_sub(MAX_UNACKED_SAMPLES);
+        if over > 0 {
+            self.samples.drain(..over);
+            self.start += over as u64;
+        }
+    }
+
+    fn ack(&mut self, upto: u64) {
+        let n = upto.saturating_sub(self.start).min(self.samples.len() as u64) as usize;
+        self.samples.drain(..n);
+        self.start += n as u64;
+    }
+}
+
+/// Real failure (2026-11-03, a user's computer): "WS send error: ... forcibly
+/// closed by the remote host (os error 10054)" ended the whole dictation. A
+/// dropped connection is now reopened and the untranscribed audio resent.
+const MAX_RECONNECTS: u32 = 3;
+const CONNECT_ATTEMPTS: u64 = 3;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_FAILED: &str =
+    "החיבור לשירות התמלול נפל ולא הצלחתי לחבר אותו מחדש. כדאי לבדוק את החיבור לאינטרנט. הטקסט שכבר התקבל נשמר.";
+
+fn to_pcm16(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
+        .collect()
+}
+
+fn pcm_bytes(pcm: &[i16]) -> Vec<u8> {
+    pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+/// Where a final result's audio ends, in samples from the connection's start.
+/// Empty finals (silence) count too: they acknowledge audio as well.
+fn final_audio_end(raw: &str) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if !json.get("is_final")?.as_bool()? {
+        return None;
+    }
+    let end = json.get("start")?.as_f64()? + json.get("duration")?.as_f64()?;
+    Some((end * 16_000.0).round().max(0.0) as u64)
+}
+
+async fn open(endpoint: &Endpoint) -> Result<WsStream, String> {
+    let mut request = endpoint
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| format!("Invalid streaming URL: {}", e))?;
+    if let Some(auth) = &endpoint.auth {
+        request.headers_mut().insert(
+            "Authorization",
+            auth.parse()
+                .map_err(|e| format!("Invalid auth header: {}", e))?,
+        );
+    }
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| map_ws_error(&e))?;
+    Ok(ws_stream)
+}
+
+/// `conn_base` is the session position of this connection's first sample:
+/// Deepgram's timestamps restart at zero on every connection.
+fn spawn_receiver(
+    ctx: Arc<ReceiveContext>,
+    mut reader: WsReader,
+    conn_base: u64,
+) -> JoinHandle<Result<(), String>> {
+    tokio::spawn(async move {
+        while let Some(msg) = reader.next().await {
+            ctx.activity.fetch_add(1, Ordering::SeqCst);
+            match msg {
+                Ok(Message::Text(txt)) => {
+                    ctx.failed_reconnects.store(0, Ordering::SeqCst);
+                    handle_message(&txt, &ctx).await;
+                    // Only after the text is committed, so audio is never
+                    // forgotten before its words are kept.
+                    if let Some(end) = final_audio_end(&txt) {
+                        ctx.unacked().ack(conn_base + end);
+                    }
+                    // Typing a long segment on a slow machine is progress too.
+                    ctx.activity.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        // After CloseStream this is the normal end; Deepgram may also drop the
+        // socket without a close handshake then. Before it, the next audio
+        // chunk (or stop) reconnects, so a drop is not an error by itself.
+        if !ctx.stopping.load(Ordering::SeqCst) {
+            ctx.dead.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    })
 }
 
 pub(crate) struct StreamingStop {
@@ -200,108 +346,143 @@ impl StreamingSession {
             crate::dictionary::keyterm_params()
         );
 
-        let mut request = url
-            .into_client_request()
-            .map_err(|e| format!("Invalid streaming URL: {}", e))?;
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Token {}", api_key)
-                .parse()
-                .map_err(|e| format!("Invalid auth header: {}", e))?,
-        );
+        let endpoint = Endpoint {
+            url,
+            auth: Some(format!("Token {}", api_key)),
+        };
+        Self::open_session(endpoint, Some(app), language_switch_enabled, live_injection).await
+    }
 
-        let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| map_ws_error(&e))?;
-
-        let (writer, mut reader) = ws_stream.split();
-        let writer = Arc::new(Mutex::new(Some(writer)));
-        let final_text = Arc::new(Mutex::new(String::new()));
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let stopping = stop_requested.clone();
-        let injection = Arc::new(SessionInjection::new());
-        let injection_rx = injection.clone();
-        let activity: Activity = Arc::new(AtomicU64::new(0));
-        let activity_rx = activity.clone();
-
-        let final_text_rx = final_text.clone();
-        let app_clone = app.clone();
-        let inject_err_reported: InjectErrReported =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let recv_task = tokio::spawn(async move {
-            while let Some(msg) = reader.next().await {
-                activity_rx.fetch_add(1, Ordering::SeqCst);
-                match msg {
-                    Ok(Message::Text(txt)) => {
-                        handle_message(
-                            &txt,
-                            &final_text_rx,
-                            &app_clone,
-                            &inject_err_reported,
-                            language_switch_enabled,
-                            live_injection,
-                            &injection_rx,
-                        )
-                        .await;
-                        // Typing a long segment on a slow machine is progress too.
-                        activity_rx.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(Message::Close(_)) => break,
-                    // After CloseStream Deepgram may drop the socket without a
-                    // close handshake. Every word it sent has arrived by then,
-                    // so a red "recording was cut" banner would be false.
-                    Err(_) if stopping.load(Ordering::SeqCst) => return Ok(()),
-                    Err(e) => {
-                        let error = map_ws_error(&e);
-                        let _ = app_clone.emit("audio-stream-error", &error);
-                        return Err(error);
-                    }
-                    _ => {}
-                }
-            }
-            if stopping.load(Ordering::SeqCst) {
-                Ok(())
-            } else {
-                let error =
-                    "החיבור לשירות התמלול נסגר במהלך ההכתבה. הטקסט שכבר התקבל נשמר.".to_string();
-                let _ = app_clone.emit("audio-stream-error", &error);
-                Err(error)
-            }
+    async fn open_session(
+        endpoint: Endpoint,
+        app: Option<AppHandle>,
+        language_switch_enabled: bool,
+        live_injection: bool,
+    ) -> Result<Arc<Self>, String> {
+        let (writer, reader) = open(&endpoint).await?.split();
+        let ctx = Arc::new(ReceiveContext {
+            final_text: Arc::new(Mutex::new(String::new())),
+            app,
+            inject_err_reported: Arc::new(AtomicBool::new(false)),
+            language_switch_enabled,
+            live_injection,
+            injection: Arc::new(SessionInjection::new()),
+            activity: Arc::new(AtomicU64::new(0)),
+            stopping: AtomicBool::new(false),
+            dead: AtomicBool::new(false),
+            unacked: std::sync::Mutex::new(Unacked::default()),
+            failed_reconnects: AtomicU32::new(0),
         });
-
+        let recv_task = spawn_receiver(ctx.clone(), reader, 0);
+        let writer = Arc::new(Mutex::new(Some(writer)));
         spawn_keep_alive(Arc::downgrade(&writer), KEEP_ALIVE_EVERY);
-
         Ok(Arc::new(Self {
             writer,
-            final_text,
             recv_task: Mutex::new(Some(recv_task)),
-            stop_requested,
-            injection,
-            activity,
+            ctx,
+            endpoint,
         }))
     }
 
     pub(crate) fn activity(&self) -> &AtomicU64 {
-        &self.activity
+        &self.ctx.activity
     }
 
-    /// Convert f32 samples (assumed 16kHz mono) to PCM16 LE bytes and send over the WS.
+    /// Convert f32 samples (assumed 16kHz mono) to PCM16 LE bytes and send over
+    /// the WS. A dropped connection is reopened here, before the error would
+    /// reach the user; only a connection that cannot be reopened fails.
     pub async fn send_audio_pcm16(&self, samples: &[f32]) -> Result<(), String> {
-        let mut bytes = Vec::with_capacity(samples.len() * 2);
-        for &s in samples {
-            let clamped = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
-            bytes.extend_from_slice(&clamped.to_le_bytes());
+        let pcm = to_pcm16(samples);
+        self.ctx.unacked().push(&pcm);
+        if self.ctx.dead.load(Ordering::SeqCst) {
+            // Resends everything unacknowledged, this chunk included.
+            return self.reconnect().await;
         }
+        let sent = {
+            let mut guard = self.writer.lock().await;
+            let Some(writer) = guard.as_mut() else {
+                return Ok(());
+            };
+            writer.send(Message::Binary(pcm_bytes(&pcm).into())).await.is_ok()
+        };
+        if sent {
+            self.ctx.activity.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        } else {
+            self.reconnect().await
+        }
+    }
 
-        let mut guard = self.writer.lock().await;
-        if let Some(writer) = guard.as_mut() {
-            writer
-                .send(Message::Binary(bytes.into()))
-                .await
-                .map_err(|e| map_ws_error(&e))?;
-            self.activity.fetch_add(1, Ordering::SeqCst);
+    async fn reconnect(&self) -> Result<(), String> {
+        let mut receiver = self.recv_task.lock().await;
+        self.reconnect_locked(&mut receiver).await
+    }
+
+    /// Lock order is receiver, then writer, the same as `stop`. Holding the
+    /// writer for the whole swap keeps KeepAlive and audio off the old socket.
+    async fn reconnect_locked(
+        &self,
+        receiver: &mut Option<JoinHandle<Result<(), String>>>,
+    ) -> Result<(), String> {
+        let mut writer = self.writer.lock().await;
+        if writer.is_none() {
+            return Ok(());
         }
-        Ok(())
+        if self.ctx.failed_reconnects.fetch_add(1, Ordering::SeqCst) >= MAX_RECONNECTS {
+            return Err(RECONNECT_FAILED.into());
+        }
+        // Let the old receiver commit what it already has; a dead socket ends
+        // it at once, a half-open one is cut after a moment.
+        if let Some(mut old) = receiver.take() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut old).await.is_err() {
+                old.abort();
+                let _ = old.await;
+            }
+        }
+        let mut last_error = String::new();
+        for attempt in 0..CONNECT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(attempt)).await;
+            }
+            let ws = match tokio::time::timeout(CONNECT_TIMEOUT, open(&self.endpoint)).await {
+                Ok(Ok(ws)) => ws,
+                Ok(Err(e)) => {
+                    last_error = e;
+                    continue;
+                }
+                Err(_) => {
+                    last_error = "timeout".into();
+                    continue;
+                }
+            };
+            let (mut new_writer, reader) = ws.split();
+            let (base, pending) = {
+                let unacked = self.ctx.unacked();
+                (unacked.start, unacked.samples.iter().copied().collect::<Vec<i16>>())
+            };
+            let mut resent = true;
+            for chunk in pending.chunks(16_000) {
+                if new_writer
+                    .send(Message::Binary(pcm_bytes(chunk).into()))
+                    .await
+                    .is_err()
+                {
+                    resent = false;
+                    break;
+                }
+            }
+            if !resent {
+                last_error = "resend failed".into();
+                continue;
+            }
+            // Cleared before the new receiver exists, so its own drop sticks.
+            self.ctx.dead.store(false, Ordering::SeqCst);
+            *receiver = Some(spawn_receiver(self.ctx.clone(), reader, base));
+            *writer = Some(new_writer);
+            self.ctx.activity.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
+        Err(format!("{RECONNECT_FAILED} ({last_error})"))
     }
 
     /// Ask Deepgram to flush and let the SERVER close the WebSocket afterwards.
@@ -313,10 +494,17 @@ impl StreamingSession {
     async fn stop_with_limits(&self, limits: WaitLimits) -> StreamingStop {
         // Holding this guard also serializes concurrent stop requests.
         let mut receiver = self.recv_task.lock().await;
-        self.stop_requested.store(true, Ordering::SeqCst);
+        let mut reconnect_warning = None;
+        // Dropped while the user was quiet or right before stop: words not yet
+        // transcribed are still in the buffer, so reopen and resend them.
+        if self.ctx.dead.load(Ordering::SeqCst) && !self.ctx.unacked().samples.is_empty() {
+            reconnect_warning = self.reconnect_locked(&mut receiver).await.err();
+        }
+        self.ctx.stopping.store(true, Ordering::SeqCst);
+        let dead = self.ctx.dead.load(Ordering::SeqCst);
         let close_result = tokio::time::timeout(limits.idle, async {
             let mut guard = self.writer.lock().await;
-            if let Some(mut writer) = guard.take() {
+            if let Some(mut writer) = guard.take().filter(|_| !dead) {
                 writer
                     .send(Message::Text(
                         r#"{"type":"CloseStream"}"#.to_string().into(),
@@ -329,18 +517,18 @@ impl StreamingSession {
             Ok::<(), String>(())
         })
         .await;
-        let mut warning = match close_result {
+        let mut warning = reconnect_warning.or(match close_result {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e),
             Err(_) => Some("בקשת סיום ההכתבה התעכבה; ייתכן שחסר סוף התמלול.".into()),
-        };
+        });
         if let Some(task) = receiver.take() {
-            if let Err(error) = finish_task(task, &self.activity, limits, RECEIVE_TIMEOUT).await {
+            if let Err(error) = finish_task(task, &self.ctx.activity, limits, RECEIVE_TIMEOUT).await {
                 warning.get_or_insert(error);
             }
         }
-        self.injection.close_and_drain().await;
-        let text = self.final_text.lock().await.clone();
+        self.ctx.injection.close_and_drain().await;
+        let text = self.ctx.final_text.lock().await.clone();
         StreamingStop {
             text: text.trim().to_string(),
             warning,
@@ -356,7 +544,8 @@ const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(4);
 
 /// Weak, so a session that is dropped without `stop` does not stay alive.
 /// Stops by itself once `stop` takes the writer, before CloseStream goes out
-/// on the same lock, so no KeepAlive can follow it.
+/// on the same lock, so no KeepAlive can follow it. A failed send does not
+/// stop it: a reconnect puts a new socket into the same slot.
 fn spawn_keep_alive(writer: std::sync::Weak<Mutex<Option<WsWriter>>>, every: Duration) {
     tokio::spawn(async move {
         loop {
@@ -364,26 +553,21 @@ fn spawn_keep_alive(writer: std::sync::Weak<Mutex<Option<WsWriter>>>, every: Dur
             let Some(writer) = writer.upgrade() else { return };
             let mut guard = writer.lock().await;
             let Some(w) = guard.as_mut() else { return };
-            if w
+            let _ = w
                 .send(Message::Text(r#"{"type":"KeepAlive"}"#.to_string().into()))
-                .await
-                .is_err()
-            {
-                return;
-            }
+                .await;
         }
     });
 }
 
-async fn handle_message(
-    raw: &str,
-    final_text: &Arc<Mutex<String>>,
-    app: &AppHandle,
-    inject_err_reported: &InjectErrReported,
-    language_switch_enabled: bool,
-    live_injection: bool,
-    injection: &Arc<SessionInjection>,
-) {
+async fn handle_message(raw: &str, ctx: &ReceiveContext) {
+    let final_text = &ctx.final_text;
+    let inject_err_reported = &ctx.inject_err_reported;
+    let injection = &ctx.injection;
+    // None only in tests: no window to type into or notify, the text is kept.
+    let app = ctx.app.as_ref();
+    let language_switch_enabled = ctx.language_switch_enabled;
+    let live_injection = ctx.live_injection;
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
         return;
     };
@@ -418,7 +602,9 @@ async fn handle_message(
             // to swap this connection for one in the new language (a WS
             // connection's language is fixed at open time); the microphone and
             // the dictation itself keep running.
-            let _ = app.emit("language-switch-requested", target_lang);
+            if let Some(app) = app {
+                let _ = app.emit("language-switch-requested", target_lang);
+            }
             return;
         }
     }
@@ -434,6 +620,8 @@ async fn handle_message(
             acc.push_str(transcript);
         }
     }
+
+    let Some(app) = app else { return };
 
     if is_final && live_injection {
         // Inject this segment into the active text field immediately so the user
@@ -507,42 +695,154 @@ mod tests {
             let (socket, _) = listener.accept().await.unwrap();
             tokio_tungstenite::accept_async(socket).await.unwrap()
         });
-        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        let session = StreamingSession::open_session(endpoint(address), None, false, false)
             .await
             .unwrap();
-        let server = accept.await.unwrap();
-        let (writer, mut reader) = client.split();
-        let final_text = Arc::new(Mutex::new(String::new()));
-        let received = final_text.clone();
-        let receiver = tokio::spawn(async move {
-            while let Some(message) = reader.next().await {
-                match message.map_err(|e| e.to_string())? {
-                    Message::Text(raw) => {
-                        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-                        if let Some(text) = json
-                            .pointer("/channel/alternatives/0/transcript")
-                            .and_then(|v| v.as_str())
-                        {
-                            received.lock().await.push_str(text);
-                        }
+        (session, accept.await.unwrap())
+    }
+
+    fn endpoint(address: std::net::SocketAddr) -> Endpoint {
+        Endpoint {
+            url: format!("ws://{address}"),
+            auth: None,
+        }
+    }
+
+    fn final_msg(text: &str, start: f64, duration: f64) -> Message {
+        Message::Text(
+            format!(
+                r#"{{"is_final":true,"start":{start},"duration":{duration},"channel":{{"alternatives":[{{"transcript":"{text}"}}]}}}}"#
+            )
+            .into(),
+        )
+    }
+
+    async fn wait_until_dead(session: &StreamingSession) {
+        for _ in 0..200 {
+            if session.ctx.dead.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the dropped connection was never noticed");
+    }
+
+    /// The 2026-11-03 "os error 10054" case: the service drops the socket in
+    /// the middle. The dictation goes on, and audio not yet transcribed is
+    /// sent again on the new connection, so no word is lost.
+    #[tokio::test]
+    async fn dropped_connection_reconnects_and_resends_untranscribed_audio() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let service = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut first = tokio_tungstenite::accept_async(socket).await.unwrap();
+            // One second of audio, transcribed; then 100 samples, then a drop.
+            let mut got = 0;
+            while got < 16_100 * 2 {
+                if let Message::Binary(b) = first.next().await.unwrap().unwrap() {
+                    got += b.len();
+                    if got == 16_000 * 2 {
+                        first.send(final_msg("לפני", 0.0, 1.0)).await.unwrap();
                     }
-                    Message::Close(_) => break,
-                    _ => {}
                 }
             }
-            Ok(())
+            drop(first);
+            let _ = first_tx.send(());
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut second = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let resent = loop {
+                if let Message::Binary(b) = second.next().await.unwrap().unwrap() {
+                    break b.len();
+                }
+            };
+            second.send(final_msg("אחרי", 0.0, 0.01)).await.unwrap();
+            loop {
+                if second.next().await.unwrap().unwrap()
+                    == Message::Text(r#"{"type":"CloseStream"}"#.into())
+                {
+                    break;
+                }
+            }
+            second.close(None).await.unwrap();
+            resent
         });
-        (
-            Arc::new(StreamingSession {
-                writer: Arc::new(Mutex::new(Some(writer))),
-                final_text,
-                recv_task: Mutex::new(Some(receiver)),
-                stop_requested: Arc::new(AtomicBool::new(false)),
-                injection: Arc::new(SessionInjection::new()),
-                activity: Arc::new(AtomicU64::new(0)),
-            }),
-            server,
-        )
+        let session = StreamingSession::open_session(endpoint(address), None, false, false)
+            .await
+            .unwrap();
+        session.send_audio_pcm16(&[0.1; 16_000]).await.unwrap();
+        // Wait for the first final before sending more, as real speech would.
+        while session.ctx.unacked().start < 16_000 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        session.send_audio_pcm16(&[0.2; 100]).await.unwrap();
+        first_rx.await.unwrap();
+        wait_until_dead(&session).await;
+        session.send_audio_pcm16(&[0.3; 50]).await.unwrap();
+        let result = session.stop().await;
+        assert_eq!(service.await.unwrap(), 150 * 2, "exactly the untranscribed audio");
+        assert_eq!(result.text, "לפני אחרי");
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+    }
+
+    #[tokio::test]
+    async fn drop_with_everything_transcribed_stops_quietly() {
+        let (session, mut server) = local_session().await;
+        let service = tokio::spawn(async move {
+            let _ = server.next().await;
+            server.send(final_msg("הכל הגיע", 0.0, 0.01)).await.unwrap();
+            drop(server);
+        });
+        session.send_audio_pcm16(&[0.1; 160]).await.unwrap();
+        service.await.unwrap();
+        wait_until_dead(&session).await;
+        let result = session.stop().await;
+        assert_eq!(result.text, "הכל הגיע");
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+    }
+
+    #[tokio::test]
+    async fn a_service_that_keeps_dropping_gives_up_instead_of_looping() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(tokio_tungstenite::accept_async(socket).await);
+            }
+        });
+        let session = StreamingSession::open_session(endpoint(address), None, false, false)
+            .await
+            .unwrap();
+        let mut failure = None;
+        for _ in 0..200 {
+            if let Err(e) = session.send_audio_pcm16(&[0.1; 160]).await {
+                failure = Some(e);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        service.abort();
+        assert!(failure.unwrap().starts_with(RECONNECT_FAILED));
+    }
+
+    #[test]
+    fn unacked_audio_is_trimmed_by_finals_and_bounded() {
+        let mut u = Unacked::default();
+        u.push(&[1, 2, 3, 4]);
+        u.ack(3);
+        assert_eq!((u.start, u.samples.len()), (3, 1));
+        u.ack(99);
+        assert_eq!((u.start, u.samples.len()), (4, 0));
+        u.push(&vec![0; MAX_UNACKED_SAMPLES + 10]);
+        assert_eq!(u.samples.len(), MAX_UNACKED_SAMPLES);
+        assert_eq!(u.start, 14);
+        assert_eq!(
+            final_audio_end(r#"{"is_final":true,"start":1.5,"duration":0.5}"#),
+            Some(32_000)
+        );
+        assert_eq!(final_audio_end(r#"{"is_final":false,"start":1,"duration":1}"#), None);
     }
 
     #[tokio::test]
@@ -565,7 +865,7 @@ mod tests {
         service.await.unwrap();
         assert_eq!(result.text, "המילים האחרונות");
         assert!(result.warning.is_none(), "{:?}", result.warning);
-        assert!(!session.injection.enabled.load(Ordering::SeqCst));
+        assert!(!session.ctx.injection.enabled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -602,7 +902,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_shutdown_preserves_received_text_and_closes_injection() {
         let (session, mut server) = local_session().await;
-        *session.final_text.lock().await = "טקסט שכבר התקבל".into();
+        *session.ctx.final_text.lock().await = "טקסט שכבר התקבל".into();
         let service = tokio::spawn(async move {
             let _ = server.next().await;
             std::future::pending::<()>().await;
@@ -613,6 +913,7 @@ mod tests {
         assert!(result.warning.is_some());
         assert!(session.recv_task.lock().await.is_none());
         session
+            .ctx
             .injection
             .run(|| panic!("timed-out session must never inject again"));
         service.abort();
