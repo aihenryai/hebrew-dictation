@@ -103,7 +103,7 @@ const HUGS_LEFT: &[char] = &['.', ',', '?', '!', ':', ';', ')', '…', '\n'];
 /// what should be BOTH typed and accumulated into the transcript, so the screen,
 /// the history and the local API can never disagree about what was dictated.
 pub fn apply_spoken_punctuation(segment: &str, lang: &str) -> String {
-    if lang != "he" {
+    if !crate::api_transcribe::may_contain_hebrew(lang) {
         return segment.to_string();
     }
 

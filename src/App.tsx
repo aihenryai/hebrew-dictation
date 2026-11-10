@@ -113,7 +113,9 @@ interface BatchResult {
   isCallCloud?: boolean;
 }
 let batchIdCounter = 0;
-type Language = "he" | "en" | "multi";
+/** "auto" = Deepgram's multilingual model / Whisper auto-detect (default since
+ *  2.16.0). "multi" is a legacy stored value, treated as "auto". */
+type Language = "auto" | "he" | "en" | "multi";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
 type ApiProvider = "deepgram" | "groq";
 
@@ -594,7 +596,7 @@ function App() {
       .then((r) => setModelRecommendation(r as ModelRecommendation))
       .catch(() => { /* older backend: the full list still works */ });
   }, []);
-  const [language, setLanguage] = useState<Language>("he");
+  const [language, setLanguage] = useState<Language>("auto");
   const [vadEnabled, setVadEnabled] = useState(true);
   const [recordingTime, setRecordingTime] = useState(0);
   const [transcriptionMode, setTranscriptionMode] = useState<TranscriptionMode>("auto_fallback");
@@ -1057,7 +1059,9 @@ function App() {
       switchLanguage(event.payload as Language);
     });
     const unlistenLanguageToggle = listen<string>("language-toggle-pressed", () => {
-      switchLanguage(languageRef.current === "he" ? "en" : "he");
+      // Cycle automatic → Hebrew → English → automatic.
+      const cur = languageRef.current;
+      switchLanguage(cur === "he" ? "en" : cur === "en" ? "auto" : "he");
     });
     return () => {
       unlistenLanguageSwitch.then((fn) => fn());
@@ -1312,19 +1316,10 @@ function App() {
       // Default the batch panel toggle from the user's transcription mode.
       setBatchMode(settings.transcription_mode === "local" ? "local" : "cloud");
       setApiProvider(settings.api_provider);
-      // Defensive: legacy "auto" language is migrated to "he" by the backend,
-      // but if any code path slips through, normalize here too.
-      const lang = (settings.language === "auto" ? "he" : settings.language) as Language;
+      // The backend migrates a legacy "multi" (and the old "he" default) to
+      // "auto"; normalize here too so the buttons always show one active choice.
+      const lang = (settings.language === "multi" ? "auto" : settings.language) as Language;
       setLanguage(lang);
-      if (settings.language === "auto") {
-        // Was `persistSettings({ language: "he" })` — but persistSettings reads its
-        // object from React state, and at this point in initApp the state setters
-        // above haven't been applied yet (they're batched, not synchronous). That
-        // wrote factory defaults over every OTHER field the user had configured.
-        // persistLoadedSettings builds the full object from `settings` (what was
-        // actually just loaded) instead of from stale state.
-        persistLoadedSettings(settings, { language: "he" });
-      }
       setVadEnabled(settings.vad_enabled);
       // Keys are redacted — just track whether they exist on the backend.
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
@@ -1737,7 +1732,7 @@ function App() {
       try {
         const { text, segments } = await invoke<{ text: string; segments: TimedSegment[] }>(
           "transcribe_file",
-          { filePath: initial[i].filePath, opts: { mode: batchMode, language: "he", inject: false } }
+          { filePath: initial[i].filePath, opts: { mode: batchMode, language: languageRef.current, inject: false } }
         );
         setBatchResults((prev) =>
           prev.map((r) => r.id === curId ? { ...r, status: "done", transcript: text, segments } : r)
@@ -1845,11 +1840,11 @@ function App() {
       // segments). Mic/System/CallLocal → existing mono file path.
       const { text, segments } = isCallCloud
         ? await invoke<{ text: string; segments: TimedSegment[] }>("stop_call_recording", {
-            opts: { mode: batchMode, language: "he", inject: false },
+            opts: { mode: batchMode, language: languageRef.current, inject: false },
           })
         : await invoke<{ text: string; segments: TimedSegment[] }>(
             "transcribe_file",
-            { filePath, opts: { mode: fileMode, language: "he", inject: false } }
+            { filePath, opts: { mode: fileMode, language: languageRef.current, inject: false } }
           );
       setBatchResults((prev) => prev.map((r) => r.id === newId ? { ...r, status: "done", transcript: text, segments } : r));
     } catch (e) {
@@ -2136,7 +2131,7 @@ function App() {
     ? "מצב ״בלי אינטרנט״ פעיל, אבל עוד לא הותקן מודל. הורידו את המודל המומלץ, או עברו ל-API בהגדרות."
     : `חסר מפתח ${providerName}. הוסיפו אותו בהגדרות.`;
   useEffect(() => { setupProblemRef.current = setupProblem; }, [setupProblem]);
-  const langLabels: Record<Language, string> = { he: "עברית", en: "English", multi: "עברית + אנגלית" };
+  const langLabels: Record<Language, string> = { auto: "זיהוי אוטומטי", he: "עברית", en: "English", multi: "זיהוי אוטומטי" };
   const modeLabel = transcriptionMode === "api" ? "API" : transcriptionMode === "local" ? "מקומי" : "אוטומטי";
 
   // ---- ONBOARDING WIZARD ----
@@ -2764,7 +2759,7 @@ function App() {
         <div className="settings-section">
           <h3>שפה</h3>
           <div className="settings-row">
-            {(["he", "en", "multi"] as Language[]).map((lang) => (
+            {(["auto", "he", "en"] as Language[]).map((lang) => (
               <button
                 key={lang}
                 className={`btn-option ${language === lang ? "active" : ""}`}
@@ -2774,8 +2769,9 @@ function App() {
               </button>
             ))}
           </div>
+          <p className="settings-hint">בזיהוי אוטומטי כל משפט נכתב בשפה שבה נאמר: עברית, אנגלית ועוד עשרות שפות, גם כשמערבבים באותה פגישה.</p>
           {languageHotkey && (
-            <p className="settings-hint">לחיצה על <bdi>{formatHotkey(languageHotkey)}</bdi> מחליפה בין עברית לאנגלית, גם באמצע הכתבה.</p>
+            <p className="settings-hint">לחיצה על <bdi>{formatHotkey(languageHotkey)}</bdi> עוברת בין זיהוי אוטומטי, עברית ואנגלית, גם באמצע הכתבה.</p>
           )}
         </div>
 
@@ -4440,7 +4436,7 @@ export function ToolbarApp() {
   // start dictation). Backend emits `toolbar-mode` to switch between them.
   const [mode, setMode] = useState<"idle" | "recording">("recording");
   // Set by the main window when a dictation starts and on every switch.
-  const [dictationLanguage, setDictationLanguage] = useState("he");
+  const [dictationLanguage, setDictationLanguage] = useState("auto");
   const [vadState, setVadState] = useState<VadStatePayload>({
     state: "speaking",
     silent_secs: 0,
@@ -4674,7 +4670,7 @@ export function ToolbarApp() {
       <div className="toolbar-row-top">
         <span className="toolbar-dot" aria-hidden="true" />
         <span className="toolbar-lang" title="שפת ההכתבה">
-          {dictationLanguage === "en" ? "EN" : dictationLanguage === "multi" ? "רב" : "עב"}
+          {dictationLanguage === "en" ? "EN" : dictationLanguage === "he" ? "עב" : "אוטו"}
         </span>
         <div className="toolbar-meter" aria-hidden="true">
           <div className="toolbar-meter-fill" style={{ width: `${levelPct}%` }} />

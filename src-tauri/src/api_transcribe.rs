@@ -246,24 +246,28 @@ async fn transcribe_groq_inner(
 
 /// The language code that is safe to put in a Deepgram URL.
 ///
-/// **`"multi"` must never reach Deepgram from this app.** Nova-3's multilingual
-/// code-switching model covers English, Spanish, French, German, Hindi, Russian,
-/// Portuguese, Japanese, Italian and Dutch — **Hebrew is not in that list**
-/// (verified against Deepgram's Models & Languages docs, 2026-09-10). Hebrew
-/// exists on Nova-3 only as a monolingual model. Sending `language=multi` gets
-/// the request rejected, which surfaced to the user as the generic 400 message
-/// in `streaming.rs`.
+/// `"he"` and `"en"` pin one language. Everything else — `"auto"` (the default
+/// since 2.16.0), a legacy `"multi"`, or any other code — becomes `"multi"`,
+/// Nova-3's multilingual model, which picks the language per sentence.
 ///
-/// This used to be four separate `if language == "auto"` lines that each let
-/// `"multi"` through untouched, while a settings screen offered a
-/// "עברית + אנגלית" button that produced exactly that value. One function now
-/// owns the rule, so an old settings.json still carrying `"multi"` degrades to
-/// Hebrew instead of breaking every dictation.
+/// History: until 2.15.3 this mapped everything to `"he"`, because in 09.2026
+/// `multi` did not include Hebrew and was rejected. Measured live 2026-11-10
+/// with the app's own key: `multi` now transcribes Hebrew at the same quality as
+/// `he` (batch and streaming), and an English sentence inside a Hebrew file came
+/// out perfect — while `language=he` dropped that sentence entirely, which is
+/// how an English meeting produced an empty transcript. `detect_language=true`
+/// is NOT an option: it misread Hebrew as Portuguese in the same test.
 pub(crate) fn normalize_language(lang: &str) -> &str {
     match lang {
         "he" | "en" => lang,
-        _ => "he",
+        _ => "multi",
     }
+}
+
+/// True when the transcript may contain Hebrew, so the Hebrew-only fixes
+/// (day-name ordinals, spoken punctuation) should run.
+pub(crate) fn may_contain_hebrew(lang: &str) -> bool {
+    lang != "en"
 }
 
 /// `&dictation=true` for the languages Deepgram supports it on.
@@ -322,10 +326,9 @@ pub(crate) fn language_switch_keyterm_params(lang: &str, enabled: bool) -> Strin
 /// Deepgram docs: find terms must be lowercase; digits aren't cased, so no
 /// issue here. https://developers.deepgram.com/docs/find-and-replace
 pub(crate) fn day_ordinal_replace_params(lang: &str) -> String {
-    if lang != "he" {
-        // The bug is specific to Hebrew day-names; "multi" is never used for
-        // Hebrew in this app (see transcribe_deepgram_batch's doc comment), so
-        // "he" is the only language where this string can legitimately appear.
+    if !may_contain_hebrew(lang) {
+        // The bug is specific to Hebrew day-names, which can appear under
+        // "he" or "multi" (accepted by Deepgram with multi, tested 2026-11-10).
         return String::new();
     }
     const DAYS: [(&str, &str); 7] = [
@@ -413,8 +416,8 @@ async fn transcribe_deepgram_inner(
 /// Long-file Deepgram request for batch transcription. The caller supplies a
 /// client with a long (e.g. 900s) timeout; this fn does NOT set its own timeout.
 /// Uses paragraph formatting for readable long-meeting output, falling back to the
-/// flat transcript. `language` should be "he" — Deepgram nova-3 multilingual does
-/// NOT include Hebrew (spec §14.1-A), so never pass "multi" for Hebrew.
+/// flat transcript. `language` goes through `normalize_language`, so "auto"
+/// becomes Deepgram's multilingual model.
 pub(crate) async fn transcribe_deepgram_batch(
     client: &reqwest::Client,
     samples: &[f32],
@@ -512,9 +515,9 @@ pub(crate) fn parse_deepgram_words(alt: &serde_json::Value) -> Vec<crate::srt::T
 /// `multichannel=true` and deliberately WITHOUT `diarize`/`paragraphs`. Each
 /// channel is transcribed independently and the labeled text is assembled from
 /// the merged segments (`build_multichannel_result`), never from Deepgram's
-/// per-channel flat transcript. `auto` maps to Hebrew, matching the batch route.
+/// per-channel flat transcript. `auto` maps to multilingual, matching the batch route.
 fn multichannel_url(language: &str) -> String {
-    let lang = if language == "auto" { "he" } else { language };
+    let lang = normalize_language(language);
     format!(
         "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&multichannel=true{}",
         lang,
@@ -744,10 +747,10 @@ mod tests {
 
     #[test]
     fn multichannel_url_has_multichannel_but_no_diarize_or_paragraphs() {
-        // Same nova-3 base as the batch route, "auto" resolved to Hebrew…
+        // Same nova-3 base as the batch route, "auto" resolved to multilingual…
         let url = multichannel_url("auto");
         assert!(url.contains("model=nova-3"));
-        assert!(url.contains("language=he"));
+        assert!(url.contains("language=multi"));
         assert!(url.contains("smart_format=true"));
         assert!(url.contains("punctuate=true"));
         // …but Call mode is per-channel: multichannel ON, and NO diarize/paragraphs
@@ -767,10 +770,22 @@ mod tests {
     }
 
     #[test]
-    fn day_ordinal_replace_params_only_for_hebrew() {
+    fn day_ordinal_replace_params_only_where_hebrew_can_appear() {
         assert_eq!(day_ordinal_replace_params("en"), "");
-        assert_eq!(day_ordinal_replace_params("multi"), "");
-        assert_eq!(day_ordinal_replace_params("auto"), "");
+        assert!(!day_ordinal_replace_params("multi").is_empty());
+        assert!(!day_ordinal_replace_params("he").is_empty());
+    }
+
+    #[test]
+    fn auto_and_unknown_languages_go_multilingual() {
+        assert_eq!(normalize_language("auto"), "multi");
+        assert_eq!(normalize_language("multi"), "multi");
+        assert_eq!(normalize_language("fr"), "multi");
+        assert_eq!(normalize_language("he"), "he");
+        assert_eq!(normalize_language("en"), "en");
+        // Deepgram's spoken punctuation is English-only; it must not ride along
+        // with the multilingual model.
+        assert_eq!(dictation_params("multi"), "");
     }
 
     #[test]

@@ -1,5 +1,16 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-10 - v2.16.0: automatic language detection by default
+
+Henry recorded an English meeting in cloud mode and it came back nearly empty: the app was on "he", and Deepgram nova-3 `language=he` silently drops English speech.
+- **Measured live 10.11.2026:** nova-3 `language=multi` now includes Hebrew at the same quality as `he` (the old "multi has no Hebrew" note in older docs is out of date), and keeps English sentences that `he` deleted; streaming with multi works too (English tagged `[en]`). keyterm, replace and multichannel are accepted with multi. `detect_language=true` is unusable (Hebrew detected as Portuguese).
+- `api_transcribe::normalize_language`: "he" and "en" pass through, everything else (auto, multi, unknown) becomes "multi"; used by batch, multichannel (call mode) and `StreamingSession::start`. `may_contain_hebrew(lang)` (= not "en") gates the Hebrew day-ordinal replace params and spoken punctuation.
+- Default language is "auto" (settings, batch, lib.rs streaming/transcribe). One-time migration `settings::migrate_language_to_auto` (flag `language_auto_migrated`): old "he"/"multi" becomes "auto"; an explicit "en" stays. UI: buttons auto/he/en, the hotkey cycles auto, he, en; batch calls send the chosen language instead of a hard-coded "he".
+- Local whisper already handled "auto"; ivrit models still lock Hebrew. Groq in-app omits `language` on auto.
+- Same fix in the call recorder (`AI-Tools\call-recorder\callrec\transcribe.py`): Whisper detects per chunk (outside he/en is redone as he), Deepgram uses multi. Limit: a chunk mixing Hebrew and English on Groq Whisper turns the English into Hebrew-letter gibberish.
+- Not touched: `cloudflare-worker\src\deepgram-client.ts` (still `he`, not deployed).
+- Tests: Rust 232 passed, tsc clean.
+
 ## 2026-11-10 - v2.15.3: Mac recognition (streaming resampler, Whisper silence loops)
 
 Report from a Mac user (+972 54-433-0109, WhatsApp export in Henry's mail 09.11.2026): text now reaches the active window, but recognition is poor on both the local 1.6 GB model and Deepgram; history full of "תודה רבה. תודה רבה." and "אהההההה"; "records a few seconds and disappears".

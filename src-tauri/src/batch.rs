@@ -37,7 +37,7 @@ pub enum RecordingSource {
 }
 
 fn default_language() -> String {
-    "he".to_string()
+    "auto".to_string()
 }
 
 /// Sentinel error string for user cancellation. The frontend shows it as a calm

@@ -73,6 +73,9 @@ pub struct AppSettings {
     pub preferred_model: String,
     #[serde(default = "default_language")]
     pub language: String,
+    /// Set once `migrate_language_to_auto` has run (2.16.0).
+    #[serde(default)]
+    pub language_auto_migrated: bool,
     #[serde(default = "default_true")]
     pub vad_enabled: bool,
     #[serde(default)]
@@ -286,7 +289,23 @@ fn default_preferred_model() -> String {
 }
 
 fn default_language() -> String {
-    "he".to_string()
+    "auto".to_string()
+}
+
+/// 2.16.0: automatic language detection became the default. Until then "he"
+/// was the only sensible value (Deepgram's multilingual model lacked Hebrew),
+/// so a stored "he" was almost never a deliberate choice, and it is what made
+/// an English meeting come back empty. Move it — and a legacy "multi" — to
+/// "auto" once; a user who then picks Hebrew again keeps it, because the flag
+/// is saved with that choice.
+pub(crate) fn migrate_language_to_auto(settings: &mut AppSettings) {
+    if settings.language_auto_migrated {
+        return;
+    }
+    if settings.language == "he" || settings.language == "multi" {
+        settings.language = "auto".to_string();
+    }
+    settings.language_auto_migrated = true;
 }
 
 fn default_true() -> bool {
@@ -350,6 +369,7 @@ impl Default for AppSettings {
             groq_api_key: None,
             preferred_model: default_preferred_model(),
             language: default_language(),
+            language_auto_migrated: true,
             vad_enabled: true,
             onboarding_completed: false,
             terms_accepted: false,
@@ -456,11 +476,7 @@ pub fn load_settings() -> LoadResult {
         settings.terms_accepted = true;
     }
 
-    // Backward-compat: "auto" was an old language option that doesn't map to a
-    // valid Deepgram/Groq value. Migrate to "he" (Hebrew default).
-    if settings.language == "auto" {
-        settings.language = "he".to_string();
-    }
+    migrate_language_to_auto(&mut settings);
     migrate_language_hotkey(&mut settings);
 
     // 1) Load existing keys from keyring (works on fresh installs and post-migration).
@@ -616,6 +632,9 @@ impl AppSettings {
         incoming.narration_voice = self.narration_voice.clone();
         incoming.custom_dictionary = self.custom_dictionary.clone();
         incoming.debug_save_audio = self.debug_save_audio;
+        // Backend-only flag: without this a frontend save (field absent → false)
+        // would re-run the migration and turn a deliberate "he" back into "auto".
+        incoming.language_auto_migrated = true;
         incoming
     }
 }
@@ -684,6 +703,27 @@ mod merge_tests {
         let incoming = AppSettings::default(); // simulates a frontend payload that never carries this field
         let merged = current.merge_frontend_update(incoming);
         assert!(merged.debug_save_audio, "a settings-json-only field must survive a frontend save");
+    }
+
+    #[test]
+    fn old_hebrew_default_moves_to_auto_once() {
+        let mut s = AppSettings { language: "he".into(), language_auto_migrated: false, ..AppSettings::default() };
+        migrate_language_to_auto(&mut s);
+        assert_eq!(s.language, "auto");
+        assert!(s.language_auto_migrated);
+        // A user who then picks Hebrew keeps it, also across a frontend save.
+        s.language = "he".into();
+        let merged = s.merge_frontend_update(AppSettings { language: "he".into(), language_auto_migrated: false, ..AppSettings::default() });
+        let mut reloaded = merged;
+        migrate_language_to_auto(&mut reloaded);
+        assert_eq!(reloaded.language, "he");
+    }
+
+    #[test]
+    fn english_choice_survives_migration() {
+        let mut s = AppSettings { language: "en".into(), language_auto_migrated: false, ..AppSettings::default() };
+        migrate_language_to_auto(&mut s);
+        assert_eq!(s.language, "en");
     }
 
     /// The wizard's completion payload carries onboarding_completed:true while
