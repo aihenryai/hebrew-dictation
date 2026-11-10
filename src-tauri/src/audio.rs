@@ -243,6 +243,14 @@ impl AudioRecorder {
             let is_recording = is_recording_clone;
             let is_paused = is_paused_clone;
             let chunk_callback = chunk_callback_clone;
+            // One resampler for the whole capture, so the 16 kHz stream is
+            // continuous across callbacks. Resampling each callback on its own
+            // dropped the fractional remainder of every block: with CoreAudio's
+            // 512-frame blocks at 48 kHz that is 2 samples lost per block, a
+            // click ~94 times a second that wrecked recognition on Macs
+            // (WASAPI's 480-frame blocks divide by 3 exactly, so Windows never
+            // showed it).
+            let mut stream_resampler = StreamResampler::new(native_rate, 16000);
 
             let stream = match device.build_input_stream(
                 &config,
@@ -268,12 +276,10 @@ impl AudioRecorder {
                     let cb_opt = chunk_callback.lock().ok().and_then(|g| g.clone());
                     if let Some(cb) = cb_opt {
                         let mono = to_mono(data, native_channels);
-                        let resampled = if native_rate == 16000 {
-                            mono
-                        } else {
-                            resample(&mono, native_rate, 16000)
-                        };
-                        cb(&resampled);
+                        let resampled = stream_resampler.process(&mono);
+                        if !resampled.is_empty() {
+                            cb(&resampled);
+                        }
                     }
                 },
                 move |err| {
@@ -405,9 +411,10 @@ impl AudioRecorder {
                             continue;
                         }
                         let start = total.saturating_sub(samples_per_check);
-                        // For multi-channel mics, many channels are silent — compute RMS on
-                        // channel 0 only (stride by `channels`) to avoid diluting the signal.
-                        let rms = calculate_rms_strided(&samples_guard[start..], channels as usize);
+                        // Multi-channel mics often carry the voice on one channel
+                        // only, and not always channel 0 — use the loudest one so
+                        // silent channels neither dilute nor hide the signal.
+                        let rms = rms_loudest_channel(&samples_guard[start..], channels as usize);
                         (total, rms)
                     } else {
                         continue;
@@ -587,24 +594,140 @@ pub(crate) fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
         .collect()
 }
 
-/// RMS over a single channel of an interleaved audio buffer.
-/// `stride` is the device channel count — 1 for mono, 4 for an array mic, etc.
-/// We sample only channel 0 to avoid silent channels diluting the signal.
-fn calculate_rms_strided(samples: &[f32], stride: usize) -> f32 {
-    if samples.is_empty() {
+/// RMS of the loudest channel of an interleaved buffer. `channels` is the device
+/// channel count (1 for mono, 4 for an array mic...). Each channel is measured on
+/// its own and the loudest wins, so silent channels never dilute the level and a
+/// device that carries the voice on channel 1+ still registers speech.
+fn rms_loudest_channel(samples: &[f32], channels: usize) -> f32 {
+    let ch = channels.max(1);
+    if samples.len() < ch {
         return 0.0;
     }
-    let stride = stride.max(1);
-    let mut sum_sq: f32 = 0.0;
-    let mut count: usize = 0;
-    for &s in samples.iter().step_by(stride) {
-        sum_sq += s * s;
-        count += 1;
+    let mut sums = vec![0.0f32; ch];
+    for frame in samples.chunks_exact(ch) {
+        for (i, &s) in frame.iter().enumerate() {
+            sums[i] += s * s;
+        }
     }
-    if count == 0 {
-        return 0.0;
+    let frames = (samples.len() / ch) as f32;
+    sums.into_iter()
+        .map(|sq| (sq / frames).sqrt())
+        .fold(0.0, f32::max)
+}
+
+/// Continuous sample-rate converter for a live capture. Keeps the fractional read
+/// position and the unread input between calls, so feeding it audio in blocks of
+/// any size yields the same stream as converting the whole recording at once - no
+/// samples dropped at block edges. Downsampling averages each output's input span
+/// (a box low-pass) so 8-24 kHz content doesn't alias into the speech band.
+pub(crate) struct StreamResampler {
+    ratio: f64,
+    /// Input not yet fully used; `pending[0]` is absolute input sample `base`.
+    pending: Vec<f32>,
+    base: u64,
+    /// Index of the next output sample. Its input position is always computed
+    /// from scratch as `next_out * ratio`, so block sizes can't shift rounding.
+    next_out: u64,
+}
+
+impl StreamResampler {
+    pub(crate) fn new(from_rate: u32, to_rate: u32) -> Self {
+        let ratio = if from_rate == 0 || to_rate == 0 {
+            1.0
+        } else {
+            from_rate as f64 / to_rate as f64
+        };
+        Self { ratio, pending: Vec::new(), base: 0, next_out: 0 }
     }
-    (sum_sq / count as f32).sqrt()
+
+    pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if (self.ratio - 1.0).abs() < f64::EPSILON {
+            return input.to_vec();
+        }
+        self.pending.extend_from_slice(input);
+        let mut out = Vec::with_capacity((input.len() as f64 / self.ratio) as usize + 1);
+        let end_abs = self.base + self.pending.len() as u64;
+        loop {
+            let pos = self.next_out as f64 * self.ratio;
+            let idx = pos as u64;
+            if self.ratio > 1.0 {
+                let stop = (((self.next_out + 1) as f64 * self.ratio) as u64).max(idx + 1);
+                if stop > end_abs {
+                    break;
+                }
+                let span = &self.pending[(idx - self.base) as usize..(stop - self.base) as usize];
+                out.push(span.iter().sum::<f32>() / span.len() as f32);
+            } else {
+                if idx + 1 >= end_abs {
+                    break;
+                }
+                let frac = (pos - idx as f64) as f32;
+                let i = (idx - self.base) as usize;
+                out.push(self.pending[i] * (1.0 - frac) + self.pending[i + 1] * frac);
+            }
+            self.next_out += 1;
+        }
+        // Drop input that no future output can reach.
+        let first_needed = ((self.next_out as f64 * self.ratio) as u64).min(end_abs);
+        if first_needed > self.base {
+            self.pending.drain(..(first_needed - self.base) as usize);
+            self.base = first_needed;
+        }
+        out
+    }
+}
+
+/// Prepare a finished dictation for batch recognition (local Whisper or a cloud
+/// file API). Long silent stretches are shortened to a short pause, because
+/// Whisper fills silence with stock phrases ("תודה רבה. תודה רבה...") - the
+/// garbage a Mac user saw in his history. Quiet input (a Mac mic at a low input
+/// level) is then raised to a healthy peak. Returns the audio and an estimate of
+/// how many seconds of it are speech.
+pub fn prepare_for_asr(samples: &[f32]) -> (Vec<f32>, f32) {
+    const FRAME: usize = 320; // 20 ms at 16 kHz
+    const PAD_FRAMES: usize = 15; // 300 ms kept around speech
+    if samples.len() < FRAME * 10 {
+        return (samples.to_vec(), samples.len() as f32 / 16000.0);
+    }
+    let rms: Vec<f32> = samples
+        .chunks(FRAME)
+        .map(|f| (f.iter().map(|s| s * s).sum::<f32>() / f.len() as f32).sqrt())
+        .collect();
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p90 = sorted[(sorted.len() * 9 / 10).min(sorted.len() - 1)];
+    let threshold = (p90 * 0.1).max(0.0015);
+    let speech: Vec<bool> = rms.iter().map(|&r| r > threshold).collect();
+    let speech_frames = speech.iter().filter(|&&s| s).count();
+    let speech_secs = speech_frames as f32 * FRAME as f32 / 16000.0;
+    if speech_frames == 0 {
+        return (samples.to_vec(), 0.0);
+    }
+
+    // Keep every frame within PAD_FRAMES of speech, so a long silent run shrinks
+    // to a ~600 ms pause: words stay apart but nothing is left to fill.
+    let n = speech.len();
+    let mut keep = vec![false; n];
+    for (i, &s) in speech.iter().enumerate() {
+        if s {
+            let a = i.saturating_sub(PAD_FRAMES);
+            let b = (i + PAD_FRAMES + 1).min(n);
+            keep[a..b].iter_mut().for_each(|k| *k = true);
+        }
+    }
+    let mut out = Vec::with_capacity(samples.len());
+    for (i, frame) in samples.chunks(FRAME).enumerate() {
+        if keep[i] {
+            out.extend_from_slice(frame);
+        }
+    }
+
+    let peak = peak_amplitude(&out);
+    if peak > 0.0 && peak < 0.5 {
+        let gain = (0.7 / peak).min(10.0);
+        out.iter_mut().for_each(|s| *s *= gain);
+    }
+    (out, speech_secs)
 }
 
 /// Peak absolute amplitude of the buffer (0.0..~1.0).
@@ -650,28 +773,110 @@ mod silence_helper_tests {
 }
 
 pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if from_rate == to_rate || from_rate == 0 || samples.is_empty() {
+    if from_rate == to_rate || from_rate == 0 || to_rate == 0 || samples.is_empty() {
         return samples.to_vec();
     }
-
     let ratio = from_rate as f64 / to_rate as f64;
     let output_len = (samples.len() as f64 / ratio) as usize;
-    let mut output = Vec::with_capacity(output_len);
+    let mut output = StreamResampler::new(from_rate, to_rate).process(samples);
+    // Upsampling stops one short of the end (it needs a next sample); hold the
+    // last value so the length matches the whole-buffer expectation.
+    let last = *samples.last().unwrap_or(&0.0);
+    output.resize(output_len, last);
+    output
+}
 
-    for i in 0..output_len {
-        let src_idx = i as f64 * ratio;
-        let idx = src_idx as usize;
-        let frac = (src_idx - idx as f64) as f32;
+#[cfg(test)]
+mod resampler_tests {
+    use super::*;
 
-        let sample = if idx + 1 < samples.len() {
-            samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
-        } else {
-            samples[idx.min(samples.len() - 1)]
-        };
-        output.push(sample);
+    fn tone(rate: u32, secs: f32, hz: f32) -> Vec<f32> {
+        (0..(rate as f32 * secs) as usize)
+            .map(|i| (i as f32 * hz * std::f32::consts::TAU / rate as f32).sin() * 0.5)
+            .collect()
     }
 
-    output
+    #[test]
+    fn coreaudio_sized_blocks_lose_no_samples() {
+        // The Mac bug: 512-frame blocks at 48 kHz and 44.1 kHz.
+        for &rate in &[48000u32, 44100, 24000] {
+            let input = tone(rate, 3.0, 220.0);
+            let mut rs = StreamResampler::new(rate, 16000);
+            let mut streamed = Vec::new();
+            for block in input.chunks(512) {
+                streamed.extend(rs.process(block));
+            }
+            let expected = (input.len() as f64 * 16000.0 / rate as f64) as usize;
+            assert!(
+                (streamed.len() as i64 - expected as i64).abs() <= 1,
+                "rate {rate}: got {} samples, expected {expected}",
+                streamed.len()
+            );
+            // Same stream as converting the recording in one go.
+            let whole = StreamResampler::new(rate, 16000).process(&input);
+            let n = streamed.len().min(whole.len());
+            let max_diff = streamed[..n]
+                .iter()
+                .zip(&whole[..n])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(max_diff < 1e-5, "rate {rate}: block edges changed the audio ({max_diff})");
+        }
+    }
+
+    #[test]
+    fn streamed_tone_has_no_block_edge_clicks() {
+        // A smooth 220 Hz tone must stay smooth: no jump between neighbours
+        // larger than the tone's own slope allows.
+        let input = tone(48000, 2.0, 220.0);
+        let mut rs = StreamResampler::new(48000, 16000);
+        let mut out = Vec::new();
+        for block in input.chunks(512) {
+            out.extend(rs.process(block));
+        }
+        let max_step = 0.5 * 220.0 * std::f32::consts::TAU / 16000.0;
+        let worst = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        assert!(worst <= max_step * 1.1, "click of {worst} (limit {max_step})");
+    }
+
+    #[test]
+    fn upsampling_8k_streams_continuously() {
+        let input = tone(8000, 1.0, 200.0);
+        let mut rs = StreamResampler::new(8000, 16000);
+        let mut out = Vec::new();
+        for block in input.chunks(100) {
+            out.extend(rs.process(block));
+        }
+        assert!((out.len() as i64 - 16000).abs() <= 2, "got {}", out.len());
+    }
+
+    #[test]
+    fn loudest_channel_wins() {
+        // Voice on channel 1 of a stereo device, channel 0 silent.
+        let buf: Vec<f32> = (0..2000).flat_map(|i| [0.0, if i % 2 == 0 { 0.1 } else { -0.1 }]).collect();
+        assert!((rms_loudest_channel(&buf, 2) - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn prepare_shrinks_long_silence_and_raises_quiet_speech() {
+        // 1 s quiet "speech", 5 s silence, 1 s quiet speech.
+        let mut s = tone(16000, 1.0, 300.0).iter().map(|x| x * 0.05).collect::<Vec<_>>();
+        s.extend(vec![0.0; 16000 * 5]);
+        s.extend(tone(16000, 1.0, 300.0).iter().map(|x| x * 0.05));
+        let (out, speech_secs) = prepare_for_asr(&s);
+        assert!(out.len() < 16000 * 3, "silence not shortened: {} samples", out.len());
+        assert!(out.len() > 16000 * 2, "speech cut: {} samples", out.len());
+        assert!((1.8..=2.2).contains(&speech_secs), "speech_secs {speech_secs}");
+        // Peak 0.025 raised by the 10x cap.
+        assert!(peak_amplitude(&out) > 0.2, "quiet speech not raised");
+    }
+
+    #[test]
+    fn prepare_reports_no_speech_for_noise_floor_only() {
+        let s = vec![0.0005f32; 16000 * 3];
+        let (_out, speech_secs) = prepare_for_asr(&s);
+        assert_eq!(speech_secs, 0.0);
+    }
 }
 
 /// Interleave a mono mic buffer and a mono system buffer into a stereo (2-channel)

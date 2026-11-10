@@ -9,6 +9,7 @@ mod hebrew;
 mod injector;
 #[cfg(windows)]
 mod floating_window;
+mod hallucination;
 mod lang_switch;
 mod local_api;
 mod model;
@@ -357,6 +358,10 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
             mic_permission_path()
         ));
     }
+    // Shorten long silences and lift a quiet mic before recognition: Whisper
+    // fills silence with stock phrases, and a Mac mic at a low input level gave
+    // both engines a signal too weak to read.
+    let (samples, speech_secs) = audio::prepare_for_asr(&samples);
     let lang = language.unwrap_or_else(|| "he".to_string());
     let (mode, provider, api_key) = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
@@ -392,7 +397,7 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
             }
         }
     };
-    result.map(|t| dictionary::apply(&t))
+    result.map(|t| dictionary::apply(&hallucination::clean(&t, speech_secs)))
 }
 
 /// Smart Cleanup (רישוף חכם) — opt-in post-transcription enhancement via Groq.

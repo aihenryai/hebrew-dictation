@@ -105,6 +105,18 @@ impl WhisperEngine {
             params.set_translate(false);
             params.set_no_timestamps(true);
             params.set_single_segment(false);
+            // Guard against the loops Whisper falls into on silence or a weak
+            // signal ("תודה רבה. תודה רבה..."): skip windows it rates as no
+            // speech, never emit a blank-led segment, and when a window decodes
+            // as a repetitive / low-confidence loop, retry it at a higher
+            // temperature instead of keeping the loop (whisper.cpp defaults,
+            // which greedy decoding only applies when set explicitly here).
+            params.set_suppress_blank(true);
+            params.set_no_speech_thold(0.6);
+            params.set_temperature(0.0);
+            params.set_temperature_inc(0.2);
+            params.set_entropy_thold(2.4);
+            params.set_logprob_thold(-1.0);
             params.set_print_progress(false);
             params.set_print_realtime(false);
             params.set_print_special(false);

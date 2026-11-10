@@ -1,5 +1,13 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-10 - v2.15.3: Mac recognition (streaming resampler, Whisper silence loops)
+
+Report from a Mac user (+972 54-433-0109, WhatsApp export in Henry's mail 09.11.2026): text now reaches the active window, but recognition is poor on both the local 1.6 GB model and Deepgram; history full of "תודה רבה. תודה רבה." and "אהההההה"; "records a few seconds and disappears".
+- **Root cause 1 (cloud, Mac only):** the CPAL callback resampled each block on its own (`resample` per chunk), dropping the fractional remainder: CoreAudio 512-frame blocks at 48 kHz lose 2 samples per block = a click ~94x/s into Deepgram. WASAPI's 480-frame blocks divide by 3 exactly, so Windows never showed it. Fix: `audio::StreamResampler` (absolute output index, carries unread input, box low-pass when downsampling); batch `resample` uses the same code. Tests: `audio::resampler_tests`.
+- **Root cause 2 (local):** Whisper dictation params had no silence guards. Added suppress_blank, no_speech 0.6, temperature fallback (inc 0.2, entropy 2.4, logprob -1). New `hallucination::clean` (collapse back-to-back repeated sentences and 4+ stretched letters; drop stock phrases only when under 1 s of speech) and `audio::prepare_for_asr` (shrink silences to ~600 ms, gain up to 10x for a quiet mic) in the `transcribe` command.
+- VAD now uses the loudest channel (`rms_loudest_channel`) instead of channel 0.
+- **Not verified on a Mac.** "Records a few seconds and disappears" not reproduced; asked the user for version, Mac model, mic and whether a message shows.
+
 ## 2026-11-03 - v2.15.2: reconnect when Deepgram drops the stream
 
 Second photo from the other computer (still on 2.15.0): "WS send error: IO error: An
