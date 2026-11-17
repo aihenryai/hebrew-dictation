@@ -286,6 +286,7 @@ fn set_secondary_hotkey(
         .map(|s| (s.hotkey.clone(), s.pause_hotkey.clone(), s.language_hotkey.clone()))
         .unwrap_or_else(|_| ("alt+d".to_string(), None, None));
 
+    let (previous_pause, previous_language) = (current_pause.clone(), current_language.clone());
     let (pause, language) = match which {
         SecondaryHotkey::Pause => (normalized.clone(), current_language),
         SecondaryHotkey::Language => (current_pause, normalized.clone()),
@@ -308,10 +309,27 @@ fn set_secondary_hotkey(
     // A secondary failure comes back as Ok(Some(..)) — surface it to the UI and
     // do NOT persist, so the settings screen keeps showing the combo that is
     // actually bound.
+    // A failed attempt has already unregistered everything, so the set that
+    // worked before is bound again; otherwise the old combo stayed dead until
+    // the next launch while the settings screen still showed it.
+    let restore_previous = || {
+        let _ = reapply_all_shortcuts(
+            &app,
+            &toggle_combo,
+            previous_pause.as_deref(),
+            previous_language.as_deref(),
+        );
+    };
     match reapply_all_shortcuts(&app, &toggle_combo, pause.as_deref(), language.as_deref()) {
-        Ok(Some(w)) => return Err(w),
+        Ok(Some(w)) => {
+            restore_previous();
+            return Err(w);
+        }
         Ok(None) => {}
-        Err(e) => return Err(format!("רענון הקיצור הראשי נכשל: {}", e)),
+        Err(e) => {
+            restore_previous();
+            return Err(format!("רענון הקיצור הראשי נכשל: {}", e));
+        }
     }
 
     let mut s = state.settings.lock().map_err(|e| e.to_string())?;
@@ -372,32 +390,43 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
         )
     };
 
-    let result = match mode {
+    // The stock-phrase filter ("תודה רבה" over silence) is a Whisper problem.
+    // Deepgram does not invent those, and running the filter on its output
+    // silently deleted a real, short "תודה רבה".
+    let api_is_whisper = !matches!(provider, settings::ApiProvider::Deepgram);
+    let (result, from_whisper) = match mode {
         settings::TranscriptionMode::Api => {
             let key = api_key.ok_or("מפתח API לא מוגדר — הגדר אותו בהגדרות")?;
-            api_transcribe::transcribe_api(&provider, &samples, &key, &lang).await
+            (
+                api_transcribe::transcribe_api(&provider, &samples, &key, &lang).await,
+                api_is_whisper,
+            )
         }
-        settings::TranscriptionMode::Local => {
-            transcribe_local(&state, &samples, &lang)
-        }
+        settings::TranscriptionMode::Local => (transcribe_local(&state, &samples, &lang), true),
         settings::TranscriptionMode::AutoFallback => {
             // Try API first if key is configured, then fall back to local
             if let Some(key) = api_key {
                 match api_transcribe::transcribe_api(&provider, &samples, &key, &lang).await {
-                    Ok(text) => Ok(text),
+                    Ok(text) => (Ok(text), api_is_whisper),
                     Err(api_err) => {
                         eprintln!("API transcription failed, trying local: {}", api_err);
-                        transcribe_local(&state, &samples, &lang).map_err(|local_err| {
-                            format!("API: {} | מקומי: {}", api_err, local_err)
-                        })
+                        (
+                            transcribe_local(&state, &samples, &lang).map_err(|local_err| {
+                                format!("API: {} | מקומי: {}", api_err, local_err)
+                            }),
+                            true,
+                        )
                     }
                 }
             } else {
-                transcribe_local(&state, &samples, &lang)
+                (transcribe_local(&state, &samples, &lang), true)
             }
         }
     };
-    result.map(|t| dictionary::apply(&hallucination::clean(&t, speech_secs)))
+    result.map(|t| {
+        let t = if from_whisper { hallucination::clean(&t, speech_secs) } else { t };
+        dictionary::apply(&t)
+    })
 }
 
 /// Smart Cleanup (רישוף חכם) — opt-in post-transcription enhancement via Groq.
@@ -837,7 +866,7 @@ async fn stop_batch_recording_to_file(
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_millis();
     let tmp_path = std::env::temp_dir().join(format!("hd-recording-{}.wav", epoch));
     write_wav_16k_mono(&tmp_path, &samples)?;
     Ok(tmp_path.to_string_lossy().to_string())
@@ -1357,6 +1386,28 @@ async fn save_narration_wav(
     Err("קריינות זמינה רק ב-Windows כרגע".to_string())
 }
 
+/// Inside the system temp dir, with no ".." that could climb out of it.
+fn is_plain_temp_path(p: &std::path::Path) -> bool {
+    p.starts_with(std::env::temp_dir())
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+/// Recordings left in the temp dir by a run that closed or crashed before the
+/// transcript was ready (≈110 MB an hour, and a private conversation). Called
+/// once at launch, when no recording of this run can exist yet.
+fn remove_stale_temp_recordings() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("hd-recording-") && name.ends_with(".wav") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Delete a temporary recording WAV produced by `stop_batch_recording_to_file`
 /// (≈110 MB/hour). Hardened: only removes files inside the system temp dir whose
 /// name matches our `hd-recording-*.wav` pattern, so a bad/forged path can never
@@ -1364,7 +1415,8 @@ async fn save_narration_wav(
 #[tauri::command]
 fn delete_temp_recording(path: String) -> Result<(), String> {
     let p = std::path::PathBuf::from(&path);
-    let in_temp = p.starts_with(std::env::temp_dir());
+    // `starts_with` compares components as written, so "<temp>\..\..\x" passed.
+    let in_temp = is_plain_temp_path(&p);
     let name_ok = p
         .file_name()
         .and_then(|n| n.to_str())
@@ -1450,6 +1502,11 @@ async fn pick_audio_files(app: AppHandle, state: State<'_, AppState>) -> Result<
 /// is Deepgram-only.
 fn streaming_config(state: &AppState) -> Result<(String, bool), String> {
     let s = state.settings.lock().map_err(|e| e.to_string())?;
+    // The saved mode decides, not the window: a screen that showed "local"
+    // after a failed save, or a stale one, must not open a cloud connection.
+    if matches!(s.transcription_mode, settings::TranscriptionMode::Local) {
+        return Err("האפליקציה במצב מקומי, ולכן הכתבה סימולטנית דרך הענן כבויה. אפשר לעבור למצב ענן בהגדרות.".to_string());
+    }
     if !matches!(s.api_provider, settings::ApiProvider::Deepgram) {
         return Err("Streaming זמין רק עם Deepgram. עבור ל-Deepgram בהגדרות.".to_string());
     }
@@ -3092,6 +3149,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            std::thread::spawn(remove_stale_temp_recordings);
             // macOS: show the Accessibility grant dialog on first launch and
             // register the app in the Privacy & Security pane. Without this the
             // permission is undiscoverable (our pre-check in injector.rs returns

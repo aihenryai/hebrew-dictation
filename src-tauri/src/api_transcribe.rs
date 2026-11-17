@@ -270,6 +270,88 @@ pub(crate) fn may_contain_hebrew(lang: &str) -> bool {
     lang != "en"
 }
 
+/// Extra query parameters every Deepgram request carries.
+///
+/// `language_hint` (nova-3, only valid with `language=multi`): "multi" covers
+/// 55 languages, and an unclear Hebrew word came back as Persian in Arabic
+/// script, Spanish, Galician or Croatian (Henry, 2026-11-17: "משרבב מילים
+/// בערבית"). Measured on a real 5,141-word Hebrew meeting: 16 Spanish words
+/// without the hints, none with them. The hints bias, they do not restrict,
+/// so `streaming::foreign_script_only` stays as the safety net.
+///
+/// `mip_opt_out=true`: the audio is not kept for Deepgram's model training.
+pub(crate) fn deepgram_common_params(lang: &str) -> &'static str {
+    if lang == "multi" {
+        "&language_hint=he&language_hint=en&mip_opt_out=true"
+    } else {
+        "&mip_opt_out=true"
+    }
+}
+
+fn is_hebrew_or_english_tag(lang: &str) -> bool {
+    lang == "he" || lang == "en"
+}
+
+/// A letter no Hebrew or English word is written with (Arabic script, "č",
+/// "é"), or Spanish's inverted punctuation.
+pub(crate) fn is_auto_language(lang: &str) -> bool {
+    !is_hebrew_or_english_tag(lang)
+}
+
+pub(crate) fn has_foreign_letter(word: &str) -> bool {
+    word.chars().any(|c| {
+        c == '¿'
+            || c == '¡'
+            || (c.is_alphabetic() && !c.is_ascii() && !('\u{0590}'..='\u{05FF}').contains(&c))
+    })
+}
+
+/// Safety net behind `language_hint`, for the multilingual model only.
+/// Deepgram tags every word with the language it heard; a word tagged as
+/// neither Hebrew nor English is a mishearing ("اشرح", "¿Qué?", "Čomatoti?"
+/// all came out of Hebrew speech, 2026-11-17) and typing it is worse than
+/// leaving it out.
+///
+/// Returns the transcript without those words, or `None` when nothing was
+/// removed and the service's own transcript should be used as is. A foreign
+/// tag on a plain ASCII word ("Henry" heard as French) is kept unless the
+/// whole segment is foreign, so names are not lost.
+pub(crate) fn without_foreign_words(alt: &serde_json::Value) -> Option<String> {
+    let words = alt["words"].as_array()?;
+    let tag = |w: &serde_json::Value| w["language"].as_str().map(str::to_owned);
+    let tagged = words.iter().filter(|w| tag(w).is_some()).count();
+    if tagged == 0 {
+        return None;
+    }
+    let any_known = words
+        .iter()
+        .any(|w| tag(w).is_some_and(|l| is_hebrew_or_english_tag(&l)));
+    let text = |w: &serde_json::Value| {
+        w["punctuated_word"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| w["word"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut removed = false;
+    let kept: Vec<String> = words
+        .iter()
+        .filter_map(|w| {
+            let word = text(w);
+            let foreign = tag(w).is_some_and(|l| !is_hebrew_or_english_tag(&l));
+            if foreign && (!any_known || has_foreign_letter(&word)) {
+                removed = true;
+                None
+            } else {
+                Some(word)
+            }
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    removed.then(|| kept.join(" "))
+}
+
 /// `&dictation=true` for the languages Deepgram supports it on.
 ///
 /// Deepgram's own spoken-punctuation feature ("period" → "."). Per its docs it
@@ -376,8 +458,9 @@ async fn transcribe_deepgram_inner(
 
     let lang = normalize_language(language);
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}{}",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}{}{}",
         lang,
+        deepgram_common_params(lang),
         day_ordinal_replace_params(lang),
         dictation_params(lang),
         crate::dictionary::keyterm_params()
@@ -404,9 +487,10 @@ async fn transcribe_deepgram_inner(
         .await
         .map_err(|e| ApiError::Other(format!("Failed to parse Deepgram response: {}", e)))?;
 
-    let transcript = body["results"]["channels"][0]["alternatives"][0]["transcript"]
-        .as_str()
-        .unwrap_or("")
+    let alt = &body["results"]["channels"][0]["alternatives"][0];
+    let cleaned = if lang == "multi" { without_foreign_words(alt) } else { None };
+    let transcript = cleaned
+        .unwrap_or_else(|| alt["transcript"].as_str().unwrap_or("").to_string())
         .trim()
         .to_string();
 
@@ -430,8 +514,9 @@ pub(crate) async fn transcribe_deepgram_batch(
     // change the transcript text, so it's safe to send on every batch request
     // (single-speaker audio simply reports one speaker → no SRT label).
     let url = format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true{}{}",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&paragraphs=true&diarize=true{}{}{}",
         lang,
+        deepgram_common_params(lang),
         day_ordinal_replace_params(lang),
         crate::dictionary::keyterm_params()
     );
@@ -519,8 +604,9 @@ pub(crate) fn parse_deepgram_words(alt: &serde_json::Value) -> Vec<crate::srt::T
 fn multichannel_url(language: &str) -> String {
     let lang = normalize_language(language);
     format!(
-        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&multichannel=true{}",
+        "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true&multichannel=true{}{}",
         lang,
+        deepgram_common_params(lang),
         day_ordinal_replace_params(lang)
     )
 }
@@ -632,7 +718,16 @@ async fn transcribe_api_inner(
     let lang = validate_language(language).map_err(ApiError::Other)?;
     match provider {
         ApiProvider::Deepgram => transcribe_deepgram_inner(samples, api_key, lang).await,
-        ApiProvider::Groq => transcribe_groq_inner(samples, api_key, lang).await,
+        ApiProvider::Groq => {
+            let text = transcribe_groq_inner(samples, api_key, lang).await?;
+            // Whisper's own language detection reads unclear Hebrew as Arabic
+            // or another language. "auto" promises Hebrew or English, so a
+            // result in any other script is run again as Hebrew.
+            if is_auto_language(lang) && has_foreign_letter(&text) {
+                return transcribe_groq_inner(samples, api_key, "he").await;
+            }
+            Ok(text)
+        }
     }
 }
 
@@ -765,8 +860,57 @@ mod tests {
         // (the º-for-day-name bug is Hebrew-specific).
         assert_eq!(
             multichannel_url("en"),
-            "https://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true&punctuate=true&multichannel=true"
+            "https://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true&punctuate=true&multichannel=true&mip_opt_out=true"
         );
+        assert!(!multichannel_url("en").contains("language_hint"));
+        assert!(url.contains("&language_hint=he&language_hint=en"));
+    }
+
+    #[test]
+    fn language_hints_only_ride_with_the_multilingual_model() {
+        // Deepgram answers HTTP 400 to a hint on a single-language request.
+        assert_eq!(deepgram_common_params("he"), "&mip_opt_out=true");
+        assert_eq!(deepgram_common_params("en"), "&mip_opt_out=true");
+        assert!(deepgram_common_params("multi").contains("language_hint=he"));
+        assert!(deepgram_common_params("multi").contains("mip_opt_out=true"));
+    }
+
+    fn alt(words: &[(&str, Option<&str>)]) -> serde_json::Value {
+        let words: Vec<_> = words
+            .iter()
+            .map(|(w, l)| match l {
+                Some(l) => serde_json::json!({"word": w, "punctuated_word": w, "language": l}),
+                None => serde_json::json!({"word": w, "punctuated_word": w}),
+            })
+            .collect();
+        serde_json::json!({ "words": words })
+    }
+
+    #[test]
+    fn words_heard_as_a_third_language_are_dropped() {
+        // The real segments from the 2026-11-17 streaming test.
+        let persian = alt(&[("اشرح", Some("fa")), ("انخوامیل", Some("fa")), ("בסדר", Some("he"))]);
+        assert_eq!(without_foreign_words(&persian).as_deref(), Some("בסדר"));
+        let spanish = alt(&[("¿Qué?", Some("es"))]);
+        assert_eq!(without_foreign_words(&spanish).as_deref(), Some(""));
+        let croatian = alt(&[("Čomatoti?", Some("hr"))]);
+        assert_eq!(without_foreign_words(&croatian).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn hebrew_and_english_segments_are_left_untouched() {
+        let mixed = alt(&[("פתחתי", Some("he")), ("pull", Some("en")), ("request", Some("en"))]);
+        assert_eq!(without_foreign_words(&mixed), None);
+        // Locked "he"/"en" sessions carry no language tags at all.
+        let untagged = alt(&[("שלום", None), ("עולם", None)]);
+        assert_eq!(without_foreign_words(&untagged), None);
+        assert_eq!(without_foreign_words(&serde_json::json!({"transcript": "x"})), None);
+    }
+
+    #[test]
+    fn a_plain_name_with_a_foreign_tag_survives_inside_a_known_segment() {
+        let name = alt(&[("קוראים", Some("he")), ("לי", Some("he")), ("Henry", Some("fr"))]);
+        assert_eq!(without_foreign_words(&name), None);
     }
 
     #[test]

@@ -342,8 +342,9 @@ impl StreamingSession {
         // "auto" → Deepgram's multilingual model (see normalize_language).
         let language = crate::api_transcribe::normalize_language(language);
         let url = format!(
-            "wss://api.deepgram.com/v1/listen?model=nova-3&language={}&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&punctuate=true&interim_results=true{}{}",
+            "wss://api.deepgram.com/v1/listen?model=nova-3&language={}&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&punctuate=true&interim_results=true{}{}{}",
             language,
+            crate::api_transcribe::deepgram_common_params(language),
             crate::api_transcribe::day_ordinal_replace_params(language),
             crate::dictionary::keyterm_params()
         );
@@ -585,7 +586,13 @@ async fn handle_message(raw: &str, ctx: &ReceiveContext) {
     else {
         return;
     };
-    let transcript_owned = crate::dictionary::apply(transcript);
+    // Words the multilingual model heard as a third language are dropped (see
+    // `without_foreign_words`). Words are only tagged in "multi" sessions, so
+    // a session locked to Hebrew or English is left alone.
+    let cleaned = json
+        .pointer("/channel/alternatives/0")
+        .and_then(crate::api_transcribe::without_foreign_words);
+    let transcript_owned = crate::dictionary::apply(cleaned.as_deref().unwrap_or(transcript));
     let transcript = transcript_owned.as_str();
 
     let is_final = json

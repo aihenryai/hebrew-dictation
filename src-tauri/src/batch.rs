@@ -53,9 +53,10 @@ pub enum BatchRoute {
 }
 
 pub fn pick_batch_route(mode: &str) -> BatchRoute {
+    // Only an explicit "cloud" uploads; an unknown value stays on the machine.
     match mode {
-        "local" => BatchRoute::Local,
-        _ => BatchRoute::CloudDeepgram,
+        "cloud" => BatchRoute::CloudDeepgram,
+        _ => BatchRoute::Local,
     }
 }
 
@@ -106,8 +107,9 @@ mod tests {
     fn routes_local_and_cloud() {
         assert_eq!(pick_batch_route("local"), BatchRoute::Local);
         assert_eq!(pick_batch_route("cloud"), BatchRoute::CloudDeepgram);
-        // Unknown/empty mode defaults to cloud.
-        assert_eq!(pick_batch_route("whatever"), BatchRoute::CloudDeepgram);
+        // Unknown/empty mode never uploads.
+        assert_eq!(pick_batch_route("whatever"), BatchRoute::Local);
+        assert_eq!(pick_batch_route(""), BatchRoute::Local);
     }
 
     #[test]

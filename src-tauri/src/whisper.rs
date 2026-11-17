@@ -70,7 +70,20 @@ impl WhisperEngine {
         Ok(Self { ctx, model_name })
     }
 
+    /// Whisper's language detection reads unclear Hebrew as Arabic or another
+    /// language. "auto" promises Hebrew or English, so a result in any other
+    /// script is run again as Hebrew.
     pub fn transcribe(&self, samples: &[f32], language: &str) -> Result<String, String> {
+        let text = self.transcribe_once(samples, language)?;
+        if crate::api_transcribe::is_auto_language(language)
+            && crate::api_transcribe::has_foreign_letter(&text)
+        {
+            return self.transcribe_once(samples, "he");
+        }
+        Ok(text)
+    }
+
+    fn transcribe_once(&self, samples: &[f32], language: &str) -> Result<String, String> {
         let mut state = self
             .ctx
             .create_state()

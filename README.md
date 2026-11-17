@@ -102,15 +102,18 @@ A short fingerprint of where data goes — useful for security review or before 
 
 | What | Where it lives | When it leaves your machine |
 |------|----------------|-----------------------------|
-| **Audio recording** | RAM only (during Alt+D press) | Sent to the transcription provider you chose (Deepgram / Groq), then discarded. **In local Whisper mode — never leaves the machine.** |
-| **API key** (Deepgram / Groq) | `%APPDATA%/hebrew-dictation/settings.json` (local file) | Only sent to the matching provider as a Bearer token in transcription requests. **Never sent to BinTech or any other third party.** |
-| **Settings** (hotkey, provider choice, model) | Same `settings.json` | Never leaves the machine. |
-| **History** (last transcribed lines) | Same `settings.json`, capped at recent items | Never leaves the machine. |
-| **Update check** | Outbound HTTPS to `github.com/aihenryai/hebrew-dictation/releases/latest/download/latest.json` | One request at app start. Disable by blocking the host in your firewall. |
+| **Dictation audio** | RAM only, from the moment recording starts until it stops | Sent to the transcription provider you chose (Deepgram / Groq), with Deepgram's model-training opt-out set. **In local Whisper mode it never leaves the machine.** |
+| **Meeting and long recordings** | A temporary WAV file in the system temp folder while it is transcribed | Deleted once the transcript is ready, and any leftover is removed the next time the app starts. Sent to Deepgram only when the files screen is set to cloud. |
+| **API keys** (Deepgram / Groq) | The operating system's credential store (Windows Credential Manager / macOS Keychain) | Only sent to the matching provider with transcription requests. **Never sent to BinTech or any other third party.** A `DEEPGRAM_API_KEY` or `GROQ_API_KEY` environment variable, if present, is used as well. |
+| **Settings** (hotkey, provider choice, model) | `settings.json` in the app's data folder | Never leaves the machine. |
+| **History** (recent transcripts) | A local file in the app's data folder | Never leaves the machine. |
+| **Smart cleanup** (optional, off by default) | - | When turned on, the transcribed **text** is sent to Groq for rewriting, in local mode too. |
+| **Update check** | Outbound HTTPS to `github.com/aihenryai/hebrew-dictation/releases/latest/download/latest.json` | At app start and every few hours while it runs. Disable by blocking the host in your firewall. |
+| **Optional downloads** | Whisper models, and the narration engine if you install it | Downloaded once from their public hosts when you ask for them. |
 
-**No telemetry, no analytics, no crash reporting.** The app does not call home, does not log usage, and does not collect identifiers. The only outbound connections during normal operation are (1) the transcription provider you selected and (2) the GitHub update check above.
+**No telemetry, no analytics, no crash reporting.** The app does not call home, does not log usage, and does not collect identifiers.
 
-The microphone is engaged **only while Alt+D is held**. There is no always-on listening mode. You can verify this via the OS-level microphone indicator (Windows / macOS).
+The microphone is engaged **from the moment you start a recording until you stop it** (or, in hold-to-talk, while the keys are held). There is no always-on listening mode. A meeting recording keeps running when the window is closed to the tray, until you stop it. You can verify this via the OS-level microphone indicator (Windows / macOS).
 
 **Trademarks:** Deepgram and Groq are trademarks of their respective owners. The app supports those services via their public APIs but is not endorsed by, affiliated with, or sponsored by them.
 

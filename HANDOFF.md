@@ -1,5 +1,19 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-17 - v2.16.1: foreign words in auto mode, plus a security / privacy / bug audit
+
+Henry: since the language update the dictation "inserts words in Arabic and things like that".
+- **Cause, measured:** nova-3 `multi` covers 55 languages and there is no parameter that restricts it. A 10-minute real Hebrew recording, streamed: 15 words in Persian (Arabic script), Spanish, Galician, Croatian. With `language_hint=he&language_hint=en`: 4 words. Batch, a 5,141-word meeting: 16 Spanish words without hints, none with.
+- **Fix 1:** `api_transcribe::deepgram_common_params` adds the two hints on every `multi` request (batch, long batch, multichannel, streaming). A hint on a single-language request is HTTP 400, so it is `multi` only.
+- **Fix 2 (safety net, hints only bias):** `api_transcribe::without_foreign_words` reads each word's `language` tag and drops a word tagged neither `he` nor `en` when it has a non-Hebrew, non-ASCII letter, or when the whole segment is foreign. A plain ASCII name with a foreign tag inside a known segment stays. Used in `streaming::handle_message` and the short batch path. Long-file batch relies on the hints alone.
+- **Whisper and Groq on "auto":** a result with a letter outside Hebrew/ASCII is run again as `he` (`WhisperEngine::transcribe`, `transcribe_api`). ASCII-only Spanish is not caught.
+- `mip_opt_out=true` on every Deepgram request.
+- **Audit fixes:** files screen follows the dictation mode (`batchMode` effect) and an unknown batch mode routes local, not cloud; `streaming_config` refuses when the saved mode is local; `audio-stream-error` now stops the dictation and keeps the text (the bar used to stay on "recording"); `statusRef` set synchronously in stop/discard (double injection); language changed while the connection opens is applied after it opens; `recording-paused` event syncs the floating bar; a failed secondary-hotkey change re-registers the previous set; the stock-phrase filter runs only on Whisper output (it deleted a real "תודה רבה" from Deepgram); `delete_temp_recording` rejects `..`; temp recordings get a millisecond name and leftovers are removed at launch; README privacy section rewritten to match the code; hint next to Smart Cleanup in local mode.
+- **Correction to the 2.16.0 entry below:** spoken punctuation (`punctuation::apply_spoken_punctuation`), `lang_switch`, `leading_separator` and `language_switch_keyterm_params` are NOT wired into the live path; streaming uses its own exact-match `detect_language_switch` and sends no `dictation` param.
+- Tests: Rust 236 passed, tsc clean. Not released: the tag and the download page wait for Henry's go-ahead.
+- **Open, not done:** meeting recording ignores the one-hour cap and has no tray indicator when the window is closed; batch-transcribing the audio left after a dropped stream; `transcribe_file` accepts any path from the webview; narration installer runs `pip install` without hashes; microphone errors still in English; hold-to-talk counted twice in the local API.
+- **Henry's decisions:** release workflow pins actions by tag and signs with a key that has no password; macOS builds unsigned (needs a paid Developer ID); an env `DEEPGRAM_API_KEY` skips the wizard and uses the cloud; port 5758 is shared by narration and the call recorder on Henry's machine.
+
 ## 2026-11-10 - v2.16.0: automatic language detection by default
 
 Henry recorded an English meeting in cloud mode and it came back nearly empty: the app was on "he", and Deepgram nova-3 `language=he` silently drops English speech.

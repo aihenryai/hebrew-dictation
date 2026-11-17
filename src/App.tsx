@@ -739,6 +739,12 @@ function App() {
   const setupProblemRef = useRef("");
 
   useEffect(() => { statusRef.current = status; }, [status]);
+  // The files-and-meetings screen follows the dictation mode: switching to
+  // "local" must not leave that screen uploading to the cloud. Its own toggle
+  // still lets the user pick the other route for one job, on purpose.
+  useEffect(() => {
+    setBatchMode(transcriptionMode === "local" ? "local" : "cloud");
+  }, [transcriptionMode]);
   useEffect(() => { batchRecordingRef.current = batchRecording; }, [batchRecording]);
   useEffect(() => { vadEnabledRef.current = vadEnabled; }, [vadEnabled]);
   useEffect(() => { languageRef.current = language; }, [language]);
@@ -808,6 +814,10 @@ function App() {
   const stopAndTranscribe = useCallback(async (fromToolbar: boolean = false) => {
     if (statusRef.current !== "recording") return;
 
+    // The ref, now: two stops in the same tick (hotkey + auto-stop, or a
+    // dropped connection + a click) both passed the check above and typed the
+    // dictation twice.
+    statusRef.current = "transcribing";
     setStatus("transcribing");
     stopVadPolling();
     stopTimer();
@@ -897,11 +907,14 @@ function App() {
     setStatus("idle");
     setRecordingTime(0);
   }, [stopVadPolling, stopTimer, injectText, isStreamingSession]);
+  const stopAndTranscribeRef = useRef(stopAndTranscribe);
+  stopAndTranscribeRef.current = stopAndTranscribe;
 
   // Hold-to-talk turned out to be a Ctrl+Win+<key> Windows shortcut: stop and
   // throw away what was recorded (a fraction of a second of silence).
   const discardRecording = useCallback(async () => {
     if (statusRef.current !== "recording") return;
+    statusRef.current = "transcribing";
     setStatus("transcribing");
     stopVadPolling();
     stopTimer();
@@ -935,7 +948,14 @@ function App() {
       if (streamingSession) {
         setLivePreview("");
         liveFinalRef.current = "";
-        await invoke("start_streaming_transcription", { language: languageRef.current, liveInjection: !ptt });
+        const startLang = languageRef.current;
+        await invoke("start_streaming_transcription", { language: startLang, liveInjection: !ptt });
+        // The language key pressed while the connection was opening changed
+        // the bar but not the connection, which is fixed at open time.
+        if (languageRef.current !== startLang) {
+          await invoke("switch_streaming_language", { language: languageRef.current })
+            .catch((e) => console.error("switch_streaming_language failed:", e));
+        }
       } else {
         await invoke("start_recording");
       }
@@ -1016,6 +1036,8 @@ function App() {
         } else {
           await invoke("pause_recording");
         }
+        // The floating bar is a different window with its own pause state.
+        await emit("recording-paused", !isPausedNow).catch(() => {});
       } catch {
         /* state mismatch — ignore, the toolbar's own button is the fallback */
       }
@@ -1259,7 +1281,15 @@ function App() {
       );
     });
     const unlistenStreamError = listen<string>("audio-stream-error", (event) => {
-      setError(`ההקלטה נקטעה: ${event.payload}`);
+      // Stop for real: the bar used to keep showing "recording" over a dead
+      // microphone or connection, and everything said after that was lost.
+      // Stopping keeps the text that already arrived and frees the bar.
+      const wasRecording = statusRef.current === "recording";
+      const finish = wasRecording ? stopAndTranscribeRef.current() : Promise.resolve();
+      finish.finally(() => {
+        setError(`ההקלטה נקטעה: ${event.payload}. מה שנאמר עד הניתוק נשמר, אפשר להתחיל הקלטה חדשה.`);
+        if (audioFeedbackEnabledRef.current) playErrorTone();
+      });
     });
     // Streaming injects per final segment in the backend; when that fails
     // (e.g. missing macOS Accessibility permission) the backend emits this
@@ -3303,6 +3333,9 @@ function App() {
             <span className="toggle-text">נקה מילות מילוי, חזרות ופיסוק מהתמלול לפני ההזרקה (דרך Groq Llama)</span>
           </label>
           <p className="settings-hint">פועל אחרי שמסיימים לדבר (batch). כשההכתבה הסימולטנית דלוקה — הרישוף נעול, וההיפך.</p>
+          {transcriptionMode === "local" && (
+            <p className="settings-hint">שימו לב: במצב מקומי הקול נשאר במחשב, אבל כשהרישוף דלוק הטקסט המתומלל נשלח ל-Groq לעיבוד.</p>
+          )}
 
           {/* Dedicated Groq key for cleanup — works regardless of the transcription provider */}
           <p className="settings-hint">מפתח Groq לרישוף (עובד גם כשמתמללים ב-Deepgram או מקומי):</p>
@@ -4497,6 +4530,9 @@ export function ToolbarApp() {
     const unlistenLevel = listen<number>("audio-level", (event) => {
       setAudioLevel(event.payload);
     });
+    const unlistenPaused = listen<boolean>("recording-paused", (event) => {
+      setPaused(event.payload);
+    });
     const unlistenVad = listen<VadStatePayload>("vad-state", (event) => {
       setVadState(event.payload);
     });
@@ -4528,6 +4564,7 @@ export function ToolbarApp() {
       unlistenInterim.then((fn) => fn());
       unlistenReset.then((fn) => fn());
       unlistenLevel.then((fn) => fn());
+      unlistenPaused.then((fn) => fn());
       unlistenVad.then((fn) => fn());
       unlistenMode.then((fn) => fn());
       unlistenLanguage.then((fn) => fn());
