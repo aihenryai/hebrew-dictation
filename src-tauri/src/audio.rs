@@ -24,6 +24,31 @@ const DEFAULT_MAX_RECORDING_SECS: f32 = 60.0;
 /// RAM and keeps API costs bounded. 1 hour is more than any reasonable dictation.
 const MAX_RECORDING_CEILING_SECS: f32 = 3600.0;
 
+/// Shown when no input device exists at all (none plugged in, or all disabled).
+pub(crate) const MIC_NOT_FOUND: &str =
+    "לא נמצא מיקרופון. חברו מיקרופון או בחרו אחר בהגדרות, ונסו שוב.";
+
+/// Hebrew text for a microphone that failed to open or start. `stage` is
+/// what we were doing; the original (English) driver text stays at the end in
+/// parentheses, so a support request still carries the real cause.
+pub(crate) fn mic_open_error(stage: &str, detail: &str) -> String {
+    format!(
+        "לא הצלחנו {} את המיקרופון. ודאו שהוא מחובר, שאף תוכנה אחרת לא תופסת אותו, ושלאפליקציה יש הרשאה: {}. ({})",
+        stage,
+        crate::mic_permission_path(),
+        detail
+    )
+}
+
+/// Hebrew text for a capture that broke mid-recording (cpal's error callback).
+/// Unplugging the device is by far the common case, so it gets its own words.
+pub(crate) fn mic_stream_error_text(err: &cpal::StreamError) -> String {
+    match err {
+        cpal::StreamError::DeviceNotAvailable => "המיקרופון נותק".to_string(),
+        other => format!("תקלה בהתקן השמע ({})", other),
+    }
+}
+
 /// Callback invoked from the CPAL audio thread with 16kHz mono f32 samples.
 /// Used by streaming mode to push chunks to a WebSocket writer.
 pub type ChunkCallback = Arc<dyn Fn(&[f32]) + Send + Sync + 'static>;
@@ -156,15 +181,15 @@ impl AudioRecorder {
                     devs.find(|d| d.name().ok().as_deref() == Some(name.as_str()))
                 })
                 .or_else(|| host.default_input_device())
-                .ok_or("No input device available")?,
+                .ok_or(MIC_NOT_FOUND)?,
             None => host
                 .default_input_device()
-                .ok_or("No input device available")?,
+                .ok_or(MIC_NOT_FOUND)?,
         };
 
         let default_config = device
             .default_input_config()
-            .map_err(|e| format!("No default input config: {}", e))?;
+            .map_err(|e| mic_open_error("לקרוא את הגדרות", &e.to_string()))?;
 
         let native_rate = default_config.sample_rate().0;
         let native_channels = default_config.channels();
@@ -228,7 +253,7 @@ impl AudioRecorder {
             let device = match device {
                 Some(d) => d,
                 None => {
-                    let _ = ready_tx.send(Err("No input device".to_string()));
+                    let _ = ready_tx.send(Err(MIC_NOT_FOUND.to_string()));
                     return;
                 }
             };
@@ -288,20 +313,20 @@ impl AudioRecorder {
                     // profile), which otherwise present as a silent dead mic.
                     eprintln!("Audio stream error: {}", err);
                     if let Some(app) = &err_app_handle {
-                        let _ = app.emit("audio-stream-error", err.to_string());
+                        let _ = app.emit("audio-stream-error", mic_stream_error_text(&err));
                     }
                 },
                 None,
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(format!("Failed to build input stream: {}", e)));
+                    let _ = ready_tx.send(Err(mic_open_error("לפתוח", &e.to_string())));
                     return;
                 }
             };
 
             if let Err(e) = stream.play() {
-                let _ = ready_tx.send(Err(format!("Failed to start stream: {}", e)));
+                let _ = ready_tx.send(Err(mic_open_error("להפעיל", &e.to_string())));
                 return;
             }
 
@@ -316,7 +341,7 @@ impl AudioRecorder {
         // Wait for the stream thread to confirm it started
         let result = ready_rx
             .recv()
-            .map_err(|_| "Stream thread exited before signaling".to_string())?;
+            .map_err(|_| mic_open_error("להפעיל", "stream thread exited before signaling"))?;
         result?;
 
         self.stream_stop_tx = Some(tx);

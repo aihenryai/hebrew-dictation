@@ -2161,6 +2161,11 @@ body:has(.toolbar-idle) #root {
   color: #cc6666;
   flex: 1;
 }
+.batch-record-notice {
+  flex-basis: 100%;
+  font-size: 0.8rem;
+  color: #d9a441;
+}
 .batch-record-controls {
   display: flex;
   gap: 0.5rem;

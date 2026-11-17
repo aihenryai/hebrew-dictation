@@ -153,7 +153,12 @@ impl SystemAudioRecorder {
                 *rec = false;
             }
             let _ = handle.join();
-            return Err(e);
+            // The WASAPI step names stay in parentheses for support; the user
+            // gets the cause they can act on, in Hebrew.
+            return Err(format!(
+                "לא הצלחנו להקליט את הקול של המחשב. ודאו שמחוברים רמקולים או אוזניות ושהם מוגדרים כהתקן ההשמעה. ({})",
+                e
+            ));
         }
 
         self.capture_thread = Some(handle);

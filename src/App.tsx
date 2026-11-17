@@ -673,6 +673,7 @@ function App() {
   const [batchFileTotal, setBatchFileTotal] = useState(0);
   const batchCancelledRef = useRef(false);
   const [batchRecording, setBatchRecording] = useState(false);
+  const [batchRecordNotice, setBatchRecordNotice] = useState("");
   // Recording source for the batch record button. Default "mic" = zero regression.
   const [recordSource, setRecordSource] = useState<RecordingSource>("mic");
   const [batchRecordElapsed, setBatchRecordElapsed] = useState(0);
@@ -1813,8 +1814,12 @@ function App() {
       await invoke("start_batch_recording", { source: recordSource });
       setBatchRecording(true);
       setBatchRecordElapsed(0);
+      setBatchRecordNotice("");
+      // Wall-clock, not tick counting: a hidden window throttles timers, and
+      // the counter used to fall behind the real recording length.
+      const startedAt = Date.now();
       batchRecordTimerRef.current = setInterval(() => {
-        setBatchRecordElapsed((e) => e + 1);
+        setBatchRecordElapsed(Math.floor((Date.now() - startedAt) / 1000));
       }, 1000);
     } catch (e) {
       setBatchError(String(e));
@@ -1827,6 +1832,7 @@ function App() {
       batchRecordTimerRef.current = null;
     }
     setBatchRecording(false);
+    setBatchRecordNotice("");
 
     // Call is backend-only (spec §4.3/§4.6): it never writes a WAV and must NOT go
     // through transcribe_file → decode_file_to_16k_mono, which merges to mono and
@@ -1897,6 +1903,27 @@ function App() {
     setBatchActiveResultId(null);
   }, [batchMode, recordSource]);
 
+  // The backend watchdog caps a meeting recording at one hour (RAM). It warns
+  // five minutes ahead and, at the cap, we stop and transcribe here, so what
+  // was recorded is kept even when the window is closed.
+  const handleStopBatchRecordRef = useRef(handleStopBatchRecord);
+  useEffect(() => { handleStopBatchRecordRef.current = handleStopBatchRecord; }, [handleStopBatchRecord]);
+  useEffect(() => {
+    const unWarn = listen("batch-recording-warning", () => {
+      setBatchRecordNotice("ההקלטה תיעצר בעוד 5 דקות (מגבלה של שעה) ותתומלל. אפשר להתחיל הקלטה חדשה להמשך.");
+    });
+    const unLimit = listen("batch-recording-limit", () => {
+      if (!batchRecordingRef.current) return;
+      setBatchRecordNotice("");
+      setBatchError("ההקלטה הגיעה לשעה ונעצרה. אפשר להתחיל הקלטה חדשה להמשך.");
+      void handleStopBatchRecordRef.current();
+    });
+    return () => {
+      unWarn.then((f) => f());
+      unLimit.then((f) => f());
+    };
+  }, []);
+
   const handleCancelBatchRecord = useCallback(async () => {
     if (batchRecordTimerRef.current) {
       clearInterval(batchRecordTimerRef.current);
@@ -1904,6 +1931,7 @@ function App() {
     }
     setBatchRecording(false);
     setBatchRecordElapsed(0);
+    setBatchRecordNotice("");
     try { await invoke("cancel_batch_recording"); } catch { /* ignore */ }
   }, []);
 
@@ -3747,6 +3775,7 @@ function App() {
               {formatRecordTime(batchRecordElapsed)}
             </span>
             <span className="batch-record-label">מקליט...</span>
+            {batchRecordNotice && <span className="batch-record-notice">{batchRecordNotice}</span>}
             <div className="batch-record-controls">
               <button className="btn-primary btn-record-stop" onClick={handleStopBatchRecord}>
                 ⏹ עצור ותמלל

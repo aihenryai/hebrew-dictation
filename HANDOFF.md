@@ -1,5 +1,13 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-17 (later) - meeting-recording cap and tray, microphone errors in Hebrew (after 2.16.1, not released)
+
+- **Meeting cap:** nothing enforced one, the mic ceiling only stopped the VAD thread and the WASAPI recorder had none; both buffer raw 48 kHz audio (≈1.4 GB an hour each). `spawn_meeting_watchdog` (started by `start_batch_recording`, generation counter `batch_recording_gen`) warns at 55 min (notification + `batch-recording-warning`) and at 60 min emits `batch-recording-limit`; the frontend then runs the normal stop-and-transcribe, so the audio is kept. Rules in the pure `meeting_watch_action`, tested.
+- **Closed window:** tray tooltip reads "מקליט פגישה" while recording (restored by the watchdog when it ends), and closing the window mid-recording shows a notification each time with how to reopen it (platform-specific wording).
+- The batch timer counts wall-clock time, not ticks (a hidden window throttled it).
+- **Microphone errors:** `audio::MIC_NOT_FOUND`, `mic_open_error`, `mic_stream_error_text` (unplugged = "המיקרופון נותק"); driver text kept in parentheses. System-audio start failures are Hebrew too.
+- Not verified with a real one-hour recording or a live close-to-tray; unit tests only.
+
 ## 2026-11-17 - v2.16.1: foreign words in auto mode, plus a security / privacy / bug audit
 
 Henry: since the language update the dictation "inserts words in Arabic and things like that".
@@ -11,7 +19,7 @@ Henry: since the language update the dictation "inserts words in Arabic and thin
 - **Audit fixes:** files screen follows the dictation mode (`batchMode` effect) and an unknown batch mode routes local, not cloud; `streaming_config` refuses when the saved mode is local; `audio-stream-error` now stops the dictation and keeps the text (the bar used to stay on "recording"); `statusRef` set synchronously in stop/discard (double injection); language changed while the connection opens is applied after it opens; `recording-paused` event syncs the floating bar; a failed secondary-hotkey change re-registers the previous set; the stock-phrase filter runs only on Whisper output (it deleted a real "תודה רבה" from Deepgram); `delete_temp_recording` rejects `..`; temp recordings get a millisecond name and leftovers are removed at launch; README privacy section rewritten to match the code; hint next to Smart Cleanup in local mode.
 - **Correction to the 2.16.0 entry below:** spoken punctuation (`punctuation::apply_spoken_punctuation`), `lang_switch`, `leading_separator` and `language_switch_keyterm_params` are NOT wired into the live path; streaming uses its own exact-match `detect_language_switch` and sends no `dictation` param.
 - Tests: Rust 236 passed, tsc clean. Not released: the tag and the download page wait for Henry's go-ahead.
-- **Open, not done:** meeting recording ignores the one-hour cap and has no tray indicator when the window is closed; batch-transcribing the audio left after a dropped stream; `transcribe_file` accepts any path from the webview; narration installer runs `pip install` without hashes; microphone errors still in English; hold-to-talk counted twice in the local API.
+- **Open, not done:** (meeting cap, tray indicator and Hebrew mic errors fixed in the entry above) batch-transcribing the audio left after a dropped stream; `transcribe_file` accepts any path from the webview; narration installer runs `pip install` without hashes; hold-to-talk counted twice in the local API.
 - **Henry's decisions:** release workflow pins actions by tag and signs with a key that has no password; macOS builds unsigned (needs a paid Developer ID); an env `DEEPGRAM_API_KEY` skips the wizard and uses the cloud; port 5758 is shared by narration and the call recorder on Henry's machine.
 
 ## 2026-11-10 - v2.16.0: automatic language detection by default

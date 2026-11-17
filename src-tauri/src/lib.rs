@@ -29,7 +29,7 @@ mod system_audio;
 mod whisper;
 
 use audio::AudioRecorder;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconEvent;
@@ -80,6 +80,9 @@ struct AppState {
     /// Set true while a long batch-view recording is in progress (separate from
     /// short dictation) so Alt+D cannot overwrite the buffer mid-session.
     batch_recording_in_progress: Arc<AtomicBool>,
+    /// Bumped on every batch-recording start, so the watchdog of an earlier
+    /// recording can tell it is stale and exit instead of stopping the new one.
+    batch_recording_gen: Arc<AtomicU64>,
     /// The last completed transcript: a whole non-streaming dictation, a whole
     /// streaming session, or any transcript the user pastes from the UI (an
     /// edited transcript, or an older batch-file result). `seq` counts
@@ -714,8 +717,93 @@ fn restore_recorder_settings(state: &State<AppState>) {
 /// Start a long batch recording (for meeting / lecture). Uses the same AudioRecorder
 /// as short dictation but disables VAD auto-stop so the user controls stop manually.
 /// Blocks while a transcription or another batch recording is already in progress.
+/// Longest a meeting / lecture recording may run. Both recorders buffer raw
+/// native-rate audio in RAM (≈1.4 GB an hour each at 48 kHz stereo), so an
+/// unbounded recording left running behind a closed window eventually takes
+/// the machine down. At the cap the frontend stops and transcribes, so
+/// nothing recorded is lost.
+const MEETING_MAX_SECS: u64 = 3600;
+/// Warn this long before the cap, so the user can stop at a natural break.
+const MEETING_WARN_BEFORE_SECS: u64 = 300;
+const TRAY_TOOLTIP_IDLE: &str = "הכתבה בעברית — BinTech AI";
+const TRAY_TOOLTIP_RECORDING: &str = "הכתבה בעברית — מקליט פגישה";
+
+#[derive(Debug, PartialEq)]
+enum MeetingWatch {
+    Nothing,
+    Warn,
+    Limit,
+}
+
+/// What the meeting watchdog should do at `elapsed` seconds. Pure, so the
+/// timing rules are unit-tested without sleeping for an hour.
+fn meeting_watch_action(elapsed: u64, warned: bool) -> MeetingWatch {
+    if elapsed >= MEETING_MAX_SECS {
+        MeetingWatch::Limit
+    } else if !warned && elapsed + MEETING_WARN_BEFORE_SECS >= MEETING_MAX_SECS {
+        MeetingWatch::Warn
+    } else {
+        MeetingWatch::Nothing
+    }
+}
+
+fn show_notification(app: &AppHandle, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("הכתבה בעברית")
+        .body(body)
+        .show();
+}
+
+fn set_tray_tooltip(app: &AppHandle, text: &str) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(text));
+    }
+}
+
+/// Runs for the life of one batch recording: marks the tray while it records,
+/// warns five minutes before the cap and asks the frontend to stop at the cap.
+/// Exits (and restores the tray) as soon as the recording ends or a newer one
+/// starts. Wall-clock based, so a throttled hidden webview can't stretch it.
+fn spawn_meeting_watchdog(app: AppHandle, flag: Arc<AtomicBool>, gens: Arc<AtomicU64>, gen: u64) {
+    set_tray_tooltip(&app, TRAY_TOOLTIP_RECORDING);
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if !flag.load(Ordering::SeqCst) || gens.load(Ordering::SeqCst) != gen {
+                break;
+            }
+            match meeting_watch_action(started.elapsed().as_secs(), warned) {
+                MeetingWatch::Nothing => {}
+                MeetingWatch::Warn => {
+                    warned = true;
+                    show_notification(
+                        &app,
+                        "ההקלטה תיעצר בעוד 5 דקות (מגבלה של שעה) ותתומלל. אפשר להתחיל הקלטה חדשה להמשך.",
+                    );
+                    let _ = app.emit("batch-recording-warning", MEETING_WARN_BEFORE_SECS);
+                }
+                MeetingWatch::Limit => {
+                    show_notification(&app, "ההקלטה הגיעה לשעה, נעצרה ומתומללת עכשיו.");
+                    let _ = app.emit("batch-recording-limit", MEETING_MAX_SECS);
+                    break;
+                }
+            }
+        }
+        // Only the newest recording owns the tray text.
+        if gens.load(Ordering::SeqCst) == gen {
+            set_tray_tooltip(&app, TRAY_TOOLTIP_IDLE);
+        }
+    });
+}
+
 #[tauri::command]
 fn start_batch_recording(
+    app: AppHandle,
     state: State<AppState>,
     source: Option<batch::RecordingSource>,
 ) -> Result<(), String> {
@@ -764,6 +852,14 @@ fn start_batch_recording(
     if result.is_err() {
         // Never leave the guard set on a failed start, or short dictation stays blocked.
         state.batch_recording_in_progress.store(false, Ordering::SeqCst);
+    } else {
+        let gen = state.batch_recording_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        spawn_meeting_watchdog(
+            app,
+            state.batch_recording_in_progress.clone(),
+            state.batch_recording_gen.clone(),
+            gen,
+        );
     }
     result
 }
@@ -3145,6 +3241,7 @@ pub fn run() {
                 batch_cancel_notify: Arc::new(tokio::sync::Notify::new()),
                 batch_in_progress: Arc::new(AtomicBool::new(false)),
                 batch_recording_in_progress: Arc::new(AtomicBool::new(false)),
+                batch_recording_gen: Arc::new(AtomicU64::new(0)),
                 last_transcript: Arc::new(Mutex::new(local_api::LastTranscript::default())),
             }
         })
@@ -3304,6 +3401,22 @@ pub fn run() {
                         // Closed to tray — keep an on-screen affordance so the
                         // user can still start dictation with one click.
                         let state = app_for_close.state::<AppState>();
+                        // A meeting recording keeps running behind the closed
+                        // window; say so, every time, or it records unseen.
+                        if state.batch_recording_in_progress.load(Ordering::SeqCst) {
+                            let reopen = if cfg!(target_os = "macos") {
+                                "״הגדרות״ בסמל שבשורת התפריטים"
+                            } else {
+                                "לחיצה כפולה על הסמל ליד השעון"
+                            };
+                            show_notification(
+                                &app_for_close,
+                                &format!(
+                                    "ההקלטה ממשיכה ברקע. לעצירה: {}, ואז ״עצור ותמלל״.",
+                                    reopen
+                                ),
+                            );
+                        }
                         let (enabled, saved_pos) = {
                             let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
                             (s.idle_button_enabled, s.toolbar_position)
@@ -3439,6 +3552,31 @@ mod tests {
         assert_eq!(injection_settle_time(50), Duration::from_millis(300));
         assert_eq!(injection_settle_time(200), Duration::from_millis(800));
         assert_eq!(injection_settle_time(100_000), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn meeting_watchdog_warns_once_then_stops_at_the_cap() {
+        let warn_at = MEETING_MAX_SECS - MEETING_WARN_BEFORE_SECS;
+        assert_eq!(meeting_watch_action(0, false), MeetingWatch::Nothing);
+        assert_eq!(meeting_watch_action(warn_at - 1, false), MeetingWatch::Nothing);
+        assert_eq!(meeting_watch_action(warn_at, false), MeetingWatch::Warn);
+        // Already warned: no second warning before the cap.
+        assert_eq!(meeting_watch_action(warn_at + 10, true), MeetingWatch::Nothing);
+        assert_eq!(meeting_watch_action(MEETING_MAX_SECS, true), MeetingWatch::Limit);
+        // A machine that slept past the cap still stops, warned or not.
+        assert_eq!(meeting_watch_action(MEETING_MAX_SECS + 500, false), MeetingWatch::Limit);
+    }
+
+    #[test]
+    fn mic_errors_are_hebrew_and_keep_the_driver_detail() {
+        let msg = audio::mic_open_error("לפתוח", "The requested device is no longer available");
+        assert!(msg.starts_with("לא הצלחנו לפתוח את המיקרופון"));
+        assert!(msg.ends_with("(The requested device is no longer available)"));
+        assert_eq!(
+            audio::mic_stream_error_text(&cpal::StreamError::DeviceNotAvailable),
+            "המיקרופון נותק"
+        );
+        assert!(!audio::MIC_NOT_FOUND.is_ascii());
     }
 
     #[test]
