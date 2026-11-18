@@ -1,6 +1,6 @@
 # Hebrew Dictation — Session Handoff
 
-## 2026-11-17 (later) - meeting-recording cap and tray, microphone errors in Hebrew (after 2.16.1, not released)
+## 2026-11-18 - v2.16.2 released (Henry: "כן, לשחרר"): meeting-recording cap and tray, microphone errors in Hebrew
 
 - **Meeting cap:** nothing enforced one, the mic ceiling only stopped the VAD thread and the WASAPI recorder had none; both buffer raw 48 kHz audio (≈1.4 GB an hour each). `spawn_meeting_watchdog` (started by `start_batch_recording`, generation counter `batch_recording_gen`) warns at 55 min (notification + `batch-recording-warning`) and at 60 min emits `batch-recording-limit`; the frontend then runs the normal stop-and-transcribe, so the audio is kept. Rules in the pure `meeting_watch_action`, tested.
 - **Closed window:** tray tooltip reads "מקליט פגישה" while recording (restored by the watchdog when it ends), and closing the window mid-recording shows a notification each time with how to reopen it (platform-specific wording).
