@@ -60,15 +60,17 @@ pub fn pick_batch_route(mode: &str) -> BatchRoute {
     }
 }
 
-/// Call mode is Deepgram-only (multichannel), so it needs a Deepgram key even when
-/// `BatchOpts.mode="local"`: with a key present Call transparently forces cloud;
-/// with no key at all we fail fast — BEFORE recording — with a guiding message,
-/// rather than capturing audio that can't be transcribed. Spec §6.
-pub fn ensure_call_deepgram_available(has_deepgram_key: bool) -> Result<(), String> {
-    if has_deepgram_key {
+pub const CALL_KEY_MISSING: &str = "מצב שיחה בענן דורש מפתח ElevenLabs או Deepgram. הוסף אותו בהגדרות.";
+
+/// Cloud call mode is multichannel (ElevenLabs or Deepgram, see
+/// `AppSettings::file_provider`), so it needs one of their keys: with no key
+/// we fail fast — BEFORE recording — with a guiding message, rather than
+/// capturing audio that can't be transcribed. Spec §6.
+pub fn ensure_call_deepgram_available(has_cloud_key: bool) -> Result<(), String> {
+    if has_cloud_key {
         Ok(())
     } else {
-        Err("מצב שיחה דורש מפתח Deepgram. הוסף אותו בהגדרות.".to_string())
+        Err(CALL_KEY_MISSING.to_string())
     }
 }
 
@@ -131,6 +133,7 @@ mod tests {
         // No key at all → a guiding Hebrew error, raised BEFORE recording starts.
         let err = ensure_call_deepgram_available(false).unwrap_err();
         assert!(err.contains("Deepgram"));
+        assert!(err.contains("ElevenLabs"));
         assert!(err.contains("שיחה"));
     }
 

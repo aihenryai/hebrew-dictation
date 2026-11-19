@@ -117,7 +117,9 @@ let batchIdCounter = 0;
  *  2.16.0). "multi" is a legacy stored value, treated as "auto". */
 type Language = "auto" | "he" | "en" | "multi";
 type TranscriptionMode = "api" | "local" | "auto_fallback";
-type ApiProvider = "deepgram" | "groq";
+type ApiProvider = "elevenlabs" | "deepgram" | "groq";
+/** Providers that support live (simultaneous) dictation over a WebSocket. */
+const STREAMING_PROVIDERS: ApiProvider[] = ["elevenlabs", "deepgram"];
 
 /** Recording input source, chosen before a batch recording and threaded into
  * `start_batch_recording` (Task 18). Default "mic" = existing behavior (zero
@@ -161,6 +163,7 @@ interface AppSettings {
 interface RedactedSettings {
   transcription_mode: TranscriptionMode;
   api_provider: ApiProvider;
+  has_elevenlabs_key?: boolean;
   has_deepgram_key: boolean;
   has_groq_key: boolean;
   preferred_model: string;
@@ -601,6 +604,7 @@ function App() {
   const [recordingTime, setRecordingTime] = useState(0);
   const [transcriptionMode, setTranscriptionMode] = useState<TranscriptionMode>("auto_fallback");
   const [apiProvider, setApiProvider] = useState<ApiProvider>("deepgram");
+  const [elevenlabsKey, setElevenlabsKey] = useState("");
   const [deepgramKey, setDeepgramKey] = useState("");
   const [groqKey, setGroqKey] = useState("");
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
@@ -612,8 +616,8 @@ function App() {
   const [wizardApiKey, setWizardApiKey] = useState("");
   const [wizardKeyValid, setWizardKeyValid] = useState<boolean | null>(null);
   const [wizardKeyTesting, setWizardKeyTesting] = useState(false);
-  const [wizardChoice, setWizardChoice] = useState<"api" | "groq" | "local" | null>(null);
-  const [wizardProviderKey, setWizardProviderKey] = useState<"deepgram" | "groq">("deepgram");
+  const [wizardChoice, setWizardChoice] = useState<"elevenlabs" | "api" | "groq" | "local" | null>(null);
+  const [wizardProviderKey, setWizardProviderKey] = useState<ApiProvider>("deepgram");
   const [wizardTermsAsIs, setWizardTermsAsIs] = useState(false);
   const [wizardTermsKeys, setWizardTermsKeys] = useState(false);
   const [showTermsGate, setShowTermsGate] = useState(false);
@@ -1353,6 +1357,7 @@ function App() {
       setLanguage(lang);
       setVadEnabled(settings.vad_enabled);
       // Keys are redacted — just track whether they exist on the backend.
+      if (settings.has_elevenlabs_key) setElevenlabsKey("••••••••");
       if (settings.has_deepgram_key) setDeepgramKey("••••••••");
       if (settings.has_groq_key) setGroqKey("••••••••");
       setHasGroqKey(!!settings.has_groq_key);
@@ -1366,7 +1371,7 @@ function App() {
         // isStreamingSession(), so a stuck flag here can no longer break dictation —
         // this just keeps the persisted setting honest.
         const streamingStale = settings.streaming_enabled &&
-          (settings.api_provider !== "deepgram" || settings.transcription_mode === "local");
+          (!STREAMING_PROVIDERS.includes(settings.api_provider) || settings.transcription_mode === "local");
         setStreamingEnabled(streamingStale ? false : settings.streaming_enabled);
         if (streamingStale) {
           persistLoadedSettings(settings, { streaming_enabled: false });
@@ -1409,7 +1414,7 @@ function App() {
       // Skip the wizard if the user already has a working setup — either they've saved
       // an API key (via settings directly) or a local whisper model will be available below.
       // The flag is the source of truth once set; we backfill below for legacy installs.
-      const hasKey = settings.has_deepgram_key || settings.has_groq_key;
+      const hasKey = !!settings.has_elevenlabs_key || settings.has_deepgram_key || settings.has_groq_key;
       needsOnboarding = !settings.onboarding_completed && !hasKey;
 
       // Backfill the flag so future launches don't recheck (and so it's consistent
@@ -2036,7 +2041,7 @@ function App() {
   // failed was reported as "המפתח לא תקין", and a network failure looked the
   // same as a wrong key.
   async function handleTestApiKey() {
-    const activeKey = apiProvider === "groq" ? groqKey : deepgramKey;
+    const activeKey = apiProvider === "groq" ? groqKey : apiProvider === "elevenlabs" ? elevenlabsKey : deepgramKey;
     if (!activeKey) return;
     setTestingApiKey(true);
     setApiKeyValid(null);
@@ -2177,14 +2182,14 @@ function App() {
         : (transcriptionMode === "local" ? MAX_RECORDING_LOCAL : MAX_RECORDING_API));
   const timeRemaining = unlimitedRecording ? Infinity : (effectiveMaxRecordingSecs - recordingTime);
   const showTimeWarning = status === "recording" && Number.isFinite(timeRemaining) && timeRemaining <= 10;
-  const activeApiKey = apiProvider === "groq" ? groqKey : deepgramKey;
+  const activeApiKey = apiProvider === "groq" ? groqKey : apiProvider === "elevenlabs" ? elevenlabsKey : deepgramKey;
   const apiKeyConfigured = transcriptionMode !== "local" && activeApiKey.length > 0;
   const canRecord = whisperLoaded || apiKeyConfigured;
   useEffect(() => { canRecordRef.current = canRecord; }, [canRecord]);
   // What exactly is missing, in words. The old generic "set an API key or
   // download a model" read as "the app forgot my key" to a user whose mode had
   // been switched to local with no model installed.
-  const providerName = apiProvider === "groq" ? "Groq" : "Deepgram";
+  const providerName = apiProvider === "groq" ? "Groq" : apiProvider === "elevenlabs" ? "ElevenLabs" : "Deepgram";
   const setupProblem = transcriptionMode === "local"
     ? "מצב ״בלי אינטרנט״ פעיל, אבל עוד לא הותקן מודל. הורידו את המודל המומלץ, או עברו ל-API בהגדרות."
     : `חסר מפתח ${providerName}. הוסיפו אותו בהגדרות.`;
@@ -2220,12 +2225,15 @@ function App() {
       // wizard, and surface a toast on the main view.
       let keyError: string | null = null;
       const provider: ApiProvider | null =
-        wizardChoice === "api" ? "deepgram" : wizardChoice === "groq" ? "groq" : null;
+        wizardChoice === "elevenlabs" ? "elevenlabs"
+          : wizardChoice === "api" ? "deepgram"
+          : wizardChoice === "groq" ? "groq" : null;
 
       try {
         if (provider && wizardApiKey) {
           await setApiKey(provider, wizardApiKey);
-          if (provider === "deepgram") setDeepgramKey("••••••••");
+          if (provider === "elevenlabs") setElevenlabsKey("••••••••");
+          else if (provider === "deepgram") setDeepgramKey("••••••••");
           else setGroqKey("••••••••");
         }
       } catch (e) {
@@ -2240,13 +2248,20 @@ function App() {
       if (provider && !keyError) {
         try {
           const check = (await invoke("get_settings")) as RedactedSettings;
-          keyMissing = !(provider === "groq" ? check.has_groq_key : check.has_deepgram_key);
+          keyMissing = !(provider === "groq" ? check.has_groq_key
+            : provider === "elevenlabs" ? check.has_elevenlabs_key
+            : check.has_deepgram_key);
         } catch { /* can't verify — don't block the user */ }
       }
 
       // Apply chosen mode regardless of key save outcome.
       const overrides: Partial<AppSettings> = { onboarding_completed: true };
-      if (wizardChoice === "api") {
+      if (wizardChoice === "elevenlabs") {
+        setApiProvider("elevenlabs");
+        setTranscriptionMode("api");
+        overrides.api_provider = "elevenlabs";
+        overrides.transcription_mode = "api";
+      } else if (wizardChoice === "api") {
         setApiProvider("deepgram");
         setTranscriptionMode("api");
         overrides.api_provider = "deepgram";
@@ -2341,7 +2356,7 @@ function App() {
                   <span style={{ fontWeight: 600 }}>💳 רק מפתחות בלי כרטיס אשראי</span>
                 </div>
                 <p className="wizard-card-desc" style={{ fontSize: "0.78rem" }}>
-                  תומכים רק ב-Deepgram ו-Groq — שניהם נותנים מפתח חינם בלי להזין אשראי. אם תבחרו לטעון קרדיט בתשלום — זה ביניכם לבין הספק.
+                  תומכים רק ב-ElevenLabs, Deepgram ו-Groq — שלושתם נותנים מפתח חינם בלי להזין אשראי. אם תבחרו לטעון קרדיט בתשלום — זה ביניכם לבין הספק.
                 </p>
               </div>
               <div className="wizard-card" style={{ cursor: "default", padding: "0.6rem 0.8rem" }}>
@@ -2414,6 +2429,67 @@ function App() {
             <h2 className="wizard-step-title">בחר מצב תמלול</h2>
 
             <div
+              className={`wizard-card ${wizardChoice === "elevenlabs" ? "selected" : ""}`}
+              onClick={() => {
+                // Same guard as the Deepgram card — see the comment there.
+                if (wizardChoice === "elevenlabs") return;
+                setWizardChoice("elevenlabs");
+                setWizardProviderKey("elevenlabs");
+                setWizardApiKey("");
+                setWizardKeyValid(null);
+              }}
+            >
+              <div className="wizard-card-header">
+                <strong>🎯 ElevenLabs — הכי מדויק בעברית</strong>
+                <span className="wizard-card-badge">מומלץ</span>
+              </div>
+              <p className="wizard-card-desc">תמלול בענן דרך ElevenLabs Scribe. בבדיקה שלנו עשה בעברית בערך חצי מהטעויות של Deepgram, גם במשפטים שמערבבים עברית ואנגלית.</p>
+              <ul className="wizard-card-facts">
+                <li>✅ <strong>חשבון חינם בלי כרטיס אשראי</strong>, עם מכסה חודשית קטנה לניסיון</li>
+                <li>✅ בתשלום: כ-0.22 דולר לשעת הכתבה</li>
+                <li>✅ תמלול סימולטני, קבצים והקלטת פגישות</li>
+                <li>⚠ דורש אינטרנט + האודיו נשלח ל-ElevenLabs</li>
+              </ul>
+              {wizardChoice === "elevenlabs" && (
+                <div className="wizard-guide" onClick={(e) => e.stopPropagation()}>
+                  <p className="wizard-guide-title">📋 איך מוציאים מפתח:</p>
+                  <ol>
+                    <li>
+                      לחץ כאן{" "}
+                      <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener" className="link-text">
+                        elevenlabs.io — מפתחות API
+                      </a>
+                    </li>
+                    <li>צור חשבון (אימייל או Google)</li>
+                    <li>לחץ <strong>Create API Key</strong> ותן הרשאה ל-<strong>Speech to Text</strong></li>
+                    <li>העתק את המפתח (מתחיל ב-<code>sk_</code>) והדבק כאן:</li>
+                  </ol>
+                  <div className="api-key-row">
+                    <input
+                      type="password"
+                      className="api-key-input"
+                      value={wizardApiKey}
+                      onChange={(e) => { setWizardApiKey(e.target.value); setWizardKeyValid(null); }}
+                      placeholder="sk_..."
+                    />
+                    <button
+                      className={`btn-test ${wizardKeyValid === true ? "valid" : wizardKeyValid === false ? "invalid" : ""}`}
+                      onClick={handleWizardTestKey}
+                      disabled={wizardKeyTesting || !wizardApiKey}
+                    >
+                      {wizardKeyTesting ? "..." : wizardKeyValid === true ? "✓" : wizardKeyValid === false ? "✗" : "בדוק"}
+                    </button>
+                  </div>
+                  {wizardKeyValid === true && <p className="settings-note success-note">✅ המפתח תקין!</p>}
+                  {wizardKeyValid === false && <p className="settings-note error-note">❌ המפתח לא תקין</p>}
+                  <p className="wizard-note" style={{ fontSize: "0.7rem", marginTop: "0.3rem" }}>
+                    💡 המפתח נשמר רק אצלך במחשב. לא נשלח לשום מקום חוץ מ-ElevenLabs.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div
               className={`wizard-card ${wizardChoice === "api" ? "selected" : ""}`}
               onClick={() => {
                 // Only reset when actually SWITCHING to this card. Re-clicking the
@@ -2429,10 +2505,10 @@ function App() {
               }}
             >
               <div className="wizard-card-header">
-                <strong>☁️ Deepgram — מהיר ומדויק</strong>
-                <span className="wizard-card-badge">מומלץ</span>
+                <strong>☁️ Deepgram — מהיר, עם קרדיט פתיחה גדול</strong>
+                <span className="wizard-card-badge">חלופה</span>
               </div>
-              <p className="wizard-card-desc">תמלול בענן דרך Deepgram Nova-3. הדיוק הגבוה ביותר בעברית.</p>
+              <p className="wizard-card-desc">תמלול בענן דרך Deepgram Nova-3. פחות מדויק בעברית מ-ElevenLabs, אבל מגיע עם קרדיט חינם גדול.</p>
               <ul className="wizard-card-facts">
                 <li>✅ <strong>~50 שעות חינם</strong> עם $200 קרדיט של Deepgram</li>
                 <li>✅ <strong>ללא כרטיס אשראי</strong> — אי אפשר לחייב אותך בטעות</li>
@@ -2496,7 +2572,7 @@ function App() {
                 <li>✅ עובד אופליין — בלי חיבור לאינטרנט</li>
                 <li>⚠ איטי יותר: 5-10 שניות עיבוד (תלוי בחוזק המחשב)</li>
                 <li>⚠ דורש הורדת מודל חד-פעמית: 75MB עד 1.5GB</li>
-                <li>⚠ דיוק בעברית סביר, אבל נמוך מ-Deepgram</li>
+                <li>⚠ דיוק בעברית סביר, אבל נמוך מהענן</li>
               </ul>
             </div>
 
@@ -2582,7 +2658,9 @@ function App() {
             <div className="wizard-content">
               {wizardSetupError && <p className="settings-note error-note">{wizardSetupError}</p>}
               {IS_MAC && !accessibilityTrusted && <MacPermissionCard />}
-              {wizardChoice === "api" && wizardApiKey ? (
+              {wizardChoice === "elevenlabs" && wizardApiKey ? (
+                <p className="wizard-success">ElevenLabs מוגדר — התמלול המדויק ביותר בעברית</p>
+              ) : wizardChoice === "api" && wizardApiKey ? (
                 <p className="wizard-success">Deepgram מוגדר — תמלול מהיר ומדויק</p>
               ) : wizardChoice === "groq" && wizardApiKey ? (
                 <p className="wizard-success">Groq מוגדר — תמלול מהיר וזול</p>
@@ -2725,6 +2803,7 @@ function App() {
             <h3>ספק API</h3>
             <div className="settings-row" style={{ marginBottom: "0.5rem" }}>
               {([
+                ["elevenlabs", "ElevenLabs (מומלץ)"],
                 ["deepgram", "Deepgram"],
                 ["groq", "Groq"],
               ] as [ApiProvider, string][]).map(([prov, label]) => (
@@ -2735,7 +2814,7 @@ function App() {
                     setApiProvider(prov);
                     setApiKeyValid(null);
                     const patch: Record<string, unknown> = { api_provider: prov };
-                    if (prov !== "deepgram" && streamingEnabled) {
+                    if (!STREAMING_PROVIDERS.includes(prov) && streamingEnabled) {
                       setStreamingEnabled(false);
                       patch.streaming_enabled = false;
                     }
@@ -2747,23 +2826,26 @@ function App() {
               ))}
             </div>
             <p className="settings-note provider-fact">
-              {apiProvider === "deepgram"
-                ? "💰 $200 קרדיט חינם ≈ 50 שעות הכתבה. ללא כרטיס אשראי. דיוק הכי גבוה בעברית."
+              {apiProvider === "elevenlabs"
+                ? "🎯 הכי מדויק בעברית בבדיקה שלנו (בערך חצי מהטעויות של Deepgram). כ-0.22 דולר לשעת הכתבה. המפתח צריך הרשאת Speech to Text."
+                : apiProvider === "deepgram"
+                ? "💰 $200 קרדיט חינם ≈ 50 שעות הכתבה. ללא כרטיס אשראי."
                 : "💰 Groq Whisper Turbo: ~$0.04/שעה — הכי זול. יש Free tier מוגבל. ללא streaming."}
             </p>
             <div className="api-key-row">
               <input
                 type="password"
                 className="api-key-input"
-                value={apiProvider === "groq" ? groqKey : deepgramKey}
+                value={activeApiKey}
                 onChange={(e) => {
                   if (apiProvider === "groq") setGroqKey(e.target.value);
+                  else if (apiProvider === "elevenlabs") setElevenlabsKey(e.target.value);
                   else setDeepgramKey(e.target.value);
                   setApiKeyValid(null);
                 }}
                 onBlur={async () => {
                   const provider = apiProvider;
-                  const value = provider === "groq" ? groqKey : deepgramKey;
+                  const value = activeApiKey;
                   // Skip the masked placeholder — that means the existing key wasn't touched.
                   if (value === "••••••••") return;
                   try {
@@ -2777,7 +2859,7 @@ function App() {
                     setApiKeySaveError(String(e));
                   }
                 }}
-                placeholder={apiProvider === "groq" ? "gsk_..." : "API key..."}
+                placeholder={apiProvider === "groq" ? "gsk_..." : apiProvider === "elevenlabs" ? "sk_..." : "API key..."}
               />
               <button
                 className={`btn-test ${apiKeyValid === true ? "valid" : apiKeyValid === false ? "invalid" : ""}`}
@@ -2796,14 +2878,18 @@ function App() {
             )}
             <div className="settings-links-row">
               <p className="settings-note">
-                {apiProvider === "deepgram" ? (
+                {apiProvider === "elevenlabs" ? (
+                  <a href="https://elevenlabs.io/app/settings/api-keys" target="_blank" rel="noopener" className="link-text">קבל מפתח ב-elevenlabs.io</a>
+                ) : apiProvider === "deepgram" ? (
                   <a href="https://console.deepgram.com/signup" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם ב-deepgram.com</a>
                 ) : (
                   <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="link-text">קבל מפתח חינם ב-groq.com</a>
                 )}
               </p>
               <p className="settings-note">
-                {apiProvider === "deepgram" ? (
+                {apiProvider === "elevenlabs" ? (
+                  <a href="https://elevenlabs.io/app/usage" target="_blank" rel="noopener" className="link-text">כמה קרדיט נשאר?</a>
+                ) : apiProvider === "deepgram" ? (
                   <a href="https://console.deepgram.com/project/default/usage" target="_blank" rel="noopener" className="link-text">כמה קרדיט נשאר?</a>
                 ) : (
                   <a href="https://console.groq.com/settings/usage" target="_blank" rel="noopener" className="link-text">בדוק שימוש</a>
@@ -3203,7 +3289,7 @@ function App() {
               // is off) the streaming toggle is LOCKED. Also Deepgram-only. The
               // `&& !streamingEnabled` guard means an already-on toggle stays clickable
               // so a legacy both-on state can self-heal.
-              disabled={apiProvider !== "deepgram" || (enhanceEnabled && !streamingEnabled)}
+              disabled={!STREAMING_PROVIDERS.includes(apiProvider) || (enhanceEnabled && !streamingEnabled)}
               onChange={() => {
                 const v = !streamingEnabled;
                 setStreamingEnabled(v);
@@ -3211,7 +3297,7 @@ function App() {
               }}
             />
             <span className="toggle-text">
-              תמלול בזמן אמת תוך כדי דיבור (Deepgram בלבד, בלי המתנה לעיבוד בסוף)
+              תמלול בזמן אמת תוך כדי דיבור (ElevenLabs או Deepgram, בלי המתנה לעיבוד בסוף)
             </span>
           </label>
           <p className="settings-hint">לא תואם ל-✨ רישוף חכם — כשהרישוף דלוק, ההכתבה הסימולטנית נעולה, וההיפך.</p>
@@ -3612,7 +3698,7 @@ function App() {
             רישיון {APP_LICENSE} · נבנה עם Tauri · whisper.cpp · React · ספריות OSS עם הקרדיט בקוד המקור
           </p>
           <p className="settings-note about-trademark">
-            Deepgram ו-Groq הם סימני מסחר של החברות בהתאמה. אין קשר עסקי או חסות.
+            ElevenLabs, Deepgram ו-Groq הם סימני מסחר של החברות בהתאמה. אין קשר עסקי או חסות.
           </p>
         </div>
 

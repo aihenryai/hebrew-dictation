@@ -394,9 +394,9 @@ async fn transcribe(state: State<'_, AppState>, samples: Vec<f32>, language: Opt
     };
 
     // The stock-phrase filter ("תודה רבה" over silence) is a Whisper problem.
-    // Deepgram does not invent those, and running the filter on its output
-    // silently deleted a real, short "תודה רבה".
-    let api_is_whisper = !matches!(provider, settings::ApiProvider::Deepgram);
+    // Deepgram and ElevenLabs do not invent those, and running the filter on
+    // their output silently deleted a real, short "תודה רבה".
+    let api_is_whisper = matches!(provider, settings::ApiProvider::Groq);
     let (result, from_whisper) = match mode {
         settings::TranscriptionMode::Api => {
             let key = api_key.ok_or("מפתח API לא מוגדר — הגדר אותו בהגדרות")?;
@@ -505,6 +505,9 @@ fn dictionary_applied(text: String, segments: Vec<srt::TimedSegment>) -> Transcr
     TranscribeFileResult { text: dictionary::apply(&text), segments }
 }
 
+const CLOUD_FILE_KEY_MISSING: &str =
+    "תמלול ענן ארוך דורש מפתח ElevenLabs או Deepgram. הוסף אותו בהגדרות, או עבור למצב \"פרטי (במכשיר)\".";
+
 async fn run_transcribe_file(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -516,10 +519,10 @@ async fn run_transcribe_file(
     if matches!(batch::pick_batch_route(&opts.mode), batch::BatchRoute::CloudDeepgram) {
         let has_key = {
             let s = state.settings.lock().map_err(|e| e.to_string())?;
-            s.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty())
+            s.file_provider().is_some()
         };
         if !has_key {
-            return Err("תמלול ענן ארוך דורש מפתח Deepgram. הוסף אותו בהגדרות, או עבור למצב \"פרטי (במכשיר)\".".to_string());
+            return Err(CLOUD_FILE_KEY_MISSING.to_string());
         }
     }
 
@@ -554,13 +557,11 @@ async fn run_transcribe_file(
     // 2) Route.
     match batch::pick_batch_route(&opts.mode) {
         batch::BatchRoute::CloudDeepgram => {
-            let key = {
+            let (provider, key) = {
                 let s = state.settings.lock().map_err(|e| e.to_string())?;
-                s.deepgram_api_key.clone()
-            };
-            let key = key.filter(|k| !k.is_empty()).ok_or_else(|| {
-                "תמלול ענן ארוך דורש מפתח Deepgram. הוסף אותו בהגדרות, או עבור למצב \"פרטי (במכשיר)\".".to_string()
-            })?;
+                s.file_provider()
+            }
+            .ok_or_else(|| CLOUD_FILE_KEY_MISSING.to_string())?;
 
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(900))
@@ -573,7 +574,7 @@ async fn run_transcribe_file(
             );
 
             let notify = state.batch_cancel_notify.clone();
-            let fut = api_transcribe::transcribe_deepgram_batch(&client, &samples, &key, &opts.language);
+            let fut = api_transcribe::transcribe_file_batch(&provider, &client, &samples, &key, &opts.language);
             let (text, segments) = tokio::select! {
                 r = fut => r.map_err(|e| e.to_string())?,
                 _ = notify.notified() => return Err(batch::CANCELLED.to_string()),
@@ -829,7 +830,7 @@ fn start_batch_recording(
     if matches!(source, batch::RecordingSource::CallCloud) {
         let has_key = {
             let s = state.settings.lock().map_err(|e| e.to_string())?;
-            s.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty())
+            s.file_provider().is_some()
         };
         batch::ensure_call_deepgram_available(has_key)?;
     }
@@ -1076,13 +1077,11 @@ async fn run_stop_call_recording(
 
     // Call forces Deepgram regardless of opts.mode; key was checked before recording,
     // re-check defensively here.
-    let key = {
+    let (provider, key) = {
         let s = state.settings.lock().map_err(|e| e.to_string())?;
-        s.deepgram_api_key.clone()
-    };
-    let key = key
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| "מצב שיחה דורש מפתח Deepgram. הוסף אותו בהגדרות.".to_string())?;
+        s.file_provider()
+    }
+    .ok_or_else(|| batch::CALL_KEY_MISSING.to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(900))
@@ -1095,8 +1094,13 @@ async fn run_stop_call_recording(
     );
 
     let notify = state.batch_cancel_notify.clone();
-    let fut =
-        api_transcribe::transcribe_deepgram_multichannel(&client, stereo_wav, &key, &opts.language);
+    let fut = api_transcribe::transcribe_call_multichannel(
+        &provider,
+        &client,
+        stereo_wav,
+        &key,
+        &opts.language,
+    );
     let (text, segments) = tokio::select! {
         r = fut => r.map_err(|e| e.to_string())?,
         _ = notify.notified() => return Err(batch::CANCELLED.to_string()),
@@ -1612,11 +1616,11 @@ async fn recover_streaming_leftover(
     if leftover.len() < 8_000 || audio::is_effectively_silent(leftover, 0.005) {
         return String::new();
     }
-    let Ok((key, _)) = streaming_config(state) else {
+    let Ok((provider, key, _)) = streaming_config(state) else {
         return String::new();
     };
     let text = match api_transcribe::transcribe_api(
-        &settings::ApiProvider::Deepgram,
+        &provider,
         leftover,
         &key,
         "auto",
@@ -1642,22 +1646,25 @@ async fn recover_streaming_leftover(
     text
 }
 
-fn streaming_config(state: &AppState) -> Result<(String, bool), String> {
+fn streaming_config(
+    state: &AppState,
+) -> Result<(settings::ApiProvider, String, bool), String> {
     let s = state.settings.lock().map_err(|e| e.to_string())?;
     // The saved mode decides, not the window: a screen that showed "local"
     // after a failed save, or a stale one, must not open a cloud connection.
     if matches!(s.transcription_mode, settings::TranscriptionMode::Local) {
         return Err("האפליקציה במצב מקומי, ולכן הכתבה סימולטנית דרך הענן כבויה. אפשר לעבור למצב ענן בהגדרות.".to_string());
     }
-    if !matches!(s.api_provider, settings::ApiProvider::Deepgram) {
-        return Err("Streaming זמין רק עם Deepgram. עבור ל-Deepgram בהגדרות.".to_string());
+    let provider = s.api_provider.clone();
+    if provider == settings::ApiProvider::Groq {
+        return Err("הכתבה סימולטנית זמינה עם ElevenLabs או Deepgram. אפשר להחליף ספק בהגדרות.".to_string());
     }
+    let name = if provider == settings::ApiProvider::ElevenLabs { "ElevenLabs" } else { "Deepgram" };
     let key = s
-        .deepgram_api_key
-        .clone()
-        .filter(|k| !k.is_empty())
-        .ok_or_else(|| "מפתח Deepgram לא מוגדר — הגדר אותו בהגדרות.".to_string())?;
-    Ok((key, s.language_switch_keywords_enabled))
+        .key_for(&provider)
+        .map(str::to_string)
+        .ok_or_else(|| format!("מפתח {name} לא מוגדר. אפשר להגדיר אותו בהגדרות."))?;
+    Ok((provider, key, s.language_switch_keywords_enabled))
 }
 
 /// Up to one second of 16kHz audio per WebSocket message.
@@ -1746,7 +1753,7 @@ async fn start_streaming_transcription(
 
     // StreamingSession::start turns "auto" into Deepgram's multilingual model.
     let lang = language.unwrap_or_else(|| "auto".to_string());
-    let (api_key, language_switch_enabled) = streaming_config(&state)?;
+    let (provider, api_key, language_switch_enabled) = streaming_config(&state)?;
 
     // Channel to pipe audio chunks from the CPAL callback (sync) to an async dispatcher.
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
@@ -1778,6 +1785,7 @@ async fn start_streaming_transcription(
 
     // Open WebSocket. If this fails, roll back the recorder we just started.
     let session = match streaming::StreamingSession::start(
+        &provider,
         &api_key,
         &lang,
         language_switch_enabled,
@@ -1829,7 +1837,7 @@ async fn switch_streaming_language(
     app: AppHandle,
     language: String,
 ) -> Result<(), String> {
-    let (api_key, language_switch_enabled) = streaming_config(&state)?;
+    let (provider, api_key, language_switch_enabled) = streaming_config(&state)?;
     // Held for the whole swap, so a stop that arrives meanwhile waits for it.
     let mut guard = state.streaming.lock().await;
     let Some(old) = guard.take() else {
@@ -1837,6 +1845,7 @@ async fn switch_streaming_language(
     };
 
     let session = match streaming::StreamingSession::start(
+        &provider,
         &api_key,
         &language,
         language_switch_enabled,
@@ -2081,15 +2090,17 @@ fn update_settings(state: State<AppState>, new_settings: settings::AppSettings) 
 
 /// Save an API key to OS-secure storage (Windows Credential Manager / macOS Keychain)
 /// and update the in-memory cache so subsequent transcribe calls find it.
-/// `provider` must be `"deepgram"` or `"groq"`.
+/// `provider` must be `"deepgram"`, `"groq"` or `"elevenlabs"`.
 #[tauri::command]
 fn set_api_key(state: State<AppState>, provider: String, key: String) -> Result<(), String> {
+    let key = key.trim().to_string();
     if key.is_empty() {
         return Err("מפתח ריק — אם ברצונך למחוק, השתמש ב-clear_api_key".to_string());
     }
     let provider_id: &'static str = match provider.as_str() {
         "deepgram" => "deepgram",
         "groq" => "groq",
+        "elevenlabs" => "elevenlabs",
         other => return Err(format!("ספק לא נתמך: {}", other)),
     };
     secure_keys::save_key(provider_id, &key)?;
@@ -2097,6 +2108,7 @@ fn set_api_key(state: State<AppState>, provider: String, key: String) -> Result<
     match provider_id {
         "deepgram" => s.deepgram_api_key = Some(key),
         "groq" => s.groq_api_key = Some(key),
+        "elevenlabs" => s.elevenlabs_api_key = Some(key),
         _ => unreachable!(),
     }
     Ok(())
@@ -2108,6 +2120,7 @@ fn clear_api_key(state: State<AppState>, provider: String) -> Result<(), String>
     let provider_id: &'static str = match provider.as_str() {
         "deepgram" => "deepgram",
         "groq" => "groq",
+        "elevenlabs" => "elevenlabs",
         other => return Err(format!("ספק לא נתמך: {}", other)),
     };
     secure_keys::delete_key(provider_id)?;
@@ -2115,6 +2128,7 @@ fn clear_api_key(state: State<AppState>, provider: String) -> Result<(), String>
     match provider_id {
         "deepgram" => s.deepgram_api_key = None,
         "groq" => s.groq_api_key = None,
+        "elevenlabs" => s.elevenlabs_api_key = None,
         _ => unreachable!(),
     }
     Ok(())

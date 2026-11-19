@@ -32,6 +32,10 @@ pub struct ToolbarPosition {
 pub enum ApiProvider {
     Deepgram,
     Groq,
+    /// ElevenLabs Scribe (v3 for files, v3 Live for streaming). Measured 2026-11-19
+    /// on FLEURS Hebrew: ~11% WER batch / ~16% streaming vs Deepgram's 20-35%.
+    #[serde(rename = "elevenlabs")]
+    ElevenLabs,
 }
 
 impl Default for ApiProvider {
@@ -52,6 +56,7 @@ impl<'de> Deserialize<'de> for ApiProvider {
         match s.as_str() {
             "deepgram" => Ok(ApiProvider::Deepgram),
             "groq" => Ok(ApiProvider::Groq),
+            "elevenlabs" => Ok(ApiProvider::ElevenLabs),
             _ => Ok(ApiProvider::default()),
         }
     }
@@ -69,6 +74,9 @@ pub struct AppSettings {
     /// Cache only — persisted in OS-secure storage (Credential Manager / Keychain), never in JSON.
     #[serde(skip)]
     pub groq_api_key: Option<String>,
+    /// Cache only — persisted in OS-secure storage (Credential Manager / Keychain), never in JSON.
+    #[serde(skip)]
+    pub elevenlabs_api_key: Option<String>,
     #[serde(default = "default_preferred_model")]
     pub preferred_model: String,
     #[serde(default = "default_language")]
@@ -209,6 +217,7 @@ pub struct RedactedSettings {
     pub api_provider: ApiProvider,
     pub has_deepgram_key: bool,
     pub has_groq_key: bool,
+    pub has_elevenlabs_key: bool,
     pub preferred_model: String,
     pub language: String,
     pub vad_enabled: bool,
@@ -249,6 +258,7 @@ impl AppSettings {
             api_provider: self.api_provider.clone(),
             has_deepgram_key: self.deepgram_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             has_groq_key: self.groq_api_key.as_ref().is_some_and(|k| !k.is_empty()),
+            has_elevenlabs_key: self.elevenlabs_api_key.as_ref().is_some_and(|k| !k.is_empty()),
             preferred_model: self.preferred_model.clone(),
             language: self.language.clone(),
             vad_enabled: self.vad_enabled,
@@ -367,6 +377,7 @@ impl Default for AppSettings {
             api_provider: ApiProvider::default(),
             deepgram_api_key: None,
             groq_api_key: None,
+            elevenlabs_api_key: None,
             preferred_model: default_preferred_model(),
             language: default_language(),
             language_auto_migrated: true,
@@ -409,7 +420,34 @@ impl AppSettings {
         match self.api_provider {
             ApiProvider::Deepgram => self.deepgram_api_key.as_deref(),
             ApiProvider::Groq => self.groq_api_key.as_deref(),
+            ApiProvider::ElevenLabs => self.elevenlabs_api_key.as_deref(),
         }
+    }
+
+    /// Key for a given provider, ignoring empty strings.
+    pub fn key_for(&self, provider: &ApiProvider) -> Option<&str> {
+        match provider {
+            ApiProvider::Deepgram => self.deepgram_api_key.as_deref(),
+            ApiProvider::Groq => self.groq_api_key.as_deref(),
+            ApiProvider::ElevenLabs => self.elevenlabs_api_key.as_deref(),
+        }
+        .filter(|k| !k.is_empty())
+    }
+
+    /// Provider + key for file and call transcription (needs word timestamps,
+    /// so Groq never qualifies): ElevenLabs when it is the active provider and
+    /// has a key, otherwise Deepgram.
+    pub fn file_provider(&self) -> Option<(ApiProvider, String)> {
+        if self.api_provider == ApiProvider::ElevenLabs {
+            if let Some(k) = self.key_for(&ApiProvider::ElevenLabs) {
+                return Some((ApiProvider::ElevenLabs, k.to_string()));
+            }
+        }
+        if let Some(k) = self.key_for(&ApiProvider::Deepgram) {
+            return Some((ApiProvider::Deepgram, k.to_string()));
+        }
+        self.key_for(&ApiProvider::ElevenLabs)
+            .map(|k| (ApiProvider::ElevenLabs, k.to_string()))
     }
 }
 
@@ -493,6 +531,11 @@ pub fn load_settings() -> LoadResult {
         Ok(_) => {}
         Err(e) => eprintln!("[settings] keyring read failed for groq: {}", e),
     }
+    match crate::secure_keys::load_key("elevenlabs") {
+        Ok(Some(k)) if !k.is_empty() => settings.elevenlabs_api_key = Some(k),
+        Ok(_) => {}
+        Err(e) => eprintln!("[settings] keyring read failed for elevenlabs: {}", e),
+    }
 
     // 2) Detect legacy keys present in JSON (only present on pre-2.6.0 installs).
     let legacy_deepgram = raw_json
@@ -565,6 +608,13 @@ pub fn load_settings() -> LoadResult {
             }
         }
     }
+    if settings.elevenlabs_api_key.is_none() {
+        if let Ok(key) = std::env::var("ELEVENLABS_API_KEY") {
+            if !key.is_empty() {
+                settings.elevenlabs_api_key = Some(key);
+            }
+        }
+    }
 
     LoadResult { settings, migration }
 }
@@ -610,6 +660,7 @@ impl AppSettings {
     pub fn merge_frontend_update(&self, mut incoming: AppSettings) -> AppSettings {
         incoming.deepgram_api_key = self.deepgram_api_key.clone();
         incoming.groq_api_key = self.groq_api_key.clone();
+        incoming.elevenlabs_api_key = self.elevenlabs_api_key.clone();
         // LATCH, don't overwrite: the onboarding wizard's completion payload
         // legitimately carries onboarding_completed:true while the in-memory
         // value is still false. A plain `= self.onboarding_completed` silently
@@ -644,6 +695,31 @@ mod merge_tests {
     use super::*;
 
     #[test]
+    fn elevenlabs_provider_round_trips_and_routes_files() {
+        let p: ApiProvider = serde_json::from_str(r#""elevenlabs""#).unwrap();
+        assert_eq!(p, ApiProvider::ElevenLabs);
+        assert_eq!(serde_json::to_string(&ApiProvider::ElevenLabs).unwrap(), r#""elevenlabs""#);
+
+        let mut s = AppSettings { api_provider: ApiProvider::ElevenLabs, ..AppSettings::default() };
+        s.deepgram_api_key = Some("dg".into());
+        assert_eq!(s.active_api_key(), None);
+        // Active provider has no key: files fall back to Deepgram.
+        assert_eq!(s.file_provider(), Some((ApiProvider::Deepgram, "dg".into())));
+        s.elevenlabs_api_key = Some("sk_x".into());
+        assert_eq!(s.file_provider(), Some((ApiProvider::ElevenLabs, "sk_x".into())));
+        // Deepgram active: Deepgram, even with an ElevenLabs key around.
+        s.api_provider = ApiProvider::Deepgram;
+        assert_eq!(s.file_provider(), Some((ApiProvider::Deepgram, "dg".into())));
+        // Groq active (no timestamps): the ElevenLabs key still serves files.
+        s.api_provider = ApiProvider::Groq;
+        s.deepgram_api_key = Some(String::new());
+        assert_eq!(s.file_provider(), Some((ApiProvider::ElevenLabs, "sk_x".into())));
+        assert!(s.redacted().has_elevenlabs_key);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("sk_x"), "keys never reach settings.json");
+    }
+
+    #[test]
     fn the_old_two_handed_language_hotkey_moves_to_alt_x_but_choices_stay() {
         let mut old_default = AppSettings { language_hotkey: Some("alt+l".into()), ..AppSettings::default() };
         migrate_language_hotkey(&mut old_default);
@@ -667,6 +743,7 @@ mod merge_tests {
         current.toolbar_position = Some(ToolbarPosition { x: 658.0, y: 804.0 });
         current.groq_api_key = Some("gsk_secret".to_string());
         current.deepgram_api_key = Some("dg_secret".to_string());
+        current.elevenlabs_api_key = Some("sk_secret".to_string());
 
         // What persistSettings sends: the managed fields fall back to serde defaults.
         let mut incoming = AppSettings::default();
@@ -685,6 +762,7 @@ mod merge_tests {
         assert_eq!(merged.toolbar_position, Some(ToolbarPosition { x: 658.0, y: 804.0 }));
         assert_eq!(merged.groq_api_key.as_deref(), Some("gsk_secret"));
         assert_eq!(merged.deepgram_api_key.as_deref(), Some("dg_secret"));
+        assert_eq!(merged.elevenlabs_api_key.as_deref(), Some("sk_secret"));
         // ...while the genuine user change is kept.
         assert_eq!(merged.audio_volume, 0.9);
     }

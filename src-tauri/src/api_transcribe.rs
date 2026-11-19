@@ -622,14 +622,24 @@ fn multichannel_url(language: &str) -> String {
 fn build_multichannel_result(
     body: &serde_json::Value,
 ) -> (String, Vec<crate::srt::TimedSegment>) {
+    let channels: Vec<Vec<crate::srt::TimedWord>> = (0usize..2)
+        .map(|i| parse_deepgram_words(&body["results"]["channels"][i]["alternatives"][0]))
+        .collect();
+    merge_call_channels(channels)
+}
+
+/// Shared by both providers' call mode: stamp each channel's index as the
+/// speaker (0 = "me", 1 = "them"), chunk per channel, merge by start time and
+/// build the labeled text from the merged cues.
+fn merge_call_channels(
+    channels: Vec<Vec<crate::srt::TimedWord>>,
+) -> (String, Vec<crate::srt::TimedSegment>) {
     let mut segments: Vec<crate::srt::TimedSegment> = Vec::new();
-    for channel_idx in 0u32..2 {
-        let alt = &body["results"]["channels"][channel_idx as usize]["alternatives"][0];
-        let mut words = parse_deepgram_words(alt);
+    for (channel_idx, mut words) in channels.into_iter().enumerate() {
         // diarize is off → the parser returns None; stamp the channel index
         // explicitly on each word before chunking (spec §4.4).
         for w in &mut words {
-            w.speaker = Some(channel_idx);
+            w.speaker = Some(channel_idx as u32);
         }
         segments.extend(crate::srt::chunk_words_to_cues(
             &words,
@@ -693,6 +703,204 @@ pub(crate) async fn transcribe_deepgram_multichannel(
     Ok(build_multichannel_result(&body))
 }
 
+// ── ElevenLabs Scribe ──
+//
+// Measured 2026-11-19 (FLEURS Hebrew dev, 40 clips / 648 words, plus 12
+// Hebrew-English code-switched sentences): Scribe v3 batch 11.3% WER and 6.6%
+// on the mixed set, against Deepgram multi 30.7% / 30.7% and Deepgram he
+// 20.1% / 32.1%. Pinning `he` still writes English terms in Latin letters and
+// transcribed pure English perfectly, so "auto" maps to `he` here; adding
+// `en` as a secondary language made the mixed set worse (10.9%).
+
+const ELEVENLABS_STT_URL: &str = "https://api.elevenlabs.io/v1/speech-to-text";
+pub(crate) const ELEVENLABS_BATCH_MODEL: &str = "scribe_v3";
+
+/// Scribe language code for an app language setting.
+pub(crate) fn elevenlabs_language(lang: &str) -> &str {
+    match lang {
+        "auto" | "multi" | "he" => "he",
+        other => other,
+    }
+}
+
+/// ElevenLabs reports a bad key as 400 `authentication_error` (e.g. a key
+/// without the `sk_` prefix) and an empty balance as `quota_exceeded`, so the
+/// body decides before the status does.
+pub(crate) fn classify_elevenlabs(status: reqwest::StatusCode, body: &str) -> ApiError {
+    if body.contains("authentication_error") || body.contains("invalid_api_key") {
+        ApiError::Unauthorized
+    } else if body.contains("quota_exceeded") || body.contains("insufficient") {
+        ApiError::InsufficientCredit
+    } else {
+        classify_status(status, body)
+    }
+}
+
+/// `speaker_3` → 3.
+pub(crate) fn elevenlabs_speaker(v: &serde_json::Value) -> Option<u32> {
+    v.as_str()?.rsplit('_').next()?.parse().ok()
+}
+
+/// Scribe `words[]` (word / spacing / audio_event entries) → `TimedWord`s.
+pub(crate) fn parse_elevenlabs_words(words: &serde_json::Value) -> Vec<crate::srt::TimedWord> {
+    words
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|w| w["type"].as_str().unwrap_or("word") == "word")
+                .filter_map(|w| {
+                    let text = w["text"].as_str()?.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(crate::srt::TimedWord {
+                        text: text.to_string(),
+                        start_ms: (w["start"].as_f64()? * 1000.0).round() as u64,
+                        end_ms: (w["end"].as_f64()? * 1000.0).round() as u64,
+                        speaker: elevenlabs_speaker(&w["speaker_id"]),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn elevenlabs_form(audio: Vec<u8>, language: &str) -> Result<multipart::Form, ApiError> {
+    let file_part = multipart::Part::bytes(audio)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| ApiError::Other(format!("Failed to create multipart: {}", e)))?;
+    let mut form = multipart::Form::new()
+        .text("model_id", ELEVENLABS_BATCH_MODEL)
+        .text("language_code", elevenlabs_language(language).to_string())
+        .text("tag_audio_events", "false");
+    for t in crate::dictionary::elevenlabs_keyterms() {
+        form = form.text("keyterms", t);
+    }
+    Ok(form.part("file", file_part))
+}
+
+async fn elevenlabs_post(
+    client: &reqwest::Client,
+    form: multipart::Form,
+    api_key: &str,
+    timeout: Option<Duration>,
+) -> Result<serde_json::Value, ApiError> {
+    let mut req = client
+        .post(ELEVENLABS_STT_URL)
+        .header("xi-api-key", api_key)
+        .multipart(form);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    let response = req.send().await.map_err(|e| classify_request_error(&e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_elevenlabs(status, &body));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| ApiError::Other(format!("Failed to parse ElevenLabs response: {}", e)))
+}
+
+async fn transcribe_elevenlabs_inner(
+    samples: &[f32],
+    api_key: &str,
+    language: &str,
+) -> Result<String, ApiError> {
+    let form = elevenlabs_form(samples_to_wav(samples, 16000), language)?;
+    let body = elevenlabs_post(&reqwest::Client::new(), form, api_key, Some(Duration::from_secs(30))).await?;
+    Ok(body["text"].as_str().unwrap_or("").trim().to_string())
+}
+
+/// Long-file ElevenLabs request, same contract as `transcribe_deepgram_batch`
+/// (the caller's client carries the long timeout). Diarized, word timestamps.
+pub(crate) async fn transcribe_elevenlabs_batch(
+    client: &reqwest::Client,
+    samples: &[f32],
+    api_key: &str,
+    language: &str,
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+    let form = elevenlabs_form(samples_to_wav(samples, 16000), language)?
+        .text("diarize", "true")
+        .text("timestamps_granularity", "word");
+    let body = elevenlabs_post(client, form, api_key, None).await?;
+    Ok(build_elevenlabs_batch_result(&body))
+}
+
+fn build_elevenlabs_batch_result(body: &serde_json::Value) -> (String, Vec<crate::srt::TimedSegment>) {
+    let words = parse_elevenlabs_words(&body["words"]);
+    let segments = crate::srt::chunk_words_to_cues(
+        &words,
+        crate::srt::SRT_MAX_WORDS_PER_CUE,
+        crate::srt::SRT_MAX_MS_PER_CUE,
+    );
+    (body["text"].as_str().unwrap_or("").trim().to_string(), segments)
+}
+
+/// Call mode on ElevenLabs: the same stereo WAV (channel 0 = me, 1 = them)
+/// with `use_multi_channel=true`. The response carries `transcripts[]`, one
+/// per channel with its own `channel_index` and words on the shared clock
+/// (verified live 2026-11-19).
+pub(crate) async fn transcribe_elevenlabs_multichannel(
+    client: &reqwest::Client,
+    stereo_wav_bytes: Vec<u8>,
+    api_key: &str,
+    language: &str,
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+    let form = elevenlabs_form(stereo_wav_bytes, language)?
+        .text("use_multi_channel", "true")
+        .text("timestamps_granularity", "word");
+    let body = elevenlabs_post(client, form, api_key, None).await?;
+    Ok(build_elevenlabs_multichannel_result(&body))
+}
+
+fn build_elevenlabs_multichannel_result(
+    body: &serde_json::Value,
+) -> (String, Vec<crate::srt::TimedSegment>) {
+    let mut channels: Vec<Vec<crate::srt::TimedWord>> = vec![Vec::new(), Vec::new()];
+    if let Some(ts) = body["transcripts"].as_array() {
+        for (i, t) in ts.iter().enumerate() {
+            let idx = t["channel_index"].as_u64().map(|n| n as usize).unwrap_or(i);
+            if idx < 2 {
+                channels[idx] = parse_elevenlabs_words(&t["words"]);
+            }
+        }
+    }
+    merge_call_channels(channels)
+}
+
+/// File / call transcription on whichever provider `settings::file_provider` picked.
+pub(crate) async fn transcribe_file_batch(
+    provider: &ApiProvider,
+    client: &reqwest::Client,
+    samples: &[f32],
+    api_key: &str,
+    language: &str,
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+    match provider {
+        ApiProvider::ElevenLabs => transcribe_elevenlabs_batch(client, samples, api_key, language).await,
+        _ => transcribe_deepgram_batch(client, samples, api_key, language).await,
+    }
+}
+
+pub(crate) async fn transcribe_call_multichannel(
+    provider: &ApiProvider,
+    client: &reqwest::Client,
+    stereo_wav_bytes: Vec<u8>,
+    api_key: &str,
+    language: &str,
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+    match provider {
+        ApiProvider::ElevenLabs => {
+            transcribe_elevenlabs_multichannel(client, stereo_wav_bytes, api_key, language).await
+        }
+        _ => transcribe_deepgram_multichannel(client, stereo_wav_bytes, api_key, language).await,
+    }
+}
+
 // ── Unified entry point ──
 
 /// Languages accepted by the transcription APIs.
@@ -718,6 +926,7 @@ async fn transcribe_api_inner(
     let lang = validate_language(language).map_err(ApiError::Other)?;
     match provider {
         ApiProvider::Deepgram => transcribe_deepgram_inner(samples, api_key, lang).await,
+        ApiProvider::ElevenLabs => transcribe_elevenlabs_inner(samples, api_key, lang).await,
         ApiProvider::Groq => {
             let text = transcribe_groq_inner(samples, api_key, lang).await?;
             // Whisper's own language detection reads unclear Hebrew as Arabic
@@ -788,6 +997,76 @@ mod tests {
         assert_eq!(words[1].speaker, Some(0));
         assert_eq!(words[2].text, "היי");
         assert_eq!(words[2].speaker, Some(1));
+    }
+
+    #[test]
+    fn elevenlabs_language_pins_hebrew_for_auto() {
+        assert_eq!(elevenlabs_language("auto"), "he");
+        assert_eq!(elevenlabs_language("multi"), "he");
+        assert_eq!(elevenlabs_language("he"), "he");
+        assert_eq!(elevenlabs_language("en"), "en");
+        assert_eq!(elevenlabs_language("fr"), "fr");
+    }
+
+    #[test]
+    fn elevenlabs_errors_classify_by_body() {
+        // Real body for a bad key (2026-11-19): HTTP 400, not 401.
+        let bad = r#"{"detail":{"type":"authentication_error","code":"invalid_api_key","message":"API key must start with 'sk_'."}}"#;
+        assert!(classify_elevenlabs(reqwest::StatusCode::BAD_REQUEST, bad).is_key_problem());
+        assert!(matches!(
+            classify_elevenlabs(reqwest::StatusCode::UNAUTHORIZED, r#"{"detail":{"status":"quota_exceeded"}}"#),
+            ApiError::InsufficientCredit
+        ));
+        assert!(matches!(
+            classify_elevenlabs(reqwest::StatusCode::BAD_REQUEST, "audio too short"),
+            ApiError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn elevenlabs_words_skip_spacing_and_read_speakers() {
+        let words = serde_json::json!([
+            {"text":"כעת","start":0.72,"end":0.96,"type":"word","speaker_id":"speaker_0"},
+            {"text":" ","start":0.96,"end":1.0,"type":"spacing","speaker_id":"speaker_0"},
+            {"text":"זמין,","start":1.0,"end":1.26,"type":"word","speaker_id":"speaker_12"},
+            {"text":"(laughs)","start":1.3,"end":1.5,"type":"audio_event"}
+        ]);
+        let w = parse_elevenlabs_words(&words);
+        assert_eq!(w.len(), 2);
+        assert_eq!((w[0].text.as_str(), w[0].start_ms, w[0].end_ms, w[0].speaker), ("כעת", 720, 960, Some(0)));
+        assert_eq!((w[1].text.as_str(), w[1].speaker), ("זמין,", Some(12)));
+        assert_eq!(elevenlabs_speaker(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn elevenlabs_multichannel_labels_each_side_and_merges_by_time() {
+        // Shape verified live 2026-11-19: transcripts[] with channel_index.
+        let body = serde_json::json!({"transcripts":[
+            {"channel_index":1,"text":"היי","words":[{"text":"היי","start":2.4,"end":2.7,"type":"word","speaker_id":"speaker_1"}]},
+            {"channel_index":0,"text":"שלום","words":[{"text":"שלום","start":0.68,"end":0.96,"type":"word","speaker_id":"speaker_0"}]}
+        ]});
+        let (text, segs) = build_elevenlabs_multichannel_result(&body);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].speaker, Some(0));
+        assert_eq!(segs[1].speaker, Some(1));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("שלום"));
+        assert!(lines[1].ends_with("היי"));
+    }
+
+    #[test]
+    fn elevenlabs_batch_result_uses_service_text_and_word_cues() {
+        let body = serde_json::json!({"text":" שלום עולם ","words":[
+            {"text":"שלום","start":0.0,"end":0.4,"type":"word","speaker_id":"speaker_0"},
+            {"text":" ","start":0.4,"end":0.5,"type":"spacing"},
+            {"text":"עולם","start":0.5,"end":0.9,"type":"word","speaker_id":"speaker_0"}
+        ]});
+        let (text, segs) = build_elevenlabs_batch_result(&body);
+        assert_eq!(text, "שלום עולם");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].start_ms, 0);
+        assert_eq!(segs[0].end_ms, 900);
     }
 
     #[test]

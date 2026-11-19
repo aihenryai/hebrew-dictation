@@ -93,6 +93,26 @@ pub fn keyterm_params() -> String {
     out
 }
 
+/// Terms for ElevenLabs Scribe `keyterms` (each under 50 characters, per its API).
+/// Note: keyterms add a surcharge on ElevenLabs, so an empty dictionary sends none.
+pub fn elevenlabs_keyterms() -> Vec<String> {
+    terms()
+        .into_iter()
+        .filter(|t| t.chars().count() < 50)
+        .take(MAX_KEYTERMS)
+        .collect()
+}
+
+/// `&keyterms=...` query parameters for the ElevenLabs realtime URL, or "".
+pub fn elevenlabs_keyterm_params() -> String {
+    let mut out = String::new();
+    for t in elevenlabs_keyterms() {
+        out.push_str("&keyterms=");
+        out.push_str(&percent_encode(&t));
+    }
+    out
+}
+
 /// Initial prompt for local whisper: the words, comma separated. None when empty.
 pub fn whisper_prompt() -> Option<String> {
     let t = terms();

@@ -33,10 +33,30 @@ pub struct StreamingSession {
     endpoint: Endpoint,
 }
 
+/// Wire protocol of the streaming service.
+///
+/// Deepgram: binary PCM frames, `{"type":"CloseStream"}` to finish, results
+/// with `is_final` + `start`/`duration`.
+///
+/// ElevenLabs Scribe v3 Live (verified live 2026-11-19): JSON text frames
+/// `{"message_type":"input_audio_chunk","audio_base_64":...,"commit":bool}`;
+/// `session_started` first, then `partial_transcript` and, per VAD commit,
+/// `committed_transcript` followed by `committed_transcript_with_timestamps`
+/// (same text, word times in seconds from the connection's first sample).
+/// A bad key gets `auth_error` and a close. There is no CloseStream: the end is
+/// a commit, and the connection closes by itself after ~40 s without audio.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Protocol {
+    Deepgram,
+    ElevenLabs,
+}
+
 /// Where to (re)connect. Kept so a dropped connection can be reopened.
 struct Endpoint {
     url: String,
-    auth: Option<String>,
+    /// Header name and value.
+    auth: Option<(&'static str, String)>,
+    protocol: Protocol,
 }
 
 /// State shared by every connection of one session: a reconnect replaces the
@@ -55,11 +75,40 @@ struct ReceiveContext {
     unacked: std::sync::Mutex<Unacked>,
     /// Reconnects since the service last sent anything; reset on every message.
     failed_reconnects: AtomicU32,
+    protocol: Protocol,
+    /// An error no reconnect can fix (bad key, no credit). Ends the dictation
+    /// with this message instead of reconnecting in a loop.
+    fatal: std::sync::Mutex<Option<String>>,
+    /// ElevenLabs: the final commit went out; the receiver drains and ends.
+    stop_commit_sent: AtomicBool,
+    /// Milliseconds since `epoch` when audio was last written to the socket.
+    last_audio_ms: AtomicU64,
+    epoch: std::time::Instant,
 }
 
 impl ReceiveContext {
     fn unacked(&self) -> std::sync::MutexGuard<'_, Unacked> {
         self.unacked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn fatal(&self) -> Option<String> {
+        self.fatal.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_fatal(&self, msg: String) {
+        let mut f = self.fatal.lock().unwrap_or_else(|e| e.into_inner());
+        if f.is_none() {
+            *f = Some(msg);
+        }
+    }
+
+    fn mark_audio(&self) {
+        self.last_audio_ms
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn ms_since_audio(&self) -> u64 {
+        (self.epoch.elapsed().as_millis() as u64).saturating_sub(self.last_audio_ms.load(Ordering::SeqCst))
     }
 }
 
@@ -113,6 +162,90 @@ fn pcm_bytes(pcm: &[i16]) -> Vec<u8> {
     pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
+/// Standard base64 with padding (ElevenLabs audio frames).
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// One audio frame in the protocol's wire format.
+fn audio_frame(protocol: Protocol, pcm: &[i16], commit: bool) -> Message {
+    match protocol {
+        Protocol::Deepgram => Message::Binary(pcm_bytes(pcm).into()),
+        Protocol::ElevenLabs => Message::Text(
+            format!(
+                r#"{{"message_type":"input_audio_chunk","audio_base_64":"{}","commit":{},"sample_rate":16000}}"#,
+                base64_encode(&pcm_bytes(pcm)),
+                commit
+            )
+            .into(),
+        ),
+    }
+}
+
+/// Resend chunk size after a reconnect. ElevenLabs gets half-second frames
+/// (base64 makes them a third bigger) to stay clear of its chunk limit.
+fn resend_chunk(protocol: Protocol) -> usize {
+    match protocol {
+        Protocol::Deepgram => 16_000,
+        Protocol::ElevenLabs => 8_000,
+    }
+}
+
+/// ElevenLabs: where a committed segment's audio ends, from the last word's
+/// end in `committed_transcript_with_timestamps`.
+fn elevenlabs_audio_end(json: &serde_json::Value) -> Option<u64> {
+    if json.get("message_type")?.as_str()? != "committed_transcript_with_timestamps" {
+        return None;
+    }
+    let end = json
+        .get("words")?
+        .as_array()?
+        .iter()
+        .filter_map(|w| w.get("end").and_then(|e| e.as_f64()))
+        .fold(f64::NAN, f64::max);
+    end.is_finite().then(|| (end * 16_000.0).round().max(0.0) as u64)
+}
+
+/// ElevenLabs error messages. Returns the user-facing text and whether a
+/// reconnect could help (`false` = stop the dictation with this message).
+fn elevenlabs_error(json: &serde_json::Value) -> Option<(String, bool)> {
+    let kind = json.get("message_type")?.as_str()?;
+    let fatal = match kind {
+        "auth_error" => return Some((ELEVENLABS_BAD_KEY.into(), false)),
+        "quota_exceeded" => return Some((ELEVENLABS_NO_CREDIT.into(), false)),
+        "unaccepted_terms" => true,
+        k if k.ends_with("error") || k.ends_with("exceeded") || k.ends_with("throttled")
+            || k == "rate_limited" || k == "queue_overflow" || k == "resource_exhausted" =>
+        {
+            false
+        }
+        _ => return None,
+    };
+    let detail = json
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect::<String>();
+    Some((format!("שגיאה בשירות התמלול של ElevenLabs ({kind}) {detail}").trim().to_string(), !fatal))
+}
+
+const ELEVENLABS_BAD_KEY: &str = "מפתח ElevenLabs לא תקין. אפשר לעדכן אותו בהגדרות.";
+const ELEVENLABS_NO_CREDIT: &str =
+    "נגמר הקרדיט ב-ElevenLabs. אפשר להוסיף קרדיט בחשבון שלהם או להחליף ספק בהגדרות.";
+
 /// Where a final result's audio ends, in samples from the connection's start.
 /// Empty finals (silence) count too: they acknowledge audio as well.
 fn final_audio_end(raw: &str) -> Option<u64> {
@@ -130,18 +263,50 @@ async fn open(endpoint: &Endpoint) -> Result<WsStream, String> {
         .as_str()
         .into_client_request()
         .map_err(|e| format!("Invalid streaming URL: {}", e))?;
-    if let Some(auth) = &endpoint.auth {
+    if let Some((name, value)) = &endpoint.auth {
         request.headers_mut().insert(
-            "Authorization",
-            auth.parse()
+            *name,
+            value
+                .parse()
                 .map_err(|e| format!("Invalid auth header: {}", e))?,
         );
     }
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
+    let (mut ws_stream, _response) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| map_ws_error(&e))?;
+    if endpoint.protocol == Protocol::ElevenLabs {
+        // ElevenLabs accepts the socket before checking the key, then answers
+        // with `session_started` or an error. Waiting for it here turns a bad
+        // key into a start failure the user sees at once.
+        await_session_started(&mut ws_stream).await?;
+    }
     Ok(ws_stream)
 }
+
+async fn await_session_started(ws: &mut WsStream) -> Result<(), String> {
+    let first = tokio::time::timeout(CONNECT_TIMEOUT, ws.next())
+        .await
+        .map_err(|_| "שירות התמלול לא ענה בזמן. כדאי לבדוק את החיבור לאינטרנט.".to_string())?;
+    match first {
+        Some(Ok(Message::Text(txt))) => {
+            let json: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+            if json["message_type"] == "session_started" {
+                Ok(())
+            } else if let Some((msg, _)) = elevenlabs_error(&json) {
+                Err(msg)
+            } else {
+                Err(format!("תשובה לא צפויה משירות התמלול: {}", txt.chars().take(120).collect::<String>()))
+            }
+        }
+        Some(Err(e)) => Err(map_ws_error(&e)),
+        _ => Err("שירות התמלול סגר את החיבור מיד. ייתכן שהמפתח לא תקין.".into()),
+    }
+}
+
+/// After the final commit, how long the receiver keeps listening once
+/// nothing new arrives. Commit answers came within ~0.1 s in the 2026-11-19
+/// probes; partials of a long last segment keep resetting it.
+const ELEVENLABS_DRAIN: Duration = Duration::from_secs(2);
 
 /// `conn_base` is the session position of this connection's first sample:
 /// Deepgram's timestamps restart at zero on every connection.
@@ -151,16 +316,50 @@ fn spawn_receiver(
     conn_base: u64,
 ) -> JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
-        while let Some(msg) = reader.next().await {
+        let mut commit_after_stop = false;
+        loop {
+            let next = if commit_after_stop {
+                match tokio::time::timeout(ELEVENLABS_DRAIN, reader.next()).await {
+                    Ok(m) => m,
+                    // The final commit is answered and nothing more is coming.
+                    Err(_) => break,
+                }
+            } else {
+                reader.next().await
+            };
+            let Some(msg) = next else { break };
             ctx.activity.fetch_add(1, Ordering::SeqCst);
             match msg {
                 Ok(Message::Text(txt)) => {
+                    let json: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+                    if ctx.protocol == Protocol::ElevenLabs {
+                        if let Some((msg, recoverable)) = elevenlabs_error(&json) {
+                            // An error is not progress: failed_reconnects stays,
+                            // so a service that keeps refusing ends the loop.
+                            eprintln!("[streaming] ElevenLabs error: {}", msg);
+                            if !recoverable {
+                                ctx.set_fatal(msg);
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     ctx.failed_reconnects.store(0, Ordering::SeqCst);
                     handle_message(&txt, &ctx).await;
                     // Only after the text is committed, so audio is never
                     // forgotten before its words are kept.
-                    if let Some(end) = final_audio_end(&txt) {
+                    let end = match ctx.protocol {
+                        Protocol::Deepgram => final_audio_end(&txt),
+                        Protocol::ElevenLabs => elevenlabs_audio_end(&json),
+                    };
+                    if let Some(end) = end {
                         ctx.unacked().ack(conn_base + end);
+                    }
+                    if ctx.protocol == Protocol::ElevenLabs
+                        && ctx.stop_commit_sent.load(Ordering::SeqCst)
+                        && json["message_type"] == "committed_transcript_with_timestamps"
+                    {
+                        commit_after_stop = true;
                     }
                     // Typing a long segment on a slow machine is progress too.
                     ctx.activity.fetch_add(1, Ordering::SeqCst);
@@ -341,12 +540,21 @@ impl StreamingSession {
     /// whole dictation once the keys are released, because typing while the
     /// user still holds Ctrl+Win would turn every character into a shortcut.
     pub async fn start(
+        provider: &crate::settings::ApiProvider,
         api_key: &str,
         language: &str,
         language_switch_enabled: bool,
         live_injection: bool,
         app: AppHandle,
     ) -> Result<Arc<Self>, String> {
+        if *provider == crate::settings::ApiProvider::ElevenLabs {
+            let endpoint = Endpoint {
+                url: elevenlabs_url(language),
+                auth: Some(("xi-api-key", api_key.to_string())),
+                protocol: Protocol::ElevenLabs,
+            };
+            return Self::open_session(endpoint, Some(app), language_switch_enabled, live_injection).await;
+        }
         // day_ordinal_replace_params: Deepgram's smart_format reformats Hebrew
         // day-names ("ביום שני") into a Spanish-style ordinal indicator
         // ("ביום 2º") — see its doc comment in api_transcribe.rs for the full
@@ -364,7 +572,8 @@ impl StreamingSession {
 
         let endpoint = Endpoint {
             url,
-            auth: Some(format!("Token {}", api_key)),
+            auth: Some(("Authorization", format!("Token {}", api_key))),
+            protocol: Protocol::Deepgram,
         };
         Self::open_session(endpoint, Some(app), language_switch_enabled, live_injection).await
     }
@@ -388,10 +597,15 @@ impl StreamingSession {
             dead: AtomicBool::new(false),
             unacked: std::sync::Mutex::new(Unacked::default()),
             failed_reconnects: AtomicU32::new(0),
+            protocol: endpoint.protocol,
+            fatal: std::sync::Mutex::new(None),
+            stop_commit_sent: AtomicBool::new(false),
+            last_audio_ms: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
         });
         let recv_task = spawn_receiver(ctx.clone(), reader, 0);
         let writer = Arc::new(Mutex::new(Some(writer)));
-        spawn_keep_alive(Arc::downgrade(&writer), KEEP_ALIVE_EVERY);
+        spawn_keep_alive(Arc::downgrade(&writer), Arc::downgrade(&ctx), KEEP_ALIVE_EVERY);
         Ok(Arc::new(Self {
             writer,
             recv_task: Mutex::new(Some(recv_task)),
@@ -408,18 +622,27 @@ impl StreamingSession {
     /// the WS. A dropped connection is reopened here, before the error would
     /// reach the user; only a connection that cannot be reopened fails.
     pub async fn send_audio_pcm16(&self, samples: &[f32]) -> Result<(), String> {
+        if let Some(fatal) = self.ctx.fatal() {
+            return Err(fatal);
+        }
         let pcm = to_pcm16(samples);
-        self.ctx.unacked().push(&pcm);
         if self.ctx.dead.load(Ordering::SeqCst) {
+            self.ctx.unacked().push(&pcm);
             // Resends everything unacknowledged, this chunk included.
             return self.reconnect().await;
         }
         let sent = {
             let mut guard = self.writer.lock().await;
+            // Pushed under the writer lock, so the ElevenLabs keep-alive
+            // silence lands in the buffer in the same order as on the wire
+            // and the service's timestamps still match buffer positions.
+            self.ctx.unacked().push(&pcm);
             let Some(writer) = guard.as_mut() else {
                 return Ok(());
             };
-            writer.send(Message::Binary(pcm_bytes(&pcm).into())).await.is_ok()
+            let ok = writer.send(audio_frame(self.ctx.protocol, &pcm, false)).await.is_ok();
+            self.ctx.mark_audio();
+            ok
         };
         if sent {
             self.ctx.activity.fetch_add(1, Ordering::SeqCst);
@@ -444,6 +667,9 @@ impl StreamingSession {
         if writer.is_none() {
             return Ok(());
         }
+        if let Some(fatal) = self.ctx.fatal() {
+            return Err(fatal);
+        }
         if self.ctx.failed_reconnects.fetch_add(1, Ordering::SeqCst) >= MAX_RECONNECTS {
             return Err(RECONNECT_FAILED.into());
         }
@@ -463,6 +689,11 @@ impl StreamingSession {
             let ws = match tokio::time::timeout(CONNECT_TIMEOUT, open(&self.endpoint)).await {
                 Ok(Ok(ws)) => ws,
                 Ok(Err(e)) => {
+                    // A refused key will not be accepted on the next try.
+                    if e == ELEVENLABS_BAD_KEY || e == ELEVENLABS_NO_CREDIT {
+                        self.ctx.set_fatal(e.clone());
+                        return Err(e);
+                    }
                     last_error = e;
                     continue;
                 }
@@ -477,9 +708,9 @@ impl StreamingSession {
                 (unacked.start, unacked.samples.iter().copied().collect::<Vec<i16>>())
             };
             let mut resent = true;
-            for chunk in pending.chunks(16_000) {
+            for chunk in pending.chunks(resend_chunk(self.ctx.protocol)) {
                 if new_writer
-                    .send(Message::Binary(pcm_bytes(chunk).into()))
+                    .send(audio_frame(self.ctx.protocol, chunk, false))
                     .await
                     .is_err()
                 {
@@ -521,19 +752,26 @@ impl StreamingSession {
         let close_result = tokio::time::timeout(limits.idle, async {
             let mut guard = self.writer.lock().await;
             if let Some(mut writer) = guard.take().filter(|_| !dead) {
-                writer
-                    .send(Message::Text(
-                        r#"{"type":"CloseStream"}"#.to_string().into(),
-                    ))
-                    .await
-                    .map_err(|e| map_ws_error(&e))?;
+                let finish = match self.ctx.protocol {
+                    Protocol::Deepgram => Message::Text(r#"{"type":"CloseStream"}"#.to_string().into()),
+                    Protocol::ElevenLabs => {
+                        // A commit needs audio behind it (an empty one is
+                        // throttled and closes the session), and trailing
+                        // silence lets VAD close the last word cleanly.
+                        let tail = vec![0i16; STOP_TAIL_SAMPLES];
+                        self.ctx.unacked().push(&tail);
+                        self.ctx.stop_commit_sent.store(true, Ordering::SeqCst);
+                        audio_frame(Protocol::ElevenLabs, &tail, true)
+                    }
+                };
+                writer.send(finish).await.map_err(|e| map_ws_error(&e))?;
                 // Do not call writer.close(): after sending a WebSocket close
                 // frame tungstenite will reject late transcript data frames.
             }
             Ok::<(), String>(())
         })
         .await;
-        let mut warning = reconnect_warning.or(match close_result {
+        let mut warning = self.ctx.fatal().or(reconnect_warning).or(match close_result {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e),
             Err(_) => Some("בקשת סיום ההכתבה התעכבה; ייתכן שחסר סוף התמלול.".into()),
@@ -544,6 +782,11 @@ impl StreamingSession {
             }
         }
         self.ctx.injection.close_and_drain().await;
+        // A fatal error that arrived while draining (e.g. credit ran out on the
+        // last segment) still reaches the user.
+        if warning.is_none() {
+            warning = self.ctx.fatal();
+        }
         let text = self.ctx.final_text.lock().await.clone();
         // `dead` was read before CloseStream: a connection that is still down
         // here never got the unacknowledged audio.
@@ -562,22 +805,98 @@ impl StreamingSession {
 /// this the connection died there and every later word was lost.
 const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(4);
 
+/// 0.4 s of silence sent with the final ElevenLabs commit.
+const STOP_TAIL_SAMPLES: usize = 6_400;
+/// ElevenLabs has no KeepAlive message and closes a connection that gets no
+/// audio for under 40 s (its `keepalive_interval_ms` did not prevent that in
+/// the 2026-11-19 probe); 100 ms of silence every 4 s did. Only sent when the
+/// microphone sent nothing for `SILENT_AFTER_MS`, so speech is never split.
+const KEEP_ALIVE_SILENCE_SAMPLES: usize = 1_600;
+const SILENT_AFTER_MS: u64 = 3_000;
+
 /// Weak, so a session that is dropped without `stop` does not stay alive.
 /// Stops by itself once `stop` takes the writer, before CloseStream goes out
 /// on the same lock, so no KeepAlive can follow it. A failed send does not
 /// stop it: a reconnect puts a new socket into the same slot.
-fn spawn_keep_alive(writer: std::sync::Weak<Mutex<Option<WsWriter>>>, every: Duration) {
+fn spawn_keep_alive(
+    writer: std::sync::Weak<Mutex<Option<WsWriter>>>,
+    ctx: std::sync::Weak<ReceiveContext>,
+    every: Duration,
+) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(every).await;
             let Some(writer) = writer.upgrade() else { return };
+            let Some(ctx) = ctx.upgrade() else { return };
             let mut guard = writer.lock().await;
             let Some(w) = guard.as_mut() else { return };
-            let _ = w
-                .send(Message::Text(r#"{"type":"KeepAlive"}"#.to_string().into()))
-                .await;
+            match ctx.protocol {
+                Protocol::Deepgram => {
+                    let _ = w
+                        .send(Message::Text(r#"{"type":"KeepAlive"}"#.to_string().into()))
+                        .await;
+                }
+                Protocol::ElevenLabs => {
+                    if ctx.dead.load(Ordering::SeqCst) || ctx.ms_since_audio() < SILENT_AFTER_MS {
+                        continue;
+                    }
+                    // Into the buffer too: the service counts this audio in
+                    // its timestamps, so acknowledgements stay aligned.
+                    let silence = vec![0i16; KEEP_ALIVE_SILENCE_SAMPLES];
+                    ctx.unacked().push(&silence);
+                    let _ = w.send(audio_frame(Protocol::ElevenLabs, &silence, false)).await;
+                    ctx.mark_audio();
+                }
+            }
         }
     });
+}
+
+/// The ElevenLabs realtime URL. "auto" pins Hebrew with English as a secondary
+/// language: on the 12 code-switched sentences that was 12.4% WER against
+/// 14.6% for Hebrew alone, at the same 16% on plain Hebrew (2026-11-19).
+fn elevenlabs_url(language: &str) -> String {
+    let lang = crate::api_transcribe::elevenlabs_language(language);
+    let secondary = if crate::api_transcribe::is_auto_language(language) {
+        "&secondary_languages=en"
+    } else {
+        ""
+    };
+    format!(
+        "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v3_live&audio_format=pcm_16000&language_code={}&commit_strategy=vad&include_timestamps=true{}{}",
+        lang,
+        secondary,
+        crate::dictionary::elevenlabs_keyterm_params()
+    )
+}
+
+/// The transcript text and whether it is final, in either protocol.
+/// ElevenLabs sends each commit twice (`committed_transcript`, then the same
+/// text `_with_timestamps`); only the second counts, since it also carries
+/// the audio position that acknowledges the buffer.
+fn extract_transcript(protocol: Protocol, json: &serde_json::Value) -> Option<(String, bool)> {
+    match protocol {
+        Protocol::Deepgram => {
+            json.get("channel")?;
+            let transcript = json.pointer("/channel/alternatives/0/transcript")?.as_str()?;
+            // Words the multilingual model heard as a third language are dropped (see
+            // `without_foreign_words`). Words are only tagged in "multi" sessions, so
+            // a session locked to Hebrew or English is left alone.
+            let cleaned = json
+                .pointer("/channel/alternatives/0")
+                .and_then(crate::api_transcribe::without_foreign_words);
+            let is_final = json.get("is_final").and_then(|b| b.as_bool()).unwrap_or(false);
+            Some((cleaned.unwrap_or_else(|| transcript.to_string()), is_final))
+        }
+        Protocol::ElevenLabs => {
+            let is_final = match json.get("message_type")?.as_str()? {
+                "partial_transcript" => false,
+                "committed_transcript_with_timestamps" => true,
+                _ => return None,
+            };
+            Some((json.get("text")?.as_str()?.trim().to_string(), is_final))
+        }
+    }
 }
 
 async fn handle_message(raw: &str, ctx: &ReceiveContext) {
@@ -592,30 +911,12 @@ async fn handle_message(raw: &str, ctx: &ReceiveContext) {
         return;
     };
 
-    // Skip non-transcript message types (Metadata, SpeechStarted, UtteranceEnd, etc.)
-    if json.get("channel").is_none() {
-        return;
-    }
-
-    let Some(transcript) = json
-        .pointer("/channel/alternatives/0/transcript")
-        .and_then(|t| t.as_str())
-    else {
+    // Skip non-transcript message types (Metadata, SpeechStarted, session_started, etc.)
+    let Some((transcript, is_final)) = extract_transcript(ctx.protocol, &json) else {
         return;
     };
-    // Words the multilingual model heard as a third language are dropped (see
-    // `without_foreign_words`). Words are only tagged in "multi" sessions, so
-    // a session locked to Hebrew or English is left alone.
-    let cleaned = json
-        .pointer("/channel/alternatives/0")
-        .and_then(crate::api_transcribe::without_foreign_words);
-    let transcript_owned = crate::dictionary::apply(cleaned.as_deref().unwrap_or(transcript));
+    let transcript_owned = crate::dictionary::apply(&transcript);
     let transcript = transcript_owned.as_str();
-
-    let is_final = json
-        .get("is_final")
-        .and_then(|b| b.as_bool())
-        .unwrap_or(false);
 
     if transcript.is_empty() {
         return;
@@ -691,15 +992,13 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error as WsErr;
     match e {
         WsErr::Http(resp) => match resp.status().as_u16() {
-            401 | 403 => "מפתח Deepgram לא תקין — עדכן אותו בהגדרות".to_string(),
-            402 => "נגמר הקרדיט ב-Deepgram — צור חשבון חדש או הוסף קרדיט בלוח הבקרה".to_string(),
-            429 => "חרגת ממגבלת השימוש ב-Deepgram — נסה שוב בעוד רגע".to_string(),
-            400 => {
-                "Deepgram דחה את הבקשה (400) — ייתכן שפת תמלול לא נתמכת במצב streaming".to_string()
-            }
-            code => format!("שגיאת Deepgram (HTTP {})", code),
+            401 | 403 => "מפתח ה-API של שירות התמלול לא תקין. אפשר לעדכן אותו בהגדרות.".to_string(),
+            402 => "נגמר הקרדיט בשירות התמלול. אפשר להוסיף קרדיט או להחליף ספק בהגדרות.".to_string(),
+            429 => "חרגת ממגבלת השימוש בשירות התמלול. נסה שוב בעוד רגע.".to_string(),
+            400 => "שירות התמלול דחה את הבקשה (400). ייתכן ששפת התמלול לא נתמכת בזמן אמת.".to_string(),
+            code => format!("שגיאה בשירות התמלול (HTTP {})", code),
         },
-        WsErr::Io(io) => format!("אין חיבור ל-Deepgram — {}", io),
+        WsErr::Io(io) => format!("אין חיבור לשירות התמלול - {}", io),
         _ => format!("שגיאת streaming: {}", e),
     }
 }
@@ -744,7 +1043,191 @@ mod tests {
         Endpoint {
             url: format!("ws://{address}"),
             auth: None,
+            protocol: Protocol::Deepgram,
         }
+    }
+
+    // ── ElevenLabs ──
+
+    fn el_text(v: serde_json::Value) -> Message {
+        Message::Text(v.to_string().into())
+    }
+
+    fn el_commit(text: &str, end: f64) -> Vec<Message> {
+        vec![
+            el_text(serde_json::json!({"message_type":"committed_transcript","text":text})),
+            el_text(serde_json::json!({
+                "message_type":"committed_transcript_with_timestamps","text":text,
+                "words":[{"text":text,"start":0.0,"end":end,"type":"word"}]
+            })),
+        ]
+    }
+
+    /// Fake ElevenLabs: answers `session_started`, then runs `script`.
+    async fn el_session<F, Fut>(script: F) -> (Arc<StreamingSession>, JoinHandle<()>)
+    where
+        F: FnOnce(WebSocketStream<TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.send(el_text(serde_json::json!({"message_type":"session_started"}))).await.unwrap();
+            script(ws).await;
+        });
+        let endpoint = Endpoint {
+            url: format!("ws://{address}"),
+            auth: None,
+            protocol: Protocol::ElevenLabs,
+        };
+        let session = StreamingSession::open_session(endpoint, None, false, false).await.unwrap();
+        (session, service)
+    }
+
+    fn chunk_of(m: &Message) -> serde_json::Value {
+        match m {
+            Message::Text(t) => serde_json::from_str(t).unwrap(),
+            other => panic!("ElevenLabs audio must be JSON text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_dictation_keeps_committed_text_once_and_ends_on_the_stop_commit() {
+        let (session, service) = el_session(|mut ws| async move {
+            let audio = chunk_of(&ws.next().await.unwrap().unwrap());
+            assert_eq!(audio["message_type"], "input_audio_chunk");
+            assert_eq!(audio["commit"], false);
+            // 320 samples = 640 bytes = 856 base64 characters.
+            assert_eq!(audio["audio_base_64"].as_str().unwrap().len(), 856);
+            ws.send(el_text(serde_json::json!({"message_type":"partial_transcript","text":"שלו"}))).await.unwrap();
+            for m in el_commit("שלום", 0.01) {
+                ws.send(m).await.unwrap();
+            }
+            // The stop: 0.4 s of silence with commit=true, no CloseStream.
+            let stop = chunk_of(&ws.next().await.unwrap().unwrap());
+            assert_eq!(stop["commit"], true);
+            for m in el_commit("עולם", 0.02) {
+                ws.send(m).await.unwrap();
+            }
+            // Leave the socket open: the client must end on its own.
+            std::future::pending::<()>().await;
+        })
+        .await;
+        session.send_audio_pcm16(&[0.1; 320]).await.unwrap();
+        while session.ctx.unacked().start == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(session.ctx.unacked().start, 160, "acknowledged up to the last word's end");
+        let started = std::time::Instant::now();
+        let result = session.stop().await;
+        service.abort();
+        assert_eq!(result.text, "שלום עולם", "each commit counted once");
+        assert!(result.warning.is_none(), "{:?}", result.warning);
+        assert!(started.elapsed() < Duration::from_secs(5), "drained, not timed out");
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_bad_key_fails_at_start() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.send(el_text(serde_json::json!({"message_type":"auth_error","error":"Invalid API key"})))
+                .await
+                .unwrap();
+            let _ = ws.close(None).await;
+        });
+        let endpoint = Endpoint {
+            url: format!("ws://{address}"),
+            auth: None,
+            protocol: Protocol::ElevenLabs,
+        };
+        let err = StreamingSession::open_session(endpoint, None, false, false).await.err().unwrap();
+        assert_eq!(err, ELEVENLABS_BAD_KEY);
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_fatal_error_mid_dictation_stops_instead_of_reconnecting() {
+        let (session, service) = el_session(|mut ws| async move {
+            let _ = ws.next().await;
+            ws.send(el_text(serde_json::json!({"message_type":"quota_exceeded","error":"no credit"})))
+                .await
+                .unwrap();
+            let _ = ws.close(None).await;
+        })
+        .await;
+        session.send_audio_pcm16(&[0.1; 160]).await.unwrap();
+        service.await.unwrap();
+        wait_until_dead(&session).await;
+        let err = session.send_audio_pcm16(&[0.1; 160]).await.unwrap_err();
+        assert_eq!(err, ELEVENLABS_NO_CREDIT);
+        let result = session.stop().await;
+        assert_eq!(result.warning.as_deref(), Some(ELEVENLABS_NO_CREDIT));
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_keep_alive_never_splits_live_speech() {
+        let (session, service) = el_session(|_ws| async move {
+            std::future::pending::<()>().await;
+        })
+        .await;
+        session.send_audio_pcm16(&[0.1; 160]).await.unwrap();
+        let before = session.ctx.unacked().samples.len();
+        // Audio went out a moment ago (< SILENT_AFTER_MS): no silence may be inserted.
+        spawn_keep_alive(Arc::downgrade(&session.writer), Arc::downgrade(&session.ctx), Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.ctx.unacked().samples.len(), before);
+        service.abort();
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0x00, 0x01]), "//4AAQ==");
+    }
+
+    #[test]
+    fn elevenlabs_messages_parse() {
+        let partial = serde_json::json!({"message_type":"partial_transcript","text":" היי "});
+        assert_eq!(extract_transcript(Protocol::ElevenLabs, &partial), Some(("היי".into(), false)));
+        let plain = serde_json::json!({"message_type":"committed_transcript","text":"היי"});
+        assert_eq!(extract_transcript(Protocol::ElevenLabs, &plain), None, "counted via _with_timestamps");
+        let ts = serde_json::json!({"message_type":"committed_transcript_with_timestamps","text":"היי",
+            "words":[{"text":"היי","start":6.54,"end":6.9,"type":"word"},{"text":" ","start":6.9,"end":7.0,"type":"spacing"}]});
+        assert_eq!(extract_transcript(Protocol::ElevenLabs, &ts), Some(("היי".into(), true)));
+        assert_eq!(elevenlabs_audio_end(&ts), Some(112_000));
+        let empty = serde_json::json!({"message_type":"committed_transcript_with_timestamps","text":"","words":null});
+        assert_eq!(elevenlabs_audio_end(&empty), None);
+        assert_eq!(elevenlabs_error(&ts), None);
+        assert_eq!(
+            elevenlabs_error(&serde_json::json!({"message_type":"commit_throttled","error":"x"})).map(|e| e.1),
+            Some(true),
+            "throttling is recoverable"
+        );
+        assert_eq!(
+            elevenlabs_error(&serde_json::json!({"message_type":"auth_error"})),
+            Some((ELEVENLABS_BAD_KEY.to_string(), false))
+        );
+    }
+
+    #[test]
+    fn elevenlabs_url_pins_hebrew_with_english_secondary_on_auto() {
+        let auto = elevenlabs_url("auto");
+        assert!(auto.contains("model_id=scribe_v3_live"));
+        assert!(auto.contains("language_code=he&"));
+        assert!(auto.contains("secondary_languages=en"));
+        assert!(auto.contains("commit_strategy=vad"));
+        assert!(auto.contains("include_timestamps=true"));
+        let en = elevenlabs_url("en");
+        assert!(en.contains("language_code=en&"));
+        assert!(!en.contains("secondary_languages"));
+        assert!(!elevenlabs_url("he").contains("secondary_languages"));
     }
 
     fn final_msg(text: &str, start: f64, duration: f64) -> Message {
@@ -910,7 +1393,11 @@ mod tests {
     #[tokio::test]
     async fn keep_alive_holds_a_silent_stream_open_and_never_follows_close_stream() {
         let (session, mut server) = local_session().await;
-        spawn_keep_alive(Arc::downgrade(&session.writer), Duration::from_millis(15));
+        spawn_keep_alive(
+            Arc::downgrade(&session.writer),
+            Arc::downgrade(&session.ctx),
+            Duration::from_millis(15),
+        );
         let first = tokio::time::timeout(Duration::from_secs(2), server.next())
             .await
             .expect("a silent stream must get a KeepAlive")

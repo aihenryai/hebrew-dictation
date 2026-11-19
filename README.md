@@ -24,7 +24,7 @@
 
 | מצב | מה צריך | יתרונות |
 |-----|---------|---------|
-| **☁️ API** | מפתח Deepgram/Groq (חינם, ללא כרטיס אשראי) | מהיר ומדויק מאוד |
+| **☁️ API** | מפתח ElevenLabs, Deepgram או Groq (חינם, ללא כרטיס אשראי) | מהיר ומדויק מאוד |
 | **💻 מקומי** | הורדת מודל Whisper (75MB-1.5GB) | פרטיות מלאה, ללא אינטרנט |
 
 **מצב אוטומטי** (ברירת מחדל): API עם גיבוי מקומי כשאין חיבור.
@@ -59,12 +59,15 @@ npm run tauri build
 
 ## הגדרת API (אופציונלי)
 
-לתמלול מהיר יותר, צור מפתח Deepgram חינם:
+לתמלול המדויק ביותר בעברית, צור מפתח ElevenLabs:
 
-1. היכנס ל-[deepgram.com](https://deepgram.com)
-2. צור חשבון (כולל $200 קרדיט חינם)
-3. לחץ **Create API Key**
-4. הדבק את המפתח בהגדרות האפליקציה
+1. היכנס ל-[elevenlabs.io](https://elevenlabs.io/app/settings/api-keys)
+2. צור חשבון (יש מכסה חינמית קטנה, ואחריה כ-0.22 דולר לשעת הכתבה)
+3. לחץ **Create API Key** ותן הרשאת **Speech to Text**
+4. הדבק את המפתח בהגדרות האפליקציה, תחת ״ספק API״
+
+בבדיקה שלנו על הקלטות עבריות, ElevenLabs Scribe עשה בערך חצי מהטעויות של Deepgram, בקבצים ובהכתבה סימולטנית.
+חלופה עם קרדיט פתיחה גדול: [Deepgram](https://deepgram.com) (200 דולר חינם).
 
 ## מודלים מקומיים
 
@@ -81,7 +84,7 @@ npm run tauri build
 - **[Tauri v2](https://v2.tauri.app/)** — framework לאפליקציות desktop
 - **[whisper-rs](https://github.com/tazz4843/whisper-rs)** — Whisper.cpp bindings for Rust
 - **React 19** + TypeScript — ממשק משתמש
-- **[Deepgram Nova-3](https://deepgram.com/)** / **[Groq Whisper Turbo](https://groq.com/)** — API תמלול בענן (ללא כרטיס אשראי)
+- **[ElevenLabs Scribe](https://elevenlabs.io/speech-to-text)** / **[Deepgram Nova-3](https://deepgram.com/)** / **[Groq Whisper Turbo](https://groq.com/)** — API תמלול בענן (ללא כרטיס אשראי)
 
 ## תרומה לפרויקט
 
@@ -102,9 +105,9 @@ A short fingerprint of where data goes — useful for security review or before 
 
 | What | Where it lives | When it leaves your machine |
 |------|----------------|-----------------------------|
-| **Dictation audio** | RAM only, from the moment recording starts until it stops | Sent to the transcription provider you chose (Deepgram / Groq), with Deepgram's model-training opt-out set. **In local Whisper mode it never leaves the machine.** |
-| **Meeting and long recordings** | A temporary WAV file in the system temp folder while it is transcribed | Deleted once the transcript is ready, and any leftover is removed the next time the app starts. Sent to Deepgram only when the files screen is set to cloud. |
-| **API keys** (Deepgram / Groq) | The operating system's credential store (Windows Credential Manager / macOS Keychain) | Only sent to the matching provider with transcription requests. **Never sent to BinTech or any other third party.** A `DEEPGRAM_API_KEY` or `GROQ_API_KEY` environment variable, if present, is used as well. |
+| **Dictation audio** | RAM only, from the moment recording starts until it stops | Sent to the transcription provider you chose (ElevenLabs / Deepgram / Groq), with Deepgram's model-training opt-out set. ElevenLabs offers no such switch outside its enterprise plans, so its own data policy applies. **In local Whisper mode it never leaves the machine.** |
+| **Meeting and long recordings** | A temporary WAV file in the system temp folder while it is transcribed | Deleted once the transcript is ready, and any leftover is removed the next time the app starts. Sent to ElevenLabs or Deepgram only when the files screen is set to cloud. |
+| **API keys** (ElevenLabs / Deepgram / Groq) | The operating system's credential store (Windows Credential Manager / macOS Keychain) | Only sent to the matching provider with transcription requests. **Never sent to BinTech or any other third party.** An `ELEVENLABS_API_KEY`, `DEEPGRAM_API_KEY` or `GROQ_API_KEY` environment variable, if present, is used as well. |
 | **Settings** (hotkey, provider choice, model) | `settings.json` in the app's data folder | Never leaves the machine. |
 | **History** (recent transcripts) | A local file in the app's data folder | Never leaves the machine. |
 | **Smart cleanup** (optional, off by default) | - | When turned on, the transcribed **text** is sent to Groq for rewriting, in local mode too. |
@@ -115,7 +118,7 @@ A short fingerprint of where data goes — useful for security review or before 
 
 The microphone is engaged **from the moment you start a recording until you stop it** (or, in hold-to-talk, while the keys are held). There is no always-on listening mode. A meeting recording keeps running when the window is closed to the tray, until you stop it. You can verify this via the OS-level microphone indicator (Windows / macOS).
 
-**Trademarks:** Deepgram and Groq are trademarks of their respective owners. The app supports those services via their public APIs but is not endorsed by, affiliated with, or sponsored by them.
+**Trademarks:** ElevenLabs, Deepgram and Groq are trademarks of their respective owners. The app supports those services via their public APIs but is not endorsed by, affiliated with, or sponsored by them.
 
 ## רישיון
 

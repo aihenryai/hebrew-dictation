@@ -1,5 +1,14 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-19 - ElevenLabs Scribe as a provider, recommended for Hebrew (not released)
+
+Henry: "השאלה אם יש לנו אפשרות לשפר את התמלול עצמו? מלא שגיאות". Measured on FLEURS Hebrew + mixed he/en sentences (scratch bench, deleted): Scribe v3 batch ~11% WER vs Deepgram nova-3 20-31%; Scribe v3 Live ~16% vs Deepgram live 26-35%; mixed he/en 6.6% batch, 12.4% live. Live ~$0.22/h vs ~$0.46.
+- **Settings:** `ApiProvider::ElevenLabs` ("elevenlabs"), key in keyring `elevenlabs` or env `ELEVENLABS_API_KEY`. `file_provider()` picks the files/meeting provider: ElevenLabs when active, else Deepgram, else ElevenLabs.
+- **Files and meetings** (`api_transcribe.rs`): `scribe_v3`, `diarize` + word timestamps; meetings use `use_multi_channel=true`, merged by the shared `merge_call_channels`. Bad key = HTTP 400 with `invalid_api_key` in the body (not 401), see `classify_elevenlabs`.
+- **Live** (`streaming.rs`, `Protocol::ElevenLabs`): `scribe_v3_live`, `commit_strategy=vad`, auto = he + `secondary_languages=en`, dictionary keyterms in the URL. Audio is JSON base64 (`input_audio_chunk`); text and ack both come from `committed_transcript_with_timestamps` (the plain `committed_transcript` is ignored). Session must say `session_started` within 10 s, so a bad key fails at open. Stop = 0.4 s silence with `commit:true`, then a 2 s drain (the server never closes). Keep-alive sends 0.1 s silence after 3 s without audio and counts it in unacked. auth/quota errors are fatal (no reconnect loop). 1-second chunks (~43 KB base64) verified live.
+- **UI:** ElevenLabs first and "(מומלץ)" in settings and the wizard; streaming allowed for ElevenLabs and Deepgram (`STREAMING_PROVIDERS`).
+- Rust 252 passed, `tsc` clean. **Not yet run inside the built app.** Henry's installed app is 2.16.2, so his `settings.json` stays `deepgram` until the next version is installed (an old build would not parse "elevenlabs"); switch it then.
+
 ## 2026-11-19 - leftover audio after a dropped stream, hold-to-talk counted once (not released)
 
 - **Leftover audio:** when the live connection is still dead at stop (reconnects exhausted), `StreamingStop.leftover` carries the unacknowledged audio (up to 60 s, `streaming::leftover_audio`). `recover_streaming_leftover` uploads it once to Deepgram batch (auto + hints), applies the dictionary, appends it to the text, and types it when live injection is on. Used on stop and on a language switch. Skipped under 0.5 s or silence; a failed upload stays silent (the reconnect warning was already shown).
