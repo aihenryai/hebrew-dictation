@@ -50,19 +50,22 @@ struct ActiveStreaming {
 }
 
 /// Hold-to-talk types its text only after the keys are released, so nothing
-/// has been typed yet when the dictation stops. With ElevenLabs that leaves
-/// room for one more pass over the whole recording with the file model
-/// (scribe_v3), which in our Hebrew tests made about a third fewer word
-/// errors than the live model (~11% vs ~16%). Live typing can't use this: its
-/// words are already on the screen. Capped at five minutes of audio so the
-/// wait at the end stays short.
+/// has been typed yet when the dictation stops. That leaves room for one more
+/// pass over the whole recording with the provider's file model, which in our
+/// Hebrew tests (FLEURS, 30 sentences, 2026-11-19) made far fewer word errors
+/// than its live model: ElevenLabs ~11% vs ~16%, Deepgram nova-3 ~17% vs ~27%.
+/// Groq has no live mode, so there is nothing to refine. Live typing can't use
+/// this: its words are already on the screen. Capped at five minutes of audio
+/// so the wait at the end stays short.
 fn should_refine_dictation(
     provider: &settings::ApiProvider,
     live_injection: bool,
     samples: usize,
 ) -> bool {
-    *provider == settings::ApiProvider::ElevenLabs
-        && !live_injection
+    matches!(
+        provider,
+        settings::ApiProvider::ElevenLabs | settings::ApiProvider::Deepgram
+    ) && !live_injection
         && samples >= 8_000
         && samples <= 16_000 * 300
 }
@@ -3719,15 +3722,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refine_pass_only_for_elevenlabs_hold_to_talk() {
+    fn refine_pass_only_for_streaming_hold_to_talk() {
         use settings::ApiProvider::*;
         let ten_secs = 160_000;
-        // Hold-to-talk with ElevenLabs: nothing typed yet, so refine.
+        // Hold-to-talk with a live provider: nothing typed yet, so refine.
         assert!(should_refine_dictation(&ElevenLabs, false, ten_secs));
+        assert!(should_refine_dictation(&Deepgram, false, ten_secs));
         // Live typing: the words are already on screen.
         assert!(!should_refine_dictation(&ElevenLabs, true, ten_secs));
-        // Other providers have no better file model to switch to.
-        assert!(!should_refine_dictation(&Deepgram, false, ten_secs));
+        assert!(!should_refine_dictation(&Deepgram, true, ten_secs));
+        // Groq has no live model, so there is nothing better to switch to.
         assert!(!should_refine_dictation(&Groq, false, ten_secs));
         // Under half a second, or over five minutes.
         assert!(!should_refine_dictation(&ElevenLabs, false, 7_999));

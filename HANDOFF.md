@@ -1,5 +1,13 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-19 - refine pass for Deepgram too; what else was measured (not released)
+
+Henry: no forcing users onto ElevenLabs; improve accuracy with the tools users already have. Bench: FLEURS he dev, 30 distinct sentences, 453 words (scratch, deleted).
+- Deepgram nova-3 **live 26.9%** vs **batch 16.8%** WER (same params as the app). So `should_refine_dictation` now also covers Deepgram: hold-to-talk re-sends the whole recording to Deepgram prerecorded at stop (same key, ~$0.26/h extra). Settings hint shown for Deepgram too.
+- Groq `whisper-large-v3-turbo` 24.5% = `whisper-large-v3` 24.5%: switching the Groq model gains nothing.
+- LLM correction after STT (Groq `gpt-oss-120b`, minimal-edit prompt): no gain (paired: Deepgram 20.4 -> 21.1, Groq 23.3 -> 22.8). Dropped.
+- ivrit-ai leaderboard (HF space `ivrit-ai/hebrew-transcription-leaderboard`): ivrit-ai `whisper-large-v3-turbo` 2025-05 = 5.3% eval-d1 / 7.1% whatsapp / 18.1% FLEURS, vs Deepgram nova-3 6.7 / 12.0 / 23.3 and ElevenLabs scribe_v1 20.0 / 26.4 / 18.1. The app's local large model is the most accurate on conversational Hebrew; the local-mode card no longer says "lower than the cloud". Windows build is CPU-only (`whisper-rs` without GPU features), so a local refine pass would be slow there; on Mac (`metal`) it is a candidate.
+
 ## 2026-11-19 - accurate pass for hold-to-talk, file gate, hash-locked narration install (not released)
 
 - **Refine pass:** hold-to-talk with ElevenLabs re-transcribes the whole recording with `scribe_v3` at stop (`refine_dictation`, `should_refine_dictation`: ElevenLabs, no live typing, 0.5 s-5 min, 12 s cap, else the live text). Live model ~16% WER vs file model ~11%. Replaces the leftover upload and the dropped-audio warning when it succeeds. Live typing can't use it (words already typed); the settings hint tells ElevenLabs users that turning simultaneous dictation off gives the file model.
