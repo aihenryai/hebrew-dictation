@@ -43,6 +43,52 @@ pub(crate) fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
+/// Gain for a quiet recording, so it reaches the service at a normal level.
+///
+/// Measured 2026-11-19 (FLEURS Hebrew, 30 clips, quiet mic = peak -40 dBFS
+/// plus a faint room-noise floor): Deepgram 24.7% WER at normal level, 43.4%
+/// quiet, 34.5% quiet but boosted before the PCM16 WAV; Groq 35.8 / 49.9 / 48.4.
+/// The boost happens on the f32 samples, before rounding to 16 bits, which is
+/// where a quiet recording loses its detail.
+///
+/// The level is the 99.9th percentile of |sample| (one click does not block the
+/// boost). Only quiet audio is touched (level under `QUIET_LEVEL`), it is
+/// raised to `TARGET_LEVEL`, at most `MAX_GAIN` times. Audio with no sign of
+/// speech is left alone: digital silence, and steady noise whose loud moments
+/// are not at least `SPEECH_CONTRAST` times its median (speech has pauses and
+/// peaks, room hiss does not). Boosting a near-silent room made "multi" hear
+/// English words ("Okay.") in Hebrew dictation. Returns 1.0 for no change.
+const QUIET_LEVEL: f32 = 0.05;
+const TARGET_LEVEL: f32 = 0.5;
+const MAX_GAIN: f32 = 30.0;
+const SPEECH_CONTRAST: f32 = 10.0;
+
+pub(crate) fn upload_gain(samples: &[f32]) -> f32 {
+    if samples.len() < 1_600 {
+        return 1.0;
+    }
+    // every 4th sample is plenty for two percentiles and keeps long files cheap
+    let mut abs: Vec<f32> = samples.iter().step_by(4).map(|s| s.abs()).collect();
+    let n = abs.len();
+    let hi = (n - 1) * 999 / 1000;
+    let level = *abs.select_nth_unstable_by(hi, f32::total_cmp).1;
+    let median = *abs[..hi].select_nth_unstable_by((n - 1) / 2, f32::total_cmp).1;
+    if level >= QUIET_LEVEL || level < 1e-3 || level < SPEECH_CONTRAST * median {
+        return 1.0;
+    }
+    (TARGET_LEVEL / level).clamp(1.0, MAX_GAIN)
+}
+
+/// Mono 16 kHz WAV for a transcription request, quiet audio boosted first.
+pub(crate) fn upload_wav(samples: &[f32]) -> Vec<u8> {
+    let gain = upload_gain(samples);
+    if gain == 1.0 {
+        return samples_to_wav(samples, 16000);
+    }
+    let boosted: Vec<f32> = samples.iter().map(|s| (s * gain).clamp(-1.0, 1.0)).collect();
+    samples_to_wav(&boosted, 16000)
+}
+
 /// Convert an **interleaved stereo** f32 buffer (L,R,L,R… at `sample_rate`) to a
 /// 2-channel PCM16 WAV byte buffer. Kept deliberately SEPARATE from `samples_to_wav`
 /// (which hardcodes `num_channels = 1`) so the Call-mode multichannel body can be
@@ -225,7 +271,7 @@ async fn transcribe_groq_inner(
     api_key: &str,
     language: &str,
 ) -> Result<String, ApiError> {
-    let wav_data = samples_to_wav(samples, 16000);
+    let wav_data = upload_wav(samples);
 
     let file_part = multipart::Part::bytes(wav_data)
         .file_name("audio.wav")
@@ -481,61 +527,103 @@ fn urlencoding_percent_encode(s: &str) -> String {
     out
 }
 
+/// What Deepgram's `words[]` says about one transcript, before any cleaning:
+/// how many words, their mean confidence, and how many of them are Latin-script
+/// words tagged `en` (only `multi` tags languages) with their mean confidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct WordStats {
+    pub words: usize,
+    pub conf: f32,
+    pub en_words: usize,
+    pub en_conf: f32,
+}
+
+fn is_latin_word(w: &str) -> bool {
+    let mut letters = w.chars().filter(|c| c.is_alphabetic()).peekable();
+    letters.peek().is_some() && letters.all(|c| c.is_ascii())
+}
+
+pub(crate) fn word_stats(alt: &serde_json::Value) -> WordStats {
+    let Some(words) = alt["words"].as_array() else {
+        return WordStats::default();
+    };
+    let mut s = WordStats::default();
+    let (mut conf_sum, mut en_sum) = (0.0f32, 0.0f32);
+    for w in words {
+        let text = w["punctuated_word"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+            .or_else(|| w["word"].as_str())
+            .unwrap_or("");
+        let c = w["confidence"].as_f64().unwrap_or(0.0) as f32;
+        s.words += 1;
+        conf_sum += c;
+        if w["language"].as_str() == Some("en") && is_latin_word(text) {
+            s.en_words += 1;
+            en_sum += c;
+        }
+    }
+    if s.words > 0 {
+        s.conf = conf_sum / s.words as f32;
+    }
+    if s.en_words > 0 {
+        s.en_conf = en_sum / s.en_words as f32;
+    }
+    s
+}
+
 /// Whether the multilingual transcript should win over the Hebrew one, for an
 /// "auto" request that was sent to Deepgram both ways.
 ///
-/// Measured 2026-11-19 (FLEURS Hebrew dev 40 clips, 12 code-switched and 6
-/// English TTS sentences): `language=he` 20.1% WER on Hebrew but it deletes
-/// English speech (100% on English); `multi` 30.6% on Hebrew, 0% on English.
-/// This pick: 20.1% Hebrew, 21.4% code-switched (both alone: 30.1% / 25.2%),
-/// 0% English. Multi wins only when its transcript is mostly Latin-script
-/// words (English speech; a "multi" mishearing comes out in Arabic script and
-/// does not count), when the Hebrew model dropped most of the speech, when it
-/// fell back to niqqud spelling of foreign sounds while multi heard Latin
-/// words, or when multi heard a whole English sentence (4+ Latin words in a row).
-pub(crate) fn prefer_multi(he: &str, multi: &str) -> bool {
-    let is_latin = |w: &str| {
-        let mut letters = w.chars().filter(|c| c.is_alphabetic()).peekable();
-        letters.peek().is_some() && letters.all(|c| c.is_ascii())
-    };
-    let multi_words: Vec<&str> = multi.split_whitespace().collect();
-    if multi_words.is_empty() {
+/// Hebrew is the default. Multi wins only when the Hebrew model failed (it
+/// heard under half as many words, or its mean confidence is under 0.7) AND
+/// multi heard confident English (at least half its words tagged `en` in Latin
+/// script, mean confidence 0.7+). One or two words win only when Hebrew is
+/// very unsure (under 0.4) and every multi word is confident English ("Okay.").
+///
+/// Measured 2026-11-19 on 144 recordings (FLEURS Hebrew full, first 1.5 s,
+/// quiet at -40 dBFS, noise only; code-switched and English TTS): never flips
+/// Hebrew, short, quiet or noise (the earlier text-only rule flipped short
+/// Hebrew to English, which Henry reported), English 0% WER, code-switched
+/// 25.2% (Hebrew alone 28.8%).
+pub(crate) fn prefer_multi(he: &WordStats, multi: &WordStats) -> bool {
+    if multi.words == 0 {
         return false;
     }
-    let latin = multi_words.iter().filter(|w| is_latin(w)).count();
-    if latin * 2 >= multi_words.len() {
-        return true;
+    if multi.words <= 2 && he.words > 0 {
+        return he.conf < 0.4 && multi.en_words == multi.words && multi.en_conf >= 0.9;
     }
-    if he.split_whitespace().count() * 2 < multi_words.len() {
-        return true;
-    }
-    let niqqud = he.chars().any(|c| ('\u{0591}'..='\u{05C7}').contains(&c));
-    if niqqud && latin > 0 {
-        return true;
-    }
-    let mut run = 0;
-    for w in &multi_words {
-        run = if is_latin(w) { run + 1 } else { 0 };
-        if run >= 4 {
-            return true;
-        }
-    }
-    false
+    let he_failed = he.words * 2 < multi.words || he.conf < 0.7;
+    let multi_english = multi.en_words * 2 >= multi.words && multi.en_conf >= 0.7;
+    he_failed && multi_english
 }
 
 /// Run an "auto" request both ways at once and keep the better transcript
 /// (`prefer_multi`). If one request fails the other is used; if both fail the
 /// multilingual one's error is returned. Costs two Deepgram requests.
-async fn deepgram_auto_pick<T, F, Fut>(run: F, text_of: fn(&T) -> &str) -> Result<T, ApiError>
+async fn deepgram_auto_pick<T, F, Fut>(run: F) -> Result<T, ApiError>
 where
     F: Fn(&'static str) -> Fut,
-    Fut: std::future::Future<Output = Result<T, ApiError>>,
+    Fut: std::future::Future<Output = Result<(T, WordStats), ApiError>>,
 {
     let (he, multi) = tokio::join!(run("he"), run("multi"));
     match (he, multi) {
-        (Ok(h), Ok(m)) => Ok(if prefer_multi(text_of(&h), text_of(&m)) { m } else { h }),
-        (Ok(h), Err(_)) => Ok(h),
-        (Err(_), Ok(m)) => Ok(m),
+        (Ok((h, hs)), Ok((m, ms))) => {
+            let pick = prefer_multi(&hs, &ms);
+            eprintln!(
+                "[deepgram auto] he {}w c{:.2} | multi {}w c{:.2} en {}w c{:.2} -> {}",
+                hs.words,
+                hs.conf,
+                ms.words,
+                ms.conf,
+                ms.en_words,
+                ms.en_conf,
+                if pick { "multi" } else { "he" }
+            );
+            Ok(if pick { m } else { h })
+        }
+        (Ok((h, _)), Err(_)) => Ok(h),
+        (Err(_), Ok((m, _))) => Ok(m),
         (Err(_), Err(e)) => Err(e),
     }
 }
@@ -545,22 +633,18 @@ async fn transcribe_deepgram_inner(
     api_key: &str,
     language: &str,
 ) -> Result<String, ApiError> {
-    let wav_data = samples_to_wav(samples, 16000);
+    let wav_data = upload_wav(samples);
     if normalize_language(language) == "multi" {
-        return deepgram_auto_pick(
-            |lang| deepgram_dictation_once(wav_data.clone(), api_key, lang),
-            |s: &String| s.as_str(),
-        )
-        .await;
+        return deepgram_auto_pick(|lang| deepgram_dictation_once(wav_data.clone(), api_key, lang)).await;
     }
-    deepgram_dictation_once(wav_data, api_key, language).await
+    Ok(deepgram_dictation_once(wav_data, api_key, language).await?.0)
 }
 
 async fn deepgram_dictation_once(
     wav_data: Vec<u8>,
     api_key: &str,
     language: &str,
-) -> Result<String, ApiError> {
+) -> Result<(String, WordStats), ApiError> {
     let lang = normalize_language(language);
     let url = format!(
         "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}{}{}",
@@ -599,7 +683,7 @@ async fn deepgram_dictation_once(
         .trim()
         .to_string();
 
-    Ok(transcript)
+    Ok((transcript, word_stats(alt)))
 }
 
 /// Long-file Deepgram request for batch transcription. The caller supplies a
@@ -613,23 +697,21 @@ pub(crate) async fn transcribe_deepgram_batch(
     api_key: &str,
     language: &str,
 ) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
-    let wav_data = samples_to_wav(samples, 16000);
+    let wav_data = upload_wav(samples);
     if normalize_language(language) == "multi" {
-        return deepgram_auto_pick(
-            |lang| deepgram_batch_once(client, wav_data.clone(), api_key, lang),
-            |r: &(String, Vec<crate::srt::TimedSegment>)| r.0.as_str(),
-        )
-        .await;
+        return deepgram_auto_pick(|lang| deepgram_batch_once(client, wav_data.clone(), api_key, lang)).await;
     }
-    deepgram_batch_once(client, wav_data, api_key, language).await
+    Ok(deepgram_batch_once(client, wav_data, api_key, language).await?.0)
 }
+
+type BatchResult = (String, Vec<crate::srt::TimedSegment>);
 
 async fn deepgram_batch_once(
     client: &reqwest::Client,
     wav_data: Vec<u8>,
     api_key: &str,
     language: &str,
-) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
+) -> Result<(BatchResult, WordStats), ApiError> {
     let lang = normalize_language(language);
     // diarize=true adds a per-word `speaker` index to words[]; it does not
     // change the transcript text, so it's safe to send on every batch request
@@ -682,7 +764,7 @@ async fn deepgram_batch_once(
         crate::srt::SRT_MAX_MS_PER_CUE,
     );
 
-    Ok((transcript, segments))
+    Ok(((transcript, segments), word_stats(alt)))
 }
 
 /// Parse Deepgram's `words[]` array (from an `alternatives[]` entry) into
@@ -931,7 +1013,7 @@ async fn transcribe_elevenlabs_inner(
     api_key: &str,
     language: &str,
 ) -> Result<String, ApiError> {
-    let form = elevenlabs_form(samples_to_wav(samples, 16000), language)?;
+    let form = elevenlabs_form(upload_wav(samples), language)?;
     let body = elevenlabs_post(&reqwest::Client::new(), form, api_key, Some(Duration::from_secs(30))).await?;
     Ok(body["text"].as_str().unwrap_or("").trim().to_string())
 }
@@ -944,7 +1026,7 @@ pub(crate) async fn transcribe_elevenlabs_batch(
     api_key: &str,
     language: &str,
 ) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
-    let form = elevenlabs_form(samples_to_wav(samples, 16000), language)?
+    let form = elevenlabs_form(upload_wav(samples), language)?
         .text("diarize", "true")
         .text("timestamps_granularity", "word");
     let body = elevenlabs_post(client, form, api_key, None).await?;
@@ -1229,39 +1311,84 @@ mod tests {
         assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
     }
 
-    // Real transcripts from the 2026-11-19 measurement.
+    #[test]
+    fn upload_gain_boosts_only_quiet_audio() {
+        // speech-like: tone bursts with pauses, over faint hiss
+        let speech = |amp: f32| -> Vec<f32> {
+            (0..32_000)
+                .map(|i| {
+                    let hiss = ((i * 7919 % 101) as f32 / 101.0 - 0.5) * 0.0004;
+                    let on = (i / 4_000) % 3 == 0;
+                    hiss + if on { (i as f32 * 0.05).sin() * amp } else { 0.0 }
+                })
+                .collect()
+        };
+        assert_eq!(upload_gain(&speech(0.5)), 1.0);
+        assert_eq!(upload_gain(&[]), 1.0);
+        assert_eq!(upload_gain(&vec![0.0; 16_000]), 1.0);
+        let g = upload_gain(&speech(0.02));
+        assert!(g > 20.0 && g <= MAX_GAIN, "{g}");
+        // one loud click does not block the boost
+        let mut clicky = speech(0.02);
+        clicky[100] = 1.0;
+        assert!(upload_gain(&clicky) > 20.0);
+        // steady noise (no pauses, no peaks) is not boosted
+        let noise: Vec<f32> = (0..32_000).map(|i| ((i * 7919 % 101) as f32 / 101.0 - 0.5) * 0.01).collect();
+        assert_eq!(upload_gain(&noise), 1.0);
+        // the WAV of a quiet clip carries the boosted level
+        let wav = upload_wav(&speech(0.02));
+        let peak = wav[44..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(peak > 14_000, "{peak}");
+    }
+
+    fn ws(words: usize, conf: f32, en_words: usize, en_conf: f32) -> WordStats {
+        WordStats { words, conf, en_words, en_conf }
+    }
+
+    #[test]
+    fn word_stats_counts_latin_words_tagged_english() {
+        let alt = serde_json::json!({"words": [
+            {"word": "the", "punctuated_word": "The", "confidence": 0.9, "language": "en"},
+            {"word": "meeting", "confidence": 0.7, "language": "en"},
+            {"word": "קצת", "confidence": 0.5, "language": "he"},
+            {"word": "קצת", "confidence": 0.3, "language": "en"},
+        ]});
+        let s = word_stats(&alt);
+        assert_eq!((s.words, s.en_words), (4, 2));
+        assert!((s.conf - 0.6).abs() < 1e-6 && (s.en_conf - 0.8).abs() < 1e-6);
+        assert_eq!(word_stats(&serde_json::json!({})), WordStats::default());
+    }
+
+    // Real numbers from the 2026-11-19 measurement (words, mean confidence,
+    // Latin words tagged en, their mean confidence).
     #[test]
     fn prefer_multi_keeps_hebrew_for_hebrew_speech() {
-        assert!(!prefer_multi(
-            "הלקוח ביקש שנעבור לזום במקום טימס בשבוע הבא",
-            "הלקוח ביקש שנעבור לזום במקום Teams בשבוע הבא."
-        ));
-        // multi's mishearing in Arabic script is not English
-        assert!(!prefer_multi(
-            "מטרתו העיקרית של המדע היא לגלות כיצד העולם פועל",
-            "مطرتوها اיקريت شيل حماده هي لجلوت kidsa علم بعلم"
-        ));
-        assert!(!prefer_multi("שלום", ""));
+        // code-switched Hebrew, both models confident
+        assert!(!prefer_multi(&ws(8, 0.89, 0, 0.0), &ws(8, 0.96, 0, 0.0)));
+        // quiet Hebrew: he unsure, but multi heard no English
+        assert!(!prefer_multi(&ws(9, 0.51, 0, 0.0), &ws(13, 0.71, 0, 0.0)));
+        // a short Hebrew word that multi heard as "Ken."
+        assert!(!prefer_multi(&ws(1, 0.68, 0, 0.0), &ws(1, 0.73, 1, 0.73)));
+        // short dictation, multi heard one unsure English word
+        assert!(!prefer_multi(&ws(2, 0.87, 0, 0.0), &ws(1, 0.89, 1, 0.89)));
+        assert!(!prefer_multi(&ws(1, 0.5, 0, 0.0), &WordStats::default()));
     }
 
     #[test]
     fn prefer_multi_takes_english_speech() {
         // he deleted the English sentence
-        assert!(prefer_multi("", "Please send me the final version by Thursday."));
-        // mostly Latin words
-        assert!(prefer_multi(
-            "אז תגיע קצת לפני",
-            "The meeting is at five, as taguya קצת left nay."
-        ));
-        // he spelled English with niqqud, multi heard Latin words
-        assert!(prefer_multi(
-            "ל ט ס דוּ אִיט טוּמּוּרוֹ, וְעַז נָאֵלָם.",
-            "הוא אמר לי' לet's do it tomorrow' ואז נעלם."
-        ));
-        // a whole English sentence inside a long Hebrew transcript
-        let he = "שלום לכולם היום נדבר על התוכנית לשבוע הבא ועל התקציב של הפרויקט";
-        let multi = "שלום לכולם היום נדבר על התוכנית לשבוע הבא and then we will review the budget ועל התקציב של הפרויקט";
-        assert!(prefer_multi(he, multi));
+        assert!(prefer_multi(&WordStats::default(), &ws(12, 0.98, 12, 0.98)));
+        // "Okay.": he unsure, multi sure
+        assert!(prefer_multi(&ws(1, 0.28, 0, 0.0), &ws(1, 1.0, 1, 1.0)));
+        // "Thanks a lot." that he spelled as Hebrew letters
+        assert!(prefer_multi(&ws(5, 0.62, 0, 0.0), &ws(3, 0.99, 3, 0.99)));
+        // mostly English sentence with a Hebrew tail
+        assert!(prefer_multi(&ws(4, 0.92, 0, 0.0), &ws(10, 0.77, 9, 0.79)));
+        assert!(prefer_multi(&ws(10, 0.64, 0, 0.0), &ws(8, 0.84, 8, 0.84)));
     }
 
     /// Live check of the "auto" pick against Deepgram. Needs DEEPGRAM_API_KEY and

@@ -83,6 +83,8 @@ struct ReceiveContext {
     stop_commit_sent: AtomicBool,
     /// Milliseconds since `epoch` when audio was last written to the socket.
     last_audio_ms: AtomicU64,
+    /// Loudest chunk peak heard this session (f32 bits), for `LiveGain`.
+    peak_bits: std::sync::atomic::AtomicU32,
     epoch: std::time::Instant,
 }
 
@@ -151,12 +153,37 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_FAILED: &str =
     "החיבור לשירות התמלול נפל ולא הצלחתי לחבר אותו מחדש. כדאי לבדוק את החיבור לאינטרנט. הטקסט שכבר התקבל נשמר.";
 
-fn to_pcm16(samples: &[f32]) -> Vec<i16> {
+/// Gain for live audio from a quiet microphone (see `api_transcribe::upload_gain`
+/// for the measurement). `peak` is the loudest chunk peak so far this session.
+/// It only grows, so the gain only falls: pauses never raise it and a loud
+/// sound lowers it for the rest of the session. Below `LIVE_MIN_PEAK` the
+/// session has heard only near-silence and nothing is boosted; from there to
+/// twice that the gain ramps up, so it has no jump. The cap is low (8) because
+/// a strong boost of a near-silent room made "multi" hear English words
+/// ("Okay.") in Hebrew dictation. The target matches `upload_gain`, so audio
+/// boosted here is not boosted again on upload.
+const LIVE_MIN_PEAK: f32 = 0.01;
+const LIVE_TARGET_PEAK: f32 = 0.5;
+const LIVE_MAX_GAIN: f32 = 8.0;
+
+fn live_gain(peak: f32) -> f32 {
+    if peak < LIVE_MIN_PEAK {
+        return 1.0;
+    }
+    let gain = (LIVE_TARGET_PEAK / peak).clamp(1.0, LIVE_MAX_GAIN);
+    if peak < 2.0 * LIVE_MIN_PEAK {
+        return 1.0 + (gain - 1.0) * (peak - LIVE_MIN_PEAK) / LIVE_MIN_PEAK;
+    }
+    gain
+}
+
+fn to_pcm16_with_gain(samples: &[f32], gain: f32) -> Vec<i16> {
     samples
         .iter()
-        .map(|&s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16)
+        .map(|&s| (s * gain * 32768.0).clamp(-32768.0, 32767.0) as i16)
         .collect()
 }
+
 
 fn pcm_bytes(pcm: &[i16]) -> Vec<u8> {
     pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
@@ -601,6 +628,7 @@ impl StreamingSession {
             fatal: std::sync::Mutex::new(None),
             stop_commit_sent: AtomicBool::new(false),
             last_audio_ms: AtomicU64::new(0),
+            peak_bits: std::sync::atomic::AtomicU32::new(0),
             epoch: std::time::Instant::now(),
         });
         let recv_task = spawn_receiver(ctx.clone(), reader, 0);
@@ -625,7 +653,14 @@ impl StreamingSession {
         if let Some(fatal) = self.ctx.fatal() {
             return Err(fatal);
         }
-        let pcm = to_pcm16(samples);
+        let chunk_peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let peak = f32::from_bits(
+            self.ctx
+                .peak_bits
+                .fetch_max(chunk_peak.to_bits(), Ordering::SeqCst),
+        )
+        .max(chunk_peak);
+        let pcm = to_pcm16_with_gain(samples, live_gain(peak));
         if self.ctx.dead.load(Ordering::SeqCst) {
             self.ctx.unacked().push(&pcm);
             // Resends everything unacknowledged, this chunk included.
@@ -1006,6 +1041,19 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_gain_boosts_a_quiet_session_only() {
+        assert_eq!(live_gain(0.0), 1.0);
+        assert_eq!(live_gain(0.005), 1.0); // near-silence only
+        assert_eq!(live_gain(0.01), 1.0); // the ramp starts at 1, no jump
+        assert!((live_gain(0.015) - 4.5).abs() < 1e-4); // halfway up the ramp
+        assert_eq!(live_gain(0.03), LIVE_MAX_GAIN);
+        assert!((live_gain(0.1) - 5.0).abs() < 1e-4);
+        assert_eq!(live_gain(0.6), 1.0); // normal mic
+        let pcm = to_pcm16_with_gain(&[0.02, -0.02, 0.9], 30.0);
+        assert_eq!(pcm, vec![19660, -19660, 32767]);
+    }
 
     #[test]
     fn leftover_audio_only_when_the_connection_stayed_dead() {
