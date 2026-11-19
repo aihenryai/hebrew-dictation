@@ -1,0 +1,5 @@
+onnxruntime==1.28.0
+numpy==2.4.6
+phonikud==0.4.1
+phonikud-onnx==1.0.6
+tokenizers==0.23.1

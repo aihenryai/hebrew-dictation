@@ -1,5 +1,12 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-19 - accurate pass for hold-to-talk, file gate, hash-locked narration install (not released)
+
+- **Refine pass:** hold-to-talk with ElevenLabs re-transcribes the whole recording with `scribe_v3` at stop (`refine_dictation`, `should_refine_dictation`: ElevenLabs, no live typing, 0.5 s-5 min, 12 s cap, else the live text). Live model ~16% WER vs file model ~11%. Replaces the leftover upload and the dropped-audio warning when it succeeds. Live typing can't use it (words already typed); the settings hint tells ElevenLabs users that turning simultaneous dictation off gives the file model.
+- **File gate:** `transcribe_file` reads only paths the app handed out (`pick_audio_file(s)`, `stop_batch_recording_to_file`), kept in `AppState::transcribable_files`. Closes "any path from the webview gets read and uploaded".
+- **Narration install:** `src-tauri/narration-requirements.lock` (27 packages, all hashes, `--exclude-newer 2026-11-05`, Python 3.11, universal) installed with `--require-hashes`; regenerate command in its header. Verified: fresh venv install + imports on Windows. Existing installs are untouched (marker version unchanged). Not verified on macOS.
+- Rust 254 passed, `tsc` clean.
+
 ## 2026-11-19 - ElevenLabs Scribe as a provider, recommended for Hebrew (not released)
 
 Henry: "השאלה אם יש לנו אפשרות לשפר את התמלול עצמו? מלא שגיאות". Measured on FLEURS Hebrew + mixed he/en sentences (scratch bench, deleted): Scribe v3 batch ~11% WER vs Deepgram nova-3 20-31%; Scribe v3 Live ~16% vs Deepgram live 26-35%; mixed he/en 6.6% batch, 12.4% live. Live ~$0.22/h vs ~$0.46.

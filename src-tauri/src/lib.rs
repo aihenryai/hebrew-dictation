@@ -45,6 +45,61 @@ struct ActiveStreaming {
     carried_text: String,
     /// False for hold-to-talk: text is typed once, after the keys are released.
     live_injection: bool,
+    /// The language of the current connection ("auto", "he", "en").
+    language: String,
+}
+
+/// Hold-to-talk types its text only after the keys are released, so nothing
+/// has been typed yet when the dictation stops. With ElevenLabs that leaves
+/// room for one more pass over the whole recording with the file model
+/// (scribe_v3), which in our Hebrew tests made about a third fewer word
+/// errors than the live model (~11% vs ~16%). Live typing can't use this: its
+/// words are already on the screen. Capped at five minutes of audio so the
+/// wait at the end stays short.
+fn should_refine_dictation(
+    provider: &settings::ApiProvider,
+    live_injection: bool,
+    samples: usize,
+) -> bool {
+    *provider == settings::ApiProvider::ElevenLabs
+        && !live_injection
+        && samples >= 8_000
+        && samples <= 16_000 * 300
+}
+
+/// Upper bound on the extra pass: past it the live text is used as is.
+const REFINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// The more accurate text for a finished hold-to-talk dictation, or None to
+/// keep the live text (not ElevenLabs, live typing, silence, an error, or
+/// slower than `REFINE_TIMEOUT`).
+async fn refine_dictation(
+    state: &AppState,
+    samples: &[f32],
+    language: &str,
+    live_injection: bool,
+) -> Option<String> {
+    let (provider, key, _) = streaming_config(state).ok()?;
+    if !should_refine_dictation(&provider, live_injection, samples.len())
+        || audio::is_effectively_silent(samples, 0.005)
+    {
+        return None;
+    }
+    let pass = api_transcribe::transcribe_api(&provider, samples, &key, language);
+    match tokio::time::timeout(REFINE_TIMEOUT, pass).await {
+        Ok(Ok(t)) => {
+            let text = dictionary::apply(t.trim()).trim().to_string();
+            (!text.is_empty()).then_some(text)
+        }
+        Ok(Err(e)) => {
+            eprintln!("refine pass failed, keeping the live text: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("refine pass timed out, keeping the live text");
+            None
+        }
+    }
 }
 
 struct AppState {
@@ -77,6 +132,10 @@ struct AppState {
     batch_cancel_notify: Arc<tokio::sync::Notify>,
     /// Guards against two concurrent batch jobs.
     batch_in_progress: Arc<AtomicBool>,
+    /// Files `transcribe_file` may read: those the user picked in the app's own
+    /// file dialog, and the app's own recordings. Anything else is refused, so
+    /// a script running in the window can't read and upload arbitrary files.
+    transcribable_files: Mutex<std::collections::HashSet<String>>,
     /// Set true while a long batch-view recording is in progress (separate from
     /// short dictation) so Alt+D cannot overwrite the buffer mid-session.
     batch_recording_in_progress: Arc<AtomicBool>,
@@ -482,6 +541,14 @@ async fn transcribe_file(
     file_path: String,
     opts: batch::BatchOpts,
 ) -> Result<TranscribeFileResult, String> {
+    let allowed = state
+        .transcribable_files
+        .lock()
+        .map(|set| set.contains(&file_path))
+        .unwrap_or(false);
+    if !allowed {
+        return Err(FILE_NOT_PICKED.to_string());
+    }
     // One batch at a time.
     if state.batch_in_progress.swap(true, Ordering::SeqCst) {
         return Err("תמלול ארוך כבר רץ — המתן לסיומו או בטל אותו".to_string());
@@ -966,8 +1033,20 @@ async fn stop_batch_recording_to_file(
         .as_millis();
     let tmp_path = std::env::temp_dir().join(format!("hd-recording-{}.wav", epoch));
     write_wav_16k_mono(&tmp_path, &samples)?;
-    Ok(tmp_path.to_string_lossy().to_string())
+    let path = tmp_path.to_string_lossy().to_string();
+    allow_transcribe(&state, std::slice::from_ref(&path));
+    Ok(path)
 }
+
+/// Let `transcribe_file` read these paths (see `AppState::transcribable_files`).
+fn allow_transcribe(state: &AppState, paths: &[String]) {
+    if let Ok(mut set) = state.transcribable_files.lock() {
+        set.extend(paths.iter().cloned());
+    }
+}
+
+const FILE_NOT_PICKED: &str =
+    "אפשר לתמלל רק קובץ שנבחר בחלון בחירת הקבצים של האפליקציה או הקלטה שלה. בחרו את הקובץ שוב.";
 
 /// Stop and drain the recorder(s) a non-CallCloud `source` used, returning mono samples.
 /// `CallLocal` drains BOTH recorders and mixes them to mono here; `CallCloud` never
@@ -1566,8 +1645,11 @@ async fn pick_audio_file(app: AppHandle, state: State<'_, AppState>) -> Result<O
 
     let path = rx.await.map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string());
     set_main_on_top(&app, restore_on_top);
-    let path = path?;
-    Ok(path.map(|p| p.to_string_lossy().to_string()))
+    let path = path?.map(|p| p.to_string_lossy().to_string());
+    if let Some(p) = &path {
+        allow_transcribe(&state, std::slice::from_ref(p));
+    }
+    Ok(path)
 }
 
 /// Open a native file picker that allows selecting multiple audio files.
@@ -1594,8 +1676,12 @@ async fn pick_audio_files(app: AppHandle, state: State<'_, AppState>) -> Result<
 
     let paths = rx.await.map_err(|_| "דיאלוג הבחירה נסגר ללא תגובה".to_string());
     set_main_on_top(&app, restore_on_top);
-    let paths = paths?;
-    Ok(paths.map(|ps| ps.iter().map(|p| p.to_string_lossy().to_string()).collect()))
+    let paths: Option<Vec<String>> =
+        paths?.map(|ps| ps.iter().map(|p| p.to_string_lossy().to_string()).collect());
+    if let Some(ps) = &paths {
+        allow_transcribe(&state, ps);
+    }
+    Ok(paths)
 }
 
 /// Deepgram key + whether the spoken language-switch trigger is on. Streaming
@@ -1812,6 +1898,7 @@ async fn start_streaming_transcription(
         dispatch_task,
         carried_text: String::new(),
         live_injection,
+        language: lang,
     });
 
     Ok(())
@@ -1899,6 +1986,7 @@ async fn switch_streaming_language(
             &recovered,
         ),
         live_injection: old.live_injection,
+        language,
     });
     Ok(())
 }
@@ -1941,14 +2029,38 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // Close the WebSocket and return the accumulated final text, including
     // what earlier connections of this dictation heard (language switches).
     let stopped = active.session.stop().await;
-    let recovered =
-        recover_streaming_leftover(&app, &state, &stopped.leftover, active.live_injection).await;
-    let text = join_dictation_text(
-        &join_dictation_text(&active.carried_text, &stopped.text),
-        &recovered,
-    );
+    // A language switch mid-dictation means the recording holds two
+    // languages; "auto" lets the file model follow both.
+    let refine_lang = if active.carried_text.trim().is_empty() {
+        active.language.as_str()
+    } else {
+        "auto"
+    };
+    let refined = refine_dictation(&state, &samples, refine_lang, active.live_injection).await;
+    // A refined text means the whole recording was transcribed again: the
+    // leftover upload is not needed, and a warning about live audio that went
+    // missing no longer applies.
+    let was_refined = refined.is_some();
+    let text = match refined {
+        Some(t) => t,
+        None => {
+            let recovered = recover_streaming_leftover(
+                &app,
+                &state,
+                &stopped.leftover,
+                active.live_injection,
+            )
+            .await;
+            join_dictation_text(
+                &join_dictation_text(&active.carried_text, &stopped.text),
+                &recovered,
+            )
+        }
+    };
     if let Some(warning) = dispatch_warning.or(stopped.warning) {
-        let _ = app.emit("audio-stream-error", warning);
+        if !was_refined {
+            let _ = app.emit("audio-stream-error", warning);
+        }
     }
 
     // One seq bump per streaming session = the whole utterance, not per segment.
@@ -3315,6 +3427,7 @@ pub fn run() {
                 batch_cancel: Arc::new(AtomicBool::new(false)),
                 batch_cancel_notify: Arc::new(tokio::sync::Notify::new()),
                 batch_in_progress: Arc::new(AtomicBool::new(false)),
+                transcribable_files: Mutex::new(std::collections::HashSet::new()),
                 batch_recording_in_progress: Arc::new(AtomicBool::new(false)),
                 batch_recording_gen: Arc::new(AtomicU64::new(0)),
                 last_transcript: Arc::new(Mutex::new(local_api::LastTranscript::default())),
@@ -3604,6 +3717,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refine_pass_only_for_elevenlabs_hold_to_talk() {
+        use settings::ApiProvider::*;
+        let ten_secs = 160_000;
+        // Hold-to-talk with ElevenLabs: nothing typed yet, so refine.
+        assert!(should_refine_dictation(&ElevenLabs, false, ten_secs));
+        // Live typing: the words are already on screen.
+        assert!(!should_refine_dictation(&ElevenLabs, true, ten_secs));
+        // Other providers have no better file model to switch to.
+        assert!(!should_refine_dictation(&Deepgram, false, ten_secs));
+        assert!(!should_refine_dictation(&Groq, false, ten_secs));
+        // Under half a second, or over five minutes.
+        assert!(!should_refine_dictation(&ElevenLabs, false, 7_999));
+        assert!(should_refine_dictation(&ElevenLabs, false, 16_000 * 300));
+        assert!(!should_refine_dictation(&ElevenLabs, false, 16_000 * 300 + 1));
+    }
 
     #[test]
     fn dispatch_batches_a_backlog_in_order_and_within_the_cap() {

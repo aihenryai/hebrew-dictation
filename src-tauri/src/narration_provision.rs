@@ -211,6 +211,16 @@ const MARKER_VERSION: u32 = 2;
 /// toolchain guaranteed on the user's machine, i.e. would break provisioning
 /// outright. Re-verify wheel availability for the target Python version
 /// before ever bumping this, not just "is it the newest release".
+///
+/// The install itself goes through `NARRATION_LOCK`: these five plus every
+/// package they pull in, each pinned with its SHA-256 hashes, installed with
+/// `--require-hashes`. Pinning only the top level still let a transitive
+/// dependency (regex, httpx, huggingface-hub...) arrive at whatever version
+/// was published that day.
+/// Hash-locked requirements for the narration venv (see `PIP_PACKAGES`).
+const NARRATION_LOCK: &str = include_str!("../narration-requirements.lock");
+
+#[cfg_attr(not(test), allow(dead_code))]
 const PIP_PACKAGES: [&str; 5] = [
     "onnxruntime==1.28.0",
     "numpy==2.4.6",
@@ -626,10 +636,14 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
     // onnxruntime is the heavy one here (~200MB of wheels with its deps) —
     // 600s gives a slow connection room without hanging the UI forever.
     emit_stage(app, 3, "מתקין חבילות");
+    let lock_path = std::env::temp_dir().join("hd-narration-requirements.lock");
+    std::fs::write(&lock_path, NARRATION_LOCK)
+        .map_err(|e| format!("התקנת מנוע הקריינות נכשלה להתחיל. (פרטים טכניים: {e})"))?;
     let mut pip_cmd = tokio::process::Command::new(&uv_exe);
     pip_cmd
-        .args(["pip", "install", "--python", &venv_dir.to_string_lossy()])
-        .args(PIP_PACKAGES)
+        .args(["pip", "install", "--require-hashes", "--python", &venv_dir.to_string_lossy()])
+        .arg("-r")
+        .arg(&lock_path)
         .envs(uv_env.iter().map(|(k, v)| (*k, v.as_str())));
     #[cfg(target_os = "windows")]
     pip_cmd.creation_flags(CREATE_NO_WINDOW);
@@ -642,6 +656,7 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
         Ok(Err(e)) => return Err(format!("התקנת מנוע הקריינות נכשלה להתחיל. (פרטים טכניים: {e})")),
         Ok(Ok(output)) => output,
     };
+    let _ = std::fs::remove_file(&lock_path);
     if !pip_output.status.success() {
         return Err(format!(
             "התקנת מנוע הקריינות נכשלה (קוד יציאה: {}).\n{}",
@@ -740,6 +755,28 @@ pub async fn provision_narration_engine<R: tauri::Runtime>(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn lock_pins_every_package_with_hashes() {
+        // Every top-level package appears in the lock at the same version...
+        for pkg in PIP_PACKAGES {
+            assert!(
+                NARRATION_LOCK.lines().any(|l| l.starts_with(&format!("{pkg} "))),
+                "{pkg} missing from narration-requirements.lock"
+            );
+        }
+        // ...and every requirement line is an exact pin followed by hashes,
+        // which is what --require-hashes demands.
+        let reqs: Vec<&str> = NARRATION_LOCK
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(' '))
+            .collect();
+        assert!(reqs.len() >= PIP_PACKAGES.len());
+        for r in &reqs {
+            assert!(r.contains("=="), "not pinned: {r}");
+        }
+        assert!(NARRATION_LOCK.matches("--hash=sha256:").count() >= reqs.len());
+    }
 
     #[test]
     fn narration_dir_is_under_app_data_narration_subfolder() {

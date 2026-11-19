@@ -3301,6 +3301,11 @@ function App() {
             </span>
           </label>
           <p className="settings-hint">לא תואם ל-✨ רישוף חכם — כשהרישוף דלוק, ההכתבה הסימולטנית נעולה, וההיפך.</p>
+          {apiProvider === "elevenlabs" && (
+            <p className="settings-hint">
+              לדיוק הגבוה ביותר: כבו את ההכתבה הסימולטנית, או הכתיבו בהחזקת המקשים. כך כל ההקלטה מתומללת בסוף במודל המדויק יותר של ElevenLabs (בבדיקה שלנו כשליש פחות טעויות).
+            </p>
+          )}
         </div>
 
         {/* Language switch by voice keyword — real user request, 2026-09-02 */}
