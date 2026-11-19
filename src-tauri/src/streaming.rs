@@ -182,6 +182,19 @@ fn spawn_receiver(
 pub(crate) struct StreamingStop {
     pub text: String,
     pub warning: Option<String>,
+    /// 16 kHz mono audio the service never transcribed because the connection
+    /// could not be reopened (up to the last 60 seconds). The caller sends it
+    /// once more as a plain upload, so those words are not lost.
+    pub leftover: Vec<f32>,
+}
+
+/// Audio still unacknowledged when the session ends on a dead connection.
+/// Empty when the connection was alive: then every word reached the service.
+fn leftover_audio(dead: bool, unacked: &Unacked) -> Vec<f32> {
+    if !dead {
+        return Vec::new();
+    }
+    unacked.samples.iter().map(|&s| s as f32 / 32768.0).collect()
 }
 
 /// A cancelled spawn_blocking future does not stop its OS thread. Closing this
@@ -532,9 +545,13 @@ impl StreamingSession {
         }
         self.ctx.injection.close_and_drain().await;
         let text = self.ctx.final_text.lock().await.clone();
+        // `dead` was read before CloseStream: a connection that is still down
+        // here never got the unacknowledged audio.
+        let leftover = leftover_audio(dead, &self.ctx.unacked());
         StreamingStop {
             text: text.trim().to_string(),
             warning,
+            leftover,
         }
     }
 }
@@ -690,6 +707,19 @@ fn map_ws_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leftover_audio_only_when_the_connection_stayed_dead() {
+        let mut unacked = Unacked::default();
+        unacked.push(&[16384, -16384, 0]);
+        // Alive: the service got everything, nothing to upload again.
+        assert!(leftover_audio(false, &unacked).is_empty());
+        // Dead: the untranscribed audio comes back as f32 for an upload.
+        assert_eq!(leftover_audio(true, &unacked), vec![0.5, -0.5, 0.0]);
+        // Acknowledged audio is not returned.
+        unacked.ack(2);
+        assert_eq!(leftover_audio(true, &unacked), vec![0.0]);
+    }
 
     const SHORT: WaitLimits = WaitLimits {
         idle: Duration::from_millis(50),

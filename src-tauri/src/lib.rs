@@ -1596,6 +1596,52 @@ async fn pick_audio_files(app: AppHandle, state: State<'_, AppState>) -> Result<
 
 /// Deepgram key + whether the spoken language-switch trigger is on. Streaming
 /// is Deepgram-only.
+/// Words spoken while the live connection was down and could not be reopened:
+/// send that audio once more as a plain upload (same key, auto language with
+/// the Hebrew/English hints). Returns the recovered text, or "" when there is
+/// nothing, it is silence, or the upload fails too (the warning already shown
+/// covers that). With live injection the text is typed here, since the rest of
+/// the dictation was typed as it arrived.
+async fn recover_streaming_leftover(
+    app: &AppHandle,
+    state: &AppState,
+    leftover: &[f32],
+    live_injection: bool,
+) -> String {
+    // Under half a second, or silence: nothing worth an upload.
+    if leftover.len() < 8_000 || audio::is_effectively_silent(leftover, 0.005) {
+        return String::new();
+    }
+    let Ok((key, _)) = streaming_config(state) else {
+        return String::new();
+    };
+    let text = match api_transcribe::transcribe_api(
+        &settings::ApiProvider::Deepgram,
+        leftover,
+        &key,
+        "auto",
+    )
+    .await
+    {
+        Ok(t) => dictionary::apply(t.trim()).trim().to_string(),
+        Err(e) => {
+            eprintln!("leftover upload failed: {e}");
+            return String::new();
+        }
+    };
+    if !text.is_empty() {
+        if live_injection {
+            let inject_app = app.clone();
+            let value = format!(" {text}");
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                inject_text_defocused(&inject_app, &value)
+            })
+            .await;
+        }
+    }
+    text
+}
+
 fn streaming_config(state: &AppState) -> Result<(String, bool), String> {
     let s = state.settings.lock().map_err(|e| e.to_string())?;
     // The saved mode decides, not the window: a screen that showed "local"
@@ -1827,6 +1873,8 @@ async fn switch_streaming_language(
     drop(old.audio_tx);
     let mut warning = finish_dispatch(&old.session, old.dispatch_task).await;
     let stopped = old.session.stop().await;
+    let recovered =
+        recover_streaming_leftover(&app, &state, &stopped.leftover, old.live_injection).await;
     warning = warning.or(stopped.warning);
     if let Some(w) = warning {
         let _ = app.emit("audio-stream-error", w);
@@ -1837,7 +1885,10 @@ async fn switch_streaming_language(
         session,
         audio_tx,
         dispatch_task,
-        carried_text: join_dictation_text(&old.carried_text, &stopped.text),
+        carried_text: join_dictation_text(
+            &join_dictation_text(&old.carried_text, &stopped.text),
+            &recovered,
+        ),
         live_injection: old.live_injection,
     });
     Ok(())
@@ -1881,13 +1932,23 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // Close the WebSocket and return the accumulated final text, including
     // what earlier connections of this dictation heard (language switches).
     let stopped = active.session.stop().await;
-    let text = join_dictation_text(&active.carried_text, &stopped.text);
+    let recovered =
+        recover_streaming_leftover(&app, &state, &stopped.leftover, active.live_injection).await;
+    let text = join_dictation_text(
+        &join_dictation_text(&active.carried_text, &stopped.text),
+        &recovered,
+    );
     if let Some(warning) = dispatch_warning.or(stopped.warning) {
         let _ = app.emit("audio-stream-error", warning);
     }
 
     // One seq bump per streaming session = the whole utterance, not per segment.
-    local_api::record_utterance(&state.last_transcript, &text);
+    // Hold-to-talk (no live injection) types the text afterwards through
+    // `inject_text`, which records it; recording here too counted every
+    // hold-to-talk dictation twice in the local API.
+    if active.live_injection {
+        local_api::record_utterance(&state.last_transcript, &text);
+    }
 
     // Diagnostic opt-in (default off, see settings::AppSettings::debug_save_audio):
     // save this dictation's audio + raw transcript to disk for re-running against

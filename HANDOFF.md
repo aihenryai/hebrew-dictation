@@ -1,5 +1,12 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-19 - leftover audio after a dropped stream, hold-to-talk counted once (not released)
+
+- **Leftover audio:** when the live connection is still dead at stop (reconnects exhausted), `StreamingStop.leftover` carries the unacknowledged audio (up to 60 s, `streaming::leftover_audio`). `recover_streaming_leftover` uploads it once to Deepgram batch (auto + hints), applies the dictionary, appends it to the text, and types it when live injection is on. Used on stop and on a language switch. Skipped under 0.5 s or silence; a failed upload stays silent (the reconnect warning was already shown).
+- **Hold-to-talk:** `stop_streaming_transcription` records the utterance only with live injection; hold-to-talk is recorded once by `inject_text`.
+- Rust 239 passed. Not verified with a real network drop.
+- **Henry's decisions explained to him 19.11:** Mac signing (Apple Developer, $99/year; Mac is ~13% of downloads: 136 dmg vs 941 exe over 30 releases) and a password on the updater signing key (adds little while key and password both sit in GitHub secrets).
+
 ## 2026-11-18 - v2.16.2 released (Henry: "כן, לשחרר"): meeting-recording cap and tray, microphone errors in Hebrew
 
 - **Meeting cap:** nothing enforced one, the mic ceiling only stopped the VAD thread and the WASAPI recorder had none; both buffer raw 48 kHz audio (≈1.4 GB an hour each). `spawn_meeting_watchdog` (started by `start_batch_recording`, generation counter `batch_recording_gen`) warns at 55 min (notification + `batch-recording-warning`) and at 60 min emits `batch-recording-limit`; the frontend then runs the normal stop-and-transcribe, so the audio is kept. Rules in the pure `meeting_watch_action`, tested.
