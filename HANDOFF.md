@@ -6,7 +6,8 @@ Henry: the installed c0cf400 build "recognizes my Hebrew dictation as English a 
 - `prefer_multi(&WordStats, &WordStats)` now uses Deepgram `words[]` (count, mean confidence, Latin words tagged `en`, raw before `without_foreign_words`). Multi wins only if he failed (<half the words or confidence <0.7) AND multi heard confident English (half its words en, 0.7+). 1-2 words: only if he <0.4 and all multi words en 0.9+. Each pick logs both stats to stderr.
 - Tuned offline on 144 saved responses (Hebrew 40, first 1.5 s 30, quiet 30, noise 20, mix 16, English 8): Hebrew/short/quiet/noise never flip (old rule flipped 2 short), English 0%, mix 25.2%.
 - `upload_gain`: boost only under 0.05 peak, target 0.5, and only when the 99.9th percentile is 10x the median (speech, not hiss). `live_gain`: starts at 0.01 peak with a ramp, cap 8, target 0.5 (same target, so no double boost on upload).
-- Henry's provider is ElevenLabs: the key comes from env `ELEVENLABS_API_KEY` (not the keyring); connection to api.elevenlabs.io seen live. The pick above is Deepgram-only.
+- Henry's provider is ElevenLabs: the key comes from env `ELEVENLABS_API_KEY` (not the keyring); connection to api.elevenlabs.io seen live.
+- **ElevenLabs live typing: `secondary_languages=en` removed.** Live bench, 102 recordings, same audio both ways: short Hebrew flipped to English ("כל שינוי" -> "Call Cynu", "אבל" -> "A"), nothing gained (Hebrew 10.8/10.8, mix 18.0 without vs 19.8 with, English 1.4 vs 2.7). The hold-to-talk refine was already pinned to `he`.
 - Rust 258 passed.
 
 ## 2026-11-19 - Deepgram "auto" sends he + multi and keeps the better one; Groq prompt (not released)

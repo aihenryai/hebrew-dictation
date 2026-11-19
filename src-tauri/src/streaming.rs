@@ -887,20 +887,19 @@ fn spawn_keep_alive(
     });
 }
 
-/// The ElevenLabs realtime URL. "auto" pins Hebrew with English as a secondary
-/// language: on the 12 code-switched sentences that was 12.4% WER against
-/// 14.6% for Hebrew alone, at the same 16% on plain Hebrew (2026-11-19).
+/// The ElevenLabs realtime URL. "auto" pins Hebrew, with no secondary language.
+///
+/// `secondary_languages=en` was tried and removed (2026-11-19, Henry: Hebrew
+/// dictation came out as English too often). Measured live on 102 recordings:
+/// it turned short Hebrew into English ("כל שינוי" -> "Call Cynu", "אבל" ->
+/// "A") and gained nothing elsewhere: Hebrew 10.8% both ways, code-switched
+/// 18.0% without against 19.8% with, English 1.4% against 2.7%. Pinned Hebrew
+/// still writes English words in Latin letters.
 fn elevenlabs_url(language: &str) -> String {
     let lang = crate::api_transcribe::elevenlabs_language(language);
-    let secondary = if crate::api_transcribe::is_auto_language(language) {
-        "&secondary_languages=en"
-    } else {
-        ""
-    };
     format!(
-        "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v3_live&audio_format=pcm_16000&language_code={}&commit_strategy=vad&include_timestamps=true{}{}",
+        "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v3_live&audio_format=pcm_16000&language_code={}&commit_strategy=vad&include_timestamps=true{}",
         lang,
-        secondary,
         crate::dictionary::elevenlabs_keyterm_params()
     )
 }
@@ -1265,11 +1264,11 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_url_pins_hebrew_with_english_secondary_on_auto() {
+    fn elevenlabs_url_pins_hebrew_without_secondary_on_auto() {
         let auto = elevenlabs_url("auto");
         assert!(auto.contains("model_id=scribe_v3_live"));
         assert!(auto.contains("language_code=he&"));
-        assert!(auto.contains("secondary_languages=en"));
+        assert!(!auto.contains("secondary_languages"));
         assert!(auto.contains("commit_strategy=vad"));
         assert!(auto.contains("include_timestamps=true"));
         let en = elevenlabs_url("en");
