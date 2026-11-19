@@ -61,7 +61,7 @@ pub fn normalize(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn terms() -> Vec<String> {
+pub fn terms() -> Vec<String> {
     let Ok(d) = DICTIONARY.read() else { return Vec::new() };
     let mut out: Vec<String> = Vec::new();
     for e in d.iter() {

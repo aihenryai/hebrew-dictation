@@ -192,6 +192,30 @@ fn truncate_body(body: &str) -> String {
     }
 }
 
+/// Whisper's `prompt` for Groq: a short Hebrew sentence in the style we want
+/// back (punctuated, English names in Latin letters), then the user's
+/// dictionary words. Measured 2026-11-19 on whisper-large-v3-turbo with the
+/// app's "auto" language: Hebrew 30.4% to 29.8% WER, code-switched 24.3% to
+/// 20.4%, English unchanged at 0%; near-silence came back the same with or
+/// without it (no prompt leaking into the text). Groq caps the prompt at 224
+/// tokens, so dictionary words stop once the prompt reaches `GROQ_PROMPT_MAX_CHARS`.
+const GROQ_PROMPT_STYLE: &str =
+    "שלום, זו הכתבה בעברית. היא כוללת פיסוק מלא, משפטים ברורים ומילים באנגלית כמו Google ו-Zoom.";
+const GROQ_PROMPT_MAX_CHARS: usize = 200;
+
+pub(crate) fn groq_prompt(terms: &[String]) -> String {
+    let mut out = GROQ_PROMPT_STYLE.to_string();
+    for (i, t) in terms.iter().enumerate() {
+        let sep = if i == 0 { " " } else { ", " };
+        if out.chars().count() + sep.chars().count() + t.chars().count() > GROQ_PROMPT_MAX_CHARS {
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(t);
+    }
+    out
+}
+
 // ── Groq Whisper Turbo API ──
 // OpenAI-compatible endpoint, much cheaper (~$0.04/hr vs Deepgram $4/hr).
 // Batch only — no streaming support.
@@ -216,6 +240,9 @@ async fn transcribe_groq_inner(
     // Groq accepts ISO-639-1 codes. "auto" / "multi" → omit to let Whisper auto-detect.
     if language != "auto" && language != "multi" {
         form = form.text("language", language.to_string());
+    }
+    if language != "en" {
+        form = form.text("prompt", groq_prompt(&crate::dictionary::terms()));
     }
 
     let response = reqwest::Client::new()
@@ -257,6 +284,11 @@ async fn transcribe_groq_inner(
 /// out perfect — while `language=he` dropped that sentence entirely, which is
 /// how an English meeting produced an empty transcript. `detect_language=true`
 /// is NOT an option: it misread Hebrew as Portuguese in the same test.
+///
+/// Correction 2026-11-19, measured on 40 FLEURS clips: on pure Hebrew `multi`
+/// makes about half again as many errors as `he` (30.6% vs 20.1%). So batch
+/// dictation and file requests in "auto" now send both and keep the better one
+/// (`deepgram_auto_pick`); streaming and call mode still use `multi` alone.
 pub(crate) fn normalize_language(lang: &str) -> &str {
     match lang {
         "he" | "en" => lang,
@@ -449,13 +481,86 @@ fn urlencoding_percent_encode(s: &str) -> String {
     out
 }
 
+/// Whether the multilingual transcript should win over the Hebrew one, for an
+/// "auto" request that was sent to Deepgram both ways.
+///
+/// Measured 2026-11-19 (FLEURS Hebrew dev 40 clips, 12 code-switched and 6
+/// English TTS sentences): `language=he` 20.1% WER on Hebrew but it deletes
+/// English speech (100% on English); `multi` 30.6% on Hebrew, 0% on English.
+/// This pick: 20.1% Hebrew, 21.4% code-switched (both alone: 30.1% / 25.2%),
+/// 0% English. Multi wins only when its transcript is mostly Latin-script
+/// words (English speech; a "multi" mishearing comes out in Arabic script and
+/// does not count), when the Hebrew model dropped most of the speech, when it
+/// fell back to niqqud spelling of foreign sounds while multi heard Latin
+/// words, or when multi heard a whole English sentence (4+ Latin words in a row).
+pub(crate) fn prefer_multi(he: &str, multi: &str) -> bool {
+    let is_latin = |w: &str| {
+        let mut letters = w.chars().filter(|c| c.is_alphabetic()).peekable();
+        letters.peek().is_some() && letters.all(|c| c.is_ascii())
+    };
+    let multi_words: Vec<&str> = multi.split_whitespace().collect();
+    if multi_words.is_empty() {
+        return false;
+    }
+    let latin = multi_words.iter().filter(|w| is_latin(w)).count();
+    if latin * 2 >= multi_words.len() {
+        return true;
+    }
+    if he.split_whitespace().count() * 2 < multi_words.len() {
+        return true;
+    }
+    let niqqud = he.chars().any(|c| ('\u{0591}'..='\u{05C7}').contains(&c));
+    if niqqud && latin > 0 {
+        return true;
+    }
+    let mut run = 0;
+    for w in &multi_words {
+        run = if is_latin(w) { run + 1 } else { 0 };
+        if run >= 4 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run an "auto" request both ways at once and keep the better transcript
+/// (`prefer_multi`). If one request fails the other is used; if both fail the
+/// multilingual one's error is returned. Costs two Deepgram requests.
+async fn deepgram_auto_pick<T, F, Fut>(run: F, text_of: fn(&T) -> &str) -> Result<T, ApiError>
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    let (he, multi) = tokio::join!(run("he"), run("multi"));
+    match (he, multi) {
+        (Ok(h), Ok(m)) => Ok(if prefer_multi(text_of(&h), text_of(&m)) { m } else { h }),
+        (Ok(h), Err(_)) => Ok(h),
+        (Err(_), Ok(m)) => Ok(m),
+        (Err(_), Err(e)) => Err(e),
+    }
+}
+
 async fn transcribe_deepgram_inner(
     samples: &[f32],
     api_key: &str,
     language: &str,
 ) -> Result<String, ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
+    if normalize_language(language) == "multi" {
+        return deepgram_auto_pick(
+            |lang| deepgram_dictation_once(wav_data.clone(), api_key, lang),
+            |s: &String| s.as_str(),
+        )
+        .await;
+    }
+    deepgram_dictation_once(wav_data, api_key, language).await
+}
 
+async fn deepgram_dictation_once(
+    wav_data: Vec<u8>,
+    api_key: &str,
+    language: &str,
+) -> Result<String, ApiError> {
     let lang = normalize_language(language);
     let url = format!(
         "https://api.deepgram.com/v1/listen?model=nova-3&language={}&smart_format=true&punctuate=true{}{}{}{}",
@@ -509,6 +614,22 @@ pub(crate) async fn transcribe_deepgram_batch(
     language: &str,
 ) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
     let wav_data = samples_to_wav(samples, 16000);
+    if normalize_language(language) == "multi" {
+        return deepgram_auto_pick(
+            |lang| deepgram_batch_once(client, wav_data.clone(), api_key, lang),
+            |r: &(String, Vec<crate::srt::TimedSegment>)| r.0.as_str(),
+        )
+        .await;
+    }
+    deepgram_batch_once(client, wav_data, api_key, language).await
+}
+
+async fn deepgram_batch_once(
+    client: &reqwest::Client,
+    wav_data: Vec<u8>,
+    api_key: &str,
+    language: &str,
+) -> Result<(String, Vec<crate::srt::TimedSegment>), ApiError> {
     let lang = normalize_language(language);
     // diarize=true adds a per-word `speaker` index to words[]; it does not
     // change the transcript text, so it's safe to send on every batch request
@@ -1106,6 +1227,72 @@ mod tests {
         assert_eq!(&wav[36..40], b"data");
         // data_size = 4 bytes
         assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
+    }
+
+    // Real transcripts from the 2026-11-19 measurement.
+    #[test]
+    fn prefer_multi_keeps_hebrew_for_hebrew_speech() {
+        assert!(!prefer_multi(
+            "הלקוח ביקש שנעבור לזום במקום טימס בשבוע הבא",
+            "הלקוח ביקש שנעבור לזום במקום Teams בשבוע הבא."
+        ));
+        // multi's mishearing in Arabic script is not English
+        assert!(!prefer_multi(
+            "מטרתו העיקרית של המדע היא לגלות כיצד העולם פועל",
+            "مطرتوها اיקريت شيل حماده هي لجلوت kidsa علم بعلم"
+        ));
+        assert!(!prefer_multi("שלום", ""));
+    }
+
+    #[test]
+    fn prefer_multi_takes_english_speech() {
+        // he deleted the English sentence
+        assert!(prefer_multi("", "Please send me the final version by Thursday."));
+        // mostly Latin words
+        assert!(prefer_multi(
+            "אז תגיע קצת לפני",
+            "The meeting is at five, as taguya קצת left nay."
+        ));
+        // he spelled English with niqqud, multi heard Latin words
+        assert!(prefer_multi(
+            "ל ט ס דוּ אִיט טוּמּוּרוֹ, וְעַז נָאֵלָם.",
+            "הוא אמר לי' לet's do it tomorrow' ואז נעלם."
+        ));
+        // a whole English sentence inside a long Hebrew transcript
+        let he = "שלום לכולם היום נדבר על התוכנית לשבוע הבא ועל התקציב של הפרויקט";
+        let multi = "שלום לכולם היום נדבר על התוכנית לשבוע הבא and then we will review the budget ועל התקציב של הפרויקט";
+        assert!(prefer_multi(he, multi));
+    }
+
+    /// Live check of the "auto" pick against Deepgram. Needs DEEPGRAM_API_KEY and
+    /// LIVE_WAVS = ;-separated paths of 16 kHz mono PCM16 WAV files. Prints each transcript.
+    #[test]
+    #[ignore]
+    fn live_deepgram_auto_pick() {
+        let key = std::env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY");
+        let wavs = std::env::var("LIVE_WAVS").expect("LIVE_WAVS");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for path in wavs.split(';') {
+            let bytes = std::fs::read(path).unwrap();
+            let samples: Vec<f32> = bytes[44..]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
+            let text = rt
+                .block_on(transcribe_api_inner(&ApiProvider::Deepgram, &samples, &key, "auto"))
+                .unwrap();
+            assert!(!text.trim().is_empty(), "{path}");
+            println!("{path}\n  {text}");
+        }
+    }
+
+    #[test]
+    fn groq_prompt_adds_dictionary_words_within_the_cap() {
+        assert_eq!(groq_prompt(&[]), GROQ_PROMPT_STYLE);
+        let p = groq_prompt(&["BinTech".to_string(), "הנרי".to_string()]);
+        assert!(p.ends_with(" BinTech, הנרי"));
+        let many: Vec<String> = (0..100).map(|i| format!("מילה{}", i)).collect();
+        assert!(groq_prompt(&many).chars().count() <= GROQ_PROMPT_MAX_CHARS);
     }
 
     #[test]

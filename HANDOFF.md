@@ -1,5 +1,14 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-19 - Deepgram "auto" sends he + multi and keeps the better one; Groq prompt (not released)
+
+Bench (scratch, deleted): FLEURS he dev 40 clips / 648 words, 12 code-switched + 6 English ElevenLabs TTS sentences.
+- Deepgram batch: `he` 20.1% / mix 30.1% / English 100% (deletes English); `multi` 30.6% / 25.2% / 0%. The default "auto" mapped to `multi`, so every Deepgram user paid ~50% more Hebrew errors for English safety.
+- `deepgram_auto_pick` + `prefer_multi` (`api_transcribe.rs`): "auto" batch dictation (incl. the hold-to-talk refine pass) and file transcription send `he` and `multi` in parallel (`tokio::join!`, 2x Deepgram cost) and keep `he` unless multi is mostly Latin words, `he` has under half multi's words, `he` wrote niqqud while multi heard Latin, or multi has 4+ Latin words in a row. Result 20.1% / 21.4% / 0%. One failing request falls back to the other. Live-checked with `live_deepgram_auto_pick` (ignored test, needs `DEEPGRAM_API_KEY` + `LIVE_WAVS`).
+- Not changed: streaming (live typing) and call-mode multichannel still use `multi` alone. Long files hold 3 copies of the WAV in memory during the pair.
+- Groq: `prompt` = Hebrew style sentence + dictionary words, capped 200 chars (`groq_prompt`), not for `en`. Auto: Hebrew 30.4 -> 29.8, mix 24.3 -> 20.4, English 0 -> 0; near-silence output unchanged (no prompt leak). Dictionary words reach Groq for the first time (`dictionary::terms` now pub).
+- Rust 257 passed.
+
 ## 2026-11-19 - refine pass for Deepgram too; what else was measured (not released)
 
 Henry: no forcing users onto ElevenLabs; improve accuracy with the tools users already have. Bench: FLEURS he dev, 30 distinct sentences, 453 words (scratch, deleted).
