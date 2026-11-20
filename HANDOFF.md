@@ -1,5 +1,23 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-20 - refine pass sent while talking; short wait at the end (not released)
+
+- Henry, with live typing off: the wait between the stop and the text was long. Measured: scribe_v3 takes about 0.25 s per second of audio (2 s for 8 s, 7 s for 30 s, 12-18 s for 60 s), FLAC upload does not help (server time). It also ran only after the live close's 2 s drain, and 60 s dictations could hit `refine_timeout` and fall back to live text.
+- `src-tauri/src/progressive.rs`: the dispatch task feeds every chunk to `ProgressiveRefine`; it cuts at the first 0.6 s pause after 6 s (forced cut at the quietest frame by 20 s) and sends each part at once. At the stop only the tail is sent; parts joined in order. Any failed or late part, or a failed dispatch (`mark_incomplete`), falls back: whole-recording refine, then live text.
+- `stop_streaming_transcription`: the live close and the refine run side by side (`tokio::join!`).
+- Bench (8 FLEURS recordings, 16-46 s): WER parts vs whole within run-to-run noise (24-27% both; the whole-recording pass sometimes dropped a whole sentence, the parts sometimes split a phrase). Wait for the last part 0.5-3 s instead of 3-15 s. Not yet measured on Henry's own dictation.
+
+## 2026-11-20 - type-at-end option, audio path fixes (a50cdba, 6ca6c87; not released)
+
+Henry installed 753a9f6 (2.16.2 build) 20.11 10:13 and confirmed his first dictation through it (ElevenLabs, live typing) came out clean. Asked to keep improving.
+- **Measured:** same 102 bench clips, ElevenLabs live vs file model `scribe_v3` (he): Hebrew 10.8% vs 6.5% WER, quiet 28.3% vs 21.9%, mix 18.0% vs 14.4%, English 1.4% vs 2.7%. File model invents words on noise (21 words on 8 clips, live 0). Script: scratchpad `bench\el_file.py`.
+- **`live_typing_enabled`** (settings, default true, toggle under simultaneous dictation): off = words shown in the floating bar, whole text typed at stop through the refine pass (file model). `App.tsx`: `typeAtEndRef` replaces the ptt-only check. Henry's settings unchanged (still live typing) until he picks.
+- **Refine skipped** when live heard nothing and lost no audio (`live_heard_words`), so noise is not turned into words.
+- **Fable review, verified and fixed:** windowed-sinc downsampling (was a 3-sample box, aliasing 8-12 kHz); `mic_to_mono` averages only channels within 6 dB of the loudest (Henry's Intel array: 4 identical channels, measured, so no change for him); live gain level = 8th-loudest chunk peak (`PeakTracker`), so the hotkey click no longer sets the gain; `refine_timeout` 8 s + 0.08 s per audio second (flat 12 s dropped long dictations to live text).
+- Not done (Fable ideas, unmeasured): per-segment file-model typing in live mode (double cost, latency); ElevenLabs live VAD params (`vad_threshold`, `vad_silence_threshold_secs`, names unverified). Resampler effect on ASR not measured on real 48 kHz speech.
+- **Release blockers cleared:** none of the "signing" items block a release. Updater key: `TAURI_SIGNING_PRIVATE_KEY` is a GitHub secret, the workflow signs with an empty password (Henry's 17.11 decision). macOS: unsigned by decision (Developer ID is $99/yr, ~13% of downloads); Mac users get the Gatekeeper warning as before (existing P4 below). The local build's signing error only skips the updater `.sig`, the installer is fine. A release still needs Henry's go-ahead (tag push = public).
+- Rust 264 passed, tsc clean.
+
 ## 2026-11-19 - Hebrew no longer flips to English in "auto"; gentler gain for quiet mics (not released)
 
 Henry: the installed c0cf400 build "recognizes my Hebrew dictation as English a bit too often". Fable (consulted) traced it to the text-only `prefer_multi`: on 1-3 word dictations one misheard Latin word flipped the pick, and the x30 gain on near-silence made `multi` hear "Okay.".
