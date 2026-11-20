@@ -98,6 +98,14 @@ pub struct AppSettings {
     pub autostart_enabled: bool,
     #[serde(default)]
     pub streaming_enabled: bool,
+    /// With simultaneous dictation: type each sentence as it is recognized
+    /// (true), or show the words in the floating bar and type the whole
+    /// dictation once it stops (false). The second waits a moment at the end
+    /// but types the provider's file-model text, which made ~40% fewer word
+    /// errors on Hebrew in our ElevenLabs bench (6.5% vs 10.8%, 2026-11-20).
+    /// Default true keeps the behaviour users already have.
+    #[serde(default = "default_true")]
+    pub live_typing_enabled: bool,
     /// Saying a switch command ("כתוב באנגלית", "switch to Hebrew", …) mid-
     /// dictation changes the active language and reconnects the streaming
     /// session — real user request (עומרי רוזן, 2026-09-02): Deepgram's Nova-3
@@ -227,6 +235,7 @@ pub struct RedactedSettings {
     pub always_on_top: bool,
     pub autostart_enabled: bool,
     pub streaming_enabled: bool,
+    pub live_typing_enabled: bool,
     pub language_switch_keywords_enabled: bool,
     pub spoken_punctuation_enabled: bool,
     pub floating_toolbar_enabled: bool,
@@ -268,6 +277,7 @@ impl AppSettings {
             always_on_top: self.always_on_top,
             autostart_enabled: self.autostart_enabled,
             streaming_enabled: self.streaming_enabled,
+            live_typing_enabled: self.live_typing_enabled,
             language_switch_keywords_enabled: self.language_switch_keywords_enabled,
             spoken_punctuation_enabled: self.spoken_punctuation_enabled,
             floating_toolbar_enabled: self.floating_toolbar_enabled,
@@ -388,6 +398,7 @@ impl Default for AppSettings {
             always_on_top: true,
             autostart_enabled: true,
             streaming_enabled: true,
+            live_typing_enabled: true,
             language_switch_keywords_enabled: true,
             spoken_punctuation_enabled: true,
             floating_toolbar_enabled: true,
@@ -795,6 +806,15 @@ mod merge_tests {
         let mut reloaded = merged;
         migrate_language_to_auto(&mut reloaded);
         assert_eq!(reloaded.language, "he");
+    }
+
+    #[test]
+    fn live_typing_defaults_on_for_existing_settings_files() {
+        // A settings.json written before the option existed keeps live typing.
+        let s: AppSettings = serde_json::from_str(r#"{"streaming_enabled":true}"#).unwrap();
+        assert!(s.live_typing_enabled);
+        let off: AppSettings = serde_json::from_str(r#"{"live_typing_enabled":false}"#).unwrap();
+        assert!(!off.live_typing_enabled);
     }
 
     #[test]

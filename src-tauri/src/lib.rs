@@ -49,8 +49,9 @@ struct ActiveStreaming {
     language: String,
 }
 
-/// Hold-to-talk types its text only after the keys are released, so nothing
-/// has been typed yet when the dictation stops. That leaves room for one more
+/// Hold-to-talk, and toggle dictation with live typing turned off
+/// (`live_typing_enabled`), type their text only once the dictation stops, so
+/// nothing has been typed yet at that point. That leaves room for one more
 /// pass over the whole recording with the provider's file model, which in our
 /// Hebrew tests (FLEURS, 30 sentences, 2026-11-19) made far fewer word errors
 /// than its live model: ElevenLabs ~11% vs ~16%, Deepgram nova-3 ~17% vs ~27%.
@@ -68,6 +69,13 @@ fn should_refine_dictation(
     ) && !live_injection
         && samples >= 8_000
         && samples <= 16_000 * 300
+}
+
+/// Whether the live pass heard any words, or lost audio it could not hear.
+/// When neither, the refine pass is skipped: the file model invents words for
+/// noise and breath that the live model rightly ignores.
+fn live_heard_words(carried: &str, live: &str, leftover_samples: usize) -> bool {
+    !carried.trim().is_empty() || !live.trim().is_empty() || leftover_samples > 0
 }
 
 /// Upper bound on the extra pass: past it the live text is used as is.
@@ -2039,7 +2047,14 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     } else {
         "auto"
     };
-    let refined = refine_dictation(&state, &samples, refine_lang, active.live_injection).await;
+    // Live heard nothing and no audio went missing: the recording is noise or
+    // breath. The file model makes up words for such audio (2026-11-20 bench:
+    // 21 words on 8 noise clips where live returned none), so keep it empty.
+    let refined = if live_heard_words(&active.carried_text, &stopped.text, stopped.leftover.len()) {
+        refine_dictation(&state, &samples, refine_lang, active.live_injection).await
+    } else {
+        None
+    };
     // A refined text means the whole recording was transcribed again: the
     // leftover upload is not needed, and a warning about live audio that went
     // missing no longer applies.
@@ -3737,6 +3752,17 @@ mod tests {
         assert!(!should_refine_dictation(&ElevenLabs, false, 7_999));
         assert!(should_refine_dictation(&ElevenLabs, false, 16_000 * 300));
         assert!(!should_refine_dictation(&ElevenLabs, false, 16_000 * 300 + 1));
+    }
+
+    #[test]
+    fn refine_skipped_when_live_heard_nothing() {
+        // Noise or breath: live returned nothing and lost nothing.
+        assert!(!live_heard_words("", "  ", 0));
+        assert!(live_heard_words("", "שלום", 0));
+        // Text from before a language switch counts.
+        assert!(live_heard_words("hello", "", 0));
+        // Audio the live connection never heard: the file pass must run.
+        assert!(live_heard_words("", "", 16_000));
     }
 
     #[test]

@@ -142,6 +142,7 @@ interface AppSettings {
   always_on_top?: boolean;
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
+  live_typing_enabled?: boolean;
   language_switch_keywords_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
@@ -175,6 +176,7 @@ interface RedactedSettings {
   always_on_top?: boolean;
   autostart_enabled?: boolean;
   streaming_enabled?: boolean;
+  live_typing_enabled?: boolean;
   language_switch_keywords_enabled?: boolean;
   floating_toolbar_enabled?: boolean;
   hotkey?: string;
@@ -497,6 +499,7 @@ async function persistLoadedSettings(base: RedactedSettings, overrides: Partial<
     always_on_top: base.always_on_top,
     autostart_enabled: base.autostart_enabled,
     streaming_enabled: base.streaming_enabled,
+    live_typing_enabled: base.live_typing_enabled,
     language_switch_keywords_enabled: base.language_switch_keywords_enabled,
     floating_toolbar_enabled: base.floating_toolbar_enabled,
     hotkey: base.hotkey,
@@ -626,6 +629,7 @@ function App() {
   const [autostartEnabled, setAutostartEnabled] = useState(true);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
   const [languageSwitchKeywordsEnabled, setLanguageSwitchKeywordsEnabled] = useState(false);
+  const [liveTypingEnabled, setLiveTypingEnabled] = useState(true);
   const [floatingToolbarEnabled, setFloatingToolbarEnabled] = useState(true);
   // v2.7.0 — configurable behavior
   const [hotkey, setHotkey] = useState<string>("alt+d");
@@ -755,6 +759,11 @@ function App() {
   useEffect(() => { languageRef.current = language; }, [language]);
   useEffect(() => { transcriptionModeRef.current = transcriptionMode; }, [transcriptionMode]);
   useEffect(() => { streamingEnabledRef.current = streamingEnabled; }, [streamingEnabled]);
+  const liveTypingEnabledRef = useRef(liveTypingEnabled);
+  useEffect(() => { liveTypingEnabledRef.current = liveTypingEnabled; }, [liveTypingEnabled]);
+  // True while the current streaming dictation types nothing until it stops
+  // (hold-to-talk, or live typing turned off): the whole text is typed then.
+  const typeAtEndRef = useRef(false);
   // Streaming (the Deepgram live websocket) must never engage in local mode — local
   // mode promises no cloud calls, and a stuck `streaming_enabled` flag (e.g. left over
   // from a provider switch that never cleared it, see the initApp self-heal below) would
@@ -866,7 +875,7 @@ function App() {
           setTranscript(text);
           setEditableTranscript(text);
           setHistory((prev) => [{ id: ++historyIdCounter, text, timestamp: new Date().toISOString() }, ...prev].slice(0, 20));
-          if (pttSessionRef.current) await injectText(text);
+          if (typeAtEndRef.current) await injectText(text);
         }
       } else {
         const samples = await invoke("stop_recording") as number[];
@@ -954,7 +963,9 @@ function App() {
         setLivePreview("");
         liveFinalRef.current = "";
         const startLang = languageRef.current;
-        await invoke("start_streaming_transcription", { language: startLang, liveInjection: !ptt });
+        const liveInjection = !ptt && liveTypingEnabledRef.current;
+        typeAtEndRef.current = !liveInjection;
+        await invoke("start_streaming_transcription", { language: startLang, liveInjection });
         // The language key pressed while the connection was opening changed
         // the bar but not the connection, which is fixed at open time.
         if (languageRef.current !== startLang) {
@@ -1380,6 +1391,7 @@ function App() {
       if (typeof settings.language_switch_keywords_enabled === "boolean") {
         setLanguageSwitchKeywordsEnabled(settings.language_switch_keywords_enabled);
       }
+      if (typeof settings.live_typing_enabled === "boolean") setLiveTypingEnabled(settings.live_typing_enabled);
       if (typeof settings.floating_toolbar_enabled === "boolean") setFloatingToolbarEnabled(settings.floating_toolbar_enabled);
       if (typeof settings.hotkey === "string" && settings.hotkey) setHotkey(settings.hotkey);
       if (typeof settings.pause_hotkey === "string" || settings.pause_hotkey === null) {
@@ -1474,6 +1486,7 @@ function App() {
       always_on_top: alwaysOnTop,
       autostart_enabled: autostartEnabled,
       streaming_enabled: streamingEnabled,
+      live_typing_enabled: liveTypingEnabled,
       language_switch_keywords_enabled: languageSwitchKeywordsEnabled,
       floating_toolbar_enabled: floatingToolbarEnabled,
       hotkey: hotkey,
@@ -1491,7 +1504,7 @@ function App() {
       ...overrides,
     };
     try { await invoke("update_settings", { newSettings: settings }); } catch { /* ok */ }
-  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, languageSwitchKeywordsEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, languageHotkey, pushToTalkEnabled, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
+  }, [transcriptionMode, apiProvider, selectedModel, language, vadEnabled, alwaysOnTop, autostartEnabled, streamingEnabled, liveTypingEnabled, languageSwitchKeywordsEnabled, floatingToolbarEnabled, hotkey, pauseHotkey, languageHotkey, pushToTalkEnabled, vadSilenceSecs, maxRecordingSecs, unlimitedRecording, preferredAudioDevice, audioFeedbackEnabled, idleButtonEnabled, audioVolume, enhanceEnabled]);
 
   /** Save an API key to OS-secure storage (Credential Manager / Keychain). */
   const setApiKey = useCallback(async (provider: ApiProvider, key: string) => {
@@ -3301,9 +3314,24 @@ function App() {
             </span>
           </label>
           <p className="settings-hint">לא תואם ל-✨ רישוף חכם — כשהרישוף דלוק, ההכתבה הסימולטנית נעולה, וההיפך.</p>
+          <label className="toggle-label">
+            <input
+              type="checkbox"
+              checked={liveTypingEnabled}
+              disabled={!streamingEnabled}
+              onChange={() => {
+                const v = !liveTypingEnabled;
+                setLiveTypingEnabled(v);
+                persistSettings({ live_typing_enabled: v });
+              }}
+            />
+            <span className="toggle-text">
+              להקליד כל משפט מיד כשהוא נאמר
+            </span>
+          </label>
           {(apiProvider === "elevenlabs" || apiProvider === "deepgram") && (
             <p className="settings-hint">
-              לדיוק הגבוה ביותר: כבו את ההכתבה הסימולטנית, או הכתיבו בהחזקת המקשים. כך כל ההקלטה מתומללת בסוף במודל המדויק יותר של {apiProvider === "elevenlabs" ? "ElevenLabs" : "Deepgram"} (בבדיקה שלנו {apiProvider === "elevenlabs" ? "כשליש" : "כ-40%"} פחות טעויות).
+              לדיוק הגבוה ביותר כבו את האפשרות הזו: המילים יופיעו בזמן הדיבור בסרגל הצף, ובסוף ההכתבה יוקלד הטקסט מהמודל המדויק יותר של {apiProvider === "elevenlabs" ? "ElevenLabs" : "Deepgram"} (בבדיקה שלנו כ-40% פחות טעויות). ההקלדה מחכה שנייה או שתיים אחרי שעוצרים.
             </p>
           )}
         </div>
