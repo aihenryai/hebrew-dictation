@@ -300,7 +300,7 @@ impl AudioRecorder {
                     // last ~10-30ms WASAPI buffer reaches Deepgram before the stream is dropped.
                     let cb_opt = chunk_callback.lock().ok().and_then(|g| g.clone());
                     if let Some(cb) = cb_opt {
-                        let mono = to_mono(data, native_channels);
+                        let mono = mic_to_mono(data, native_channels);
                         let resampled = stream_resampler.process(&mono);
                         if !resampled.is_empty() {
                             cb(&resampled);
@@ -566,7 +566,7 @@ impl AudioRecorder {
         let native_rate = *self.device_sample_rate.lock().map_err(|e| e.to_string())?;
         let native_channels = *self.device_channels.lock().map_err(|e| e.to_string())?;
 
-        let mono = to_mono(&raw_samples, native_channels);
+        let mono = mic_to_mono(&raw_samples, native_channels);
 
         let target_rate = 16000u32;
         if native_rate == target_rate {
@@ -619,6 +619,37 @@ pub(crate) fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
         .collect()
 }
 
+/// Microphone downmix: the average of the channels that carry the voice, i.e.
+/// within 6 dB of the loudest. A plain average of a device that puts the mic on
+/// one channel and silence on the others (some USB interfaces and array mics)
+/// lowers speech by 6-12 dB, into the range where recognition gets worse. When
+/// every channel carries the same signal (Henry's Intel array mic, measured
+/// 2026-11-20: four identical channels) this equals the plain average.
+/// System audio keeps `to_mono`: a quieter stereo side there is content.
+pub(crate) fn mic_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+    let ch = channels as usize;
+    if ch <= 1 || samples.len() < ch {
+        return to_mono(samples, channels);
+    }
+    let mut energy = vec![0.0f64; ch];
+    for frame in samples.chunks_exact(ch) {
+        for (i, &s) in frame.iter().enumerate() {
+            energy[i] += (s as f64) * (s as f64);
+        }
+    }
+    let loudest = energy.iter().cloned().fold(0.0, f64::max);
+    if loudest <= 0.0 {
+        return to_mono(samples, channels);
+    }
+    // 6 dB in amplitude is a quarter of the energy.
+    let used: Vec<usize> = (0..ch).filter(|&i| energy[i] * 4.0 >= loudest).collect();
+    let n = used.len() as f32;
+    samples
+        .chunks_exact(ch)
+        .map(|frame| used.iter().map(|&i| frame[i]).sum::<f32>() / n)
+        .collect()
+}
+
 /// RMS of the loudest channel of an interleaved buffer. `channels` is the device
 /// channel count (1 for mono, 4 for an array mic...). Each channel is measured on
 /// its own and the loudest wins, so silent channels never dilute the level and a
@@ -640,11 +671,35 @@ fn rms_loudest_channel(samples: &[f32], channels: usize) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// Downsampling low-pass edge, as a fraction of the output rate: 0.45 of
+/// 16 kHz = 7.2 kHz, just under the 8 kHz Nyquist.
+const DOWNSAMPLE_CUTOFF: f64 = 0.45;
+/// Zero crossings of the windowed sinc on each side (filter length).
+const DOWNSAMPLE_ZEROS: f64 = 8.0;
+
+/// One tap of a Blackman-windowed sinc low-pass. `t` is the distance from the
+/// output position in input samples, `cutoff` in cycles per input sample,
+/// `half` the window's half width. The caller normalizes the sum to 1.
+fn sinc_tap(t: f64, cutoff: f64, half: f64) -> f64 {
+    let x = 2.0 * cutoff * t;
+    let sinc = if x.abs() < 1e-12 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+    let u = (t / half + 1.0) * 0.5; // 0..1 across the window
+    if !(0.0..=1.0).contains(&u) {
+        return 0.0;
+    }
+    let tau = 2.0 * std::f64::consts::PI * u;
+    let window = 0.42 - 0.5 * tau.cos() + 0.08 * (2.0 * tau).cos();
+    sinc * window
+}
+
 /// Continuous sample-rate converter for a live capture. Keeps the fractional read
 /// position and the unread input between calls, so feeding it audio in blocks of
 /// any size yields the same stream as converting the whole recording at once - no
-/// samples dropped at block edges. Downsampling averages each output's input span
-/// (a box low-pass) so 8-24 kHz content doesn't alias into the speech band.
+/// samples dropped at block edges. Downsampling uses a windowed-sinc low-pass
+/// (`sinc_tap`). It replaced a 3-sample average, which at 48 kHz let through
+/// most of 8-12 kHz (only -3.5 dB at 8 kHz), folding hiss and sibilants back
+/// into the speech band. The filter reads ~0.5 ms ahead, so the stream trails
+/// the input by that much.
 pub(crate) struct StreamResampler {
     ratio: f64,
     /// Input not yet fully used; `pending[0]` is absolute input sample `base`.
@@ -665,6 +720,11 @@ impl StreamResampler {
         Self { ratio, pending: Vec::new(), base: 0, next_out: 0 }
     }
 
+    /// Input samples on each side of an output that the low-pass reads.
+    fn half_width(&self) -> f64 {
+        DOWNSAMPLE_ZEROS / (2.0 * DOWNSAMPLE_CUTOFF / self.ratio)
+    }
+
     pub(crate) fn process(&mut self, input: &[f32]) -> Vec<f32> {
         if (self.ratio - 1.0).abs() < f64::EPSILON {
             return input.to_vec();
@@ -676,12 +736,24 @@ impl StreamResampler {
             let pos = self.next_out as f64 * self.ratio;
             let idx = pos as u64;
             if self.ratio > 1.0 {
-                let stop = (((self.next_out + 1) as f64 * self.ratio) as u64).max(idx + 1);
-                if stop > end_abs {
+                let half = self.half_width();
+                let last = (pos + half).floor() as u64;
+                if last >= end_abs {
                     break;
                 }
-                let span = &self.pending[(idx - self.base) as usize..(stop - self.base) as usize];
-                out.push(span.iter().sum::<f32>() / span.len() as f32);
+                let first = (pos - half).ceil() as i64;
+                let cutoff = DOWNSAMPLE_CUTOFF / self.ratio;
+                let (mut acc, mut norm) = (0.0f64, 0.0f64);
+                for k in first..=last as i64 {
+                    let w = sinc_tap(k as f64 - pos, cutoff, half);
+                    norm += w;
+                    // Before the first input sample the stream is silence; it
+                    // still counts in `norm`, or the start would be re-centred.
+                    if k >= self.base as i64 {
+                        acc += w * self.pending[(k as u64 - self.base) as usize] as f64;
+                    }
+                }
+                out.push(if norm.abs() > 1e-9 { (acc / norm) as f32 } else { 0.0 });
             } else {
                 if idx + 1 >= end_abs {
                     break;
@@ -693,7 +765,9 @@ impl StreamResampler {
             self.next_out += 1;
         }
         // Drop input that no future output can reach.
-        let first_needed = ((self.next_out as f64 * self.ratio) as u64).min(end_abs);
+        let reach = if self.ratio > 1.0 { self.half_width() } else { 0.0 };
+        let first_needed =
+            ((self.next_out as f64 * self.ratio - reach).ceil().max(0.0) as u64).min(end_abs);
         if first_needed > self.base {
             self.pending.drain(..(first_needed - self.base) as usize);
             self.base = first_needed;
@@ -803,7 +877,14 @@ pub(crate) fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
     }
     let ratio = from_rate as f64 / to_rate as f64;
     let output_len = (samples.len() as f64 / ratio) as usize;
-    let mut output = StreamResampler::new(from_rate, to_rate).process(samples);
+    let mut rs = StreamResampler::new(from_rate, to_rate);
+    let mut output = rs.process(samples);
+    // The downsampling filter reads past each output, so the last ~0.5 ms
+    // wait for input that never comes: feed it silence to finish them.
+    if ratio > 1.0 {
+        output.extend(rs.process(&vec![0.0; rs.half_width().ceil() as usize + 2]));
+    }
+    output.truncate(output_len);
     // Upsampling stops one short of the end (it needs a next sample); hold the
     // last value so the length matches the whole-buffer expectation.
     let last = *samples.last().unwrap_or(&0.0);
@@ -832,8 +913,11 @@ mod resampler_tests {
                 streamed.extend(rs.process(block));
             }
             let expected = (input.len() as f64 * 16000.0 / rate as f64) as usize;
+            // The low-pass trails the input by its half width (~9 outputs at
+            // 48 kHz); what matters is that blocks lose nothing on top of that.
+            let trail = (StreamResampler::new(rate, 16000).half_width() * 16000.0 / rate as f64).ceil() as i64 + 1;
             assert!(
-                (streamed.len() as i64 - expected as i64).abs() <= 1,
+                (streamed.len() as i64 - expected as i64).abs() <= trail,
                 "rate {rate}: got {} samples, expected {expected}",
                 streamed.len()
             );
@@ -865,6 +949,22 @@ mod resampler_tests {
     }
 
     #[test]
+    fn downsampling_keeps_speech_and_blocks_aliases() {
+        let rms = |x: &[f32]| (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt();
+        for &rate in &[48000u32, 44100] {
+            // Speech band passes at full level.
+            let out = resample(&tone(rate, 1.0, 1000.0), rate, 16000);
+            let r = rms(&out[1000..15000]);
+            assert!((r - 0.5 / 2f32.sqrt()).abs() < 0.01, "rate {rate}: 1 kHz rms {r}");
+            // 10 kHz would fold to 6 kHz; it must come out at least 40 dB down
+            // (the old 3-sample average let it through at about -10 dB).
+            let out = resample(&tone(rate, 1.0, 10000.0), rate, 16000);
+            let r = rms(&out[1000..15000]);
+            assert!(r < 0.0035, "rate {rate}: 10 kHz alias rms {r}");
+        }
+    }
+
+    #[test]
     fn upsampling_8k_streams_continuously() {
         let input = tone(8000, 1.0, 200.0);
         let mut rs = StreamResampler::new(8000, 16000);
@@ -873,6 +973,20 @@ mod resampler_tests {
             out.extend(rs.process(block));
         }
         assert!((out.len() as i64 - 16000).abs() <= 2, "got {}", out.len());
+    }
+
+    #[test]
+    fn mic_downmix_skips_silent_channels() {
+        // Voice on channel 0 only, three silent channels: kept at full level.
+        let buf: Vec<f32> = (0..400).flat_map(|i| [if i % 2 == 0 { 0.2 } else { -0.2 }, 0.0, 0.0, 0.0]).collect();
+        let mono = mic_to_mono(&buf, 4);
+        assert_eq!(mono.len(), 400);
+        assert!((mono[0] - 0.2).abs() < 1e-6);
+        // Identical channels: same as the plain average.
+        let same: Vec<f32> = (0..100).flat_map(|i| [i as f32 / 100.0; 4]).collect();
+        assert_eq!(mic_to_mono(&same, 4), to_mono(&same, 4));
+        // Silence everywhere stays silence.
+        assert!(mic_to_mono(&[0.0; 8], 2).iter().all(|&s| s == 0.0));
     }
 
     #[test]

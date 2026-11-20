@@ -83,8 +83,8 @@ struct ReceiveContext {
     stop_commit_sent: AtomicBool,
     /// Milliseconds since `epoch` when audio was last written to the socket.
     last_audio_ms: AtomicU64,
-    /// Loudest chunk peak heard this session (f32 bits), for `LiveGain`.
-    peak_bits: std::sync::atomic::AtomicU32,
+    /// Session level for `live_gain` (see `PeakTracker`).
+    peaks: std::sync::Mutex<PeakTracker>,
     epoch: std::time::Instant,
 }
 
@@ -154,9 +154,9 @@ const RECONNECT_FAILED: &str =
     "החיבור לשירות התמלול נפל ולא הצלחתי לחבר אותו מחדש. כדאי לבדוק את החיבור לאינטרנט. הטקסט שכבר התקבל נשמר.";
 
 /// Gain for live audio from a quiet microphone (see `api_transcribe::upload_gain`
-/// for the measurement). `peak` is the loudest chunk peak so far this session.
-/// It only grows, so the gain only falls: pauses never raise it and a loud
-/// sound lowers it for the rest of the session. Below `LIVE_MIN_PEAK` the
+/// for the measurement). `peak` is the session level from `PeakTracker`.
+/// It only grows, so the gain only falls: pauses never raise it, and a single
+/// click does not lower it (the tracker ignores the loudest few chunks). Below `LIVE_MIN_PEAK` the
 /// session has heard only near-silence and nothing is boosted; from there to
 /// twice that the gain ramps up, so it has no jump. The cap is low (8) because
 /// a strong boost of a near-silent room made "multi" hear English words
@@ -175,6 +175,37 @@ fn live_gain(peak: f32) -> f32 {
         return 1.0 + (gain - 1.0) * (peak - LIVE_MIN_PEAK) / LIVE_MIN_PEAK;
     }
     gain
+}
+
+/// How many of the loudest chunks a session's level ignores. A key click or a
+/// tap on the laptop (the dictation hotkey itself, on a laptop mic) fills a
+/// few ~10 ms chunks; speech fills dozens. Taking the session maximum let one
+/// click set the gain for the whole dictation, the reason `upload_gain` uses a
+/// percentile.
+const PEAK_RANK: usize = 8;
+
+/// The session's level for `live_gain`: the `PEAK_RANK`-th loudest chunk peak
+/// so far (the loudest, until that many chunks were heard). Like the old
+/// maximum it never falls, so pauses never raise the gain.
+#[derive(Default)]
+struct PeakTracker {
+    /// Loudest chunk peaks, descending, at most `PEAK_RANK`.
+    top: Vec<f32>,
+}
+
+impl PeakTracker {
+    fn push(&mut self, peak: f32) -> f32 {
+        let at = self.top.partition_point(|&p| p >= peak);
+        if at < PEAK_RANK {
+            self.top.insert(at, peak);
+            self.top.truncate(PEAK_RANK);
+        }
+        if self.top.len() < PEAK_RANK {
+            self.top[0]
+        } else {
+            self.top[PEAK_RANK - 1]
+        }
+    }
 }
 
 fn to_pcm16_with_gain(samples: &[f32], gain: f32) -> Vec<i16> {
@@ -628,7 +659,7 @@ impl StreamingSession {
             fatal: std::sync::Mutex::new(None),
             stop_commit_sent: AtomicBool::new(false),
             last_audio_ms: AtomicU64::new(0),
-            peak_bits: std::sync::atomic::AtomicU32::new(0),
+            peaks: std::sync::Mutex::new(PeakTracker::default()),
             epoch: std::time::Instant::now(),
         });
         let recv_task = spawn_receiver(ctx.clone(), reader, 0);
@@ -654,13 +685,11 @@ impl StreamingSession {
             return Err(fatal);
         }
         let chunk_peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        let peak = f32::from_bits(
-            self.ctx
-                .peak_bits
-                .fetch_max(chunk_peak.to_bits(), Ordering::SeqCst),
-        )
-        .max(chunk_peak);
-        let pcm = to_pcm16_with_gain(samples, live_gain(peak));
+        let level = match self.ctx.peaks.lock() {
+            Ok(mut t) => t.push(chunk_peak),
+            Err(_) => chunk_peak,
+        };
+        let pcm = to_pcm16_with_gain(samples, live_gain(level));
         if self.ctx.dead.load(Ordering::SeqCst) {
             self.ctx.unacked().push(&pcm);
             // Resends everything unacknowledged, this chunk included.
@@ -1052,6 +1081,27 @@ mod tests {
         assert_eq!(live_gain(0.6), 1.0); // normal mic
         let pcm = to_pcm16_with_gain(&[0.02, -0.02, 0.9], 30.0);
         assert_eq!(pcm, vec![19660, -19660, 32767]);
+    }
+
+    #[test]
+    fn one_click_does_not_set_the_session_gain() {
+        let mut t = PeakTracker::default();
+        // The hotkey click, two chunks loud, then quiet speech.
+        assert_eq!(t.push(0.6), 0.6);
+        t.push(0.5);
+        let mut level = 0.0;
+        for i in 0..50 {
+            level = t.push(0.04 + 0.0001 * i as f32);
+        }
+        assert!(level < 0.05, "level {level} still set by the click");
+        assert!(live_gain(level) > 5.0);
+        // Pauses never raise the gain: quieter chunks leave the level alone.
+        assert_eq!(t.push(0.001), level);
+        // Speech that really gets louder lowers it.
+        for _ in 0..PEAK_RANK {
+            t.push(0.4);
+        }
+        assert_eq!(t.push(0.0), 0.4);
     }
 
     #[test]

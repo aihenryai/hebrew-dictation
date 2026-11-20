@@ -78,12 +78,18 @@ fn live_heard_words(carried: &str, live: &str, leftover_samples: usize) -> bool 
     !carried.trim().is_empty() || !live.trim().is_empty() || leftover_samples > 0
 }
 
-/// Upper bound on the extra pass: past it the live text is used as is.
-const REFINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+/// Upper bound on the extra pass: past it the live text is used as is. It grows
+/// with the recording, since uploading and transcribing five minutes takes far
+/// longer than ten seconds; a flat 12 s quietly dropped long dictations back to
+/// the less accurate live text. 8 s plus 0.08 s per second of audio: 10 s for
+/// half a minute, 32 s for the five-minute maximum.
+fn refine_timeout(samples: usize) -> std::time::Duration {
+    std::time::Duration::from_secs_f32(8.0 + 0.08 * samples as f32 / 16_000.0)
+}
 
 /// The more accurate text for a finished hold-to-talk dictation, or None to
 /// keep the live text (not ElevenLabs, live typing, silence, an error, or
-/// slower than `REFINE_TIMEOUT`).
+/// slower than `refine_timeout`).
 async fn refine_dictation(
     state: &AppState,
     samples: &[f32],
@@ -97,7 +103,7 @@ async fn refine_dictation(
         return None;
     }
     let pass = api_transcribe::transcribe_api(&provider, samples, &key, language);
-    match tokio::time::timeout(REFINE_TIMEOUT, pass).await {
+    match tokio::time::timeout(refine_timeout(samples.len()), pass).await {
         Ok(Ok(t)) => {
             let text = dictionary::apply(t.trim()).trim().to_string();
             (!text.is_empty()).then_some(text)
@@ -3752,6 +3758,13 @@ mod tests {
         assert!(!should_refine_dictation(&ElevenLabs, false, 7_999));
         assert!(should_refine_dictation(&ElevenLabs, false, 16_000 * 300));
         assert!(!should_refine_dictation(&ElevenLabs, false, 16_000 * 300 + 1));
+    }
+
+    #[test]
+    fn refine_timeout_grows_with_the_recording() {
+        assert_eq!(refine_timeout(0).as_secs(), 8);
+        assert_eq!(refine_timeout(16_000 * 30).as_secs_f32().round() as u64, 10);
+        assert_eq!(refine_timeout(16_000 * 300).as_secs_f32().round() as u64, 32);
     }
 
     #[test]
