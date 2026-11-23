@@ -363,8 +363,10 @@ async fn await_session_started(ws: &mut WsStream) -> Result<(), String> {
 
 /// After the final commit, how long the receiver keeps listening once
 /// nothing new arrives. Commit answers came within ~0.1 s in the 2026-11-19
-/// probes; partials of a long last segment keep resetting it.
-const ELEVENLABS_DRAIN: Duration = Duration::from_secs(2);
+/// probes; partials of a long last segment keep resetting it. 0.8 s: with the
+/// refine pass running, this wait was the whole stop delay (2.26 s of 2.63 s in
+/// Henry's 2026-11-23 timing log), and the refine text replaces what it hears.
+const ELEVENLABS_DRAIN: Duration = Duration::from_millis(800);
 
 /// `conn_base` is the session position of this connection's first sample:
 /// Deepgram's timestamps restart at zero on every connection.

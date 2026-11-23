@@ -2054,8 +2054,23 @@ async fn switch_streaming_language(
     Ok(())
 }
 
+/// Appends one line to the timing log; never fails the dictation.
+fn log_stop_timing(line: &str) {
+    use std::io::Write;
+    let dir = settings::get_settings_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("timing.log"))
+    {
+        let _ = writeln!(f, "{} | {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), line);
+    }
+}
+
 #[tauri::command]
 async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
     // Stop the CPAL stream FIRST. With the chunk callback still wired, the final 10-30ms
     // of WASAPI-buffered audio is delivered via the callback into `audio_tx` before the
     // stream is dropped. clear_chunk_callback AFTER ensures nothing further is queued.
@@ -2106,15 +2121,23 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // only the recorded audio. Most of that pass was sent while the user was
     // talking; only the last part is left (Henry, 2026-11-20: the wait at the
     // end of a dictation felt long).
+    let t_dispatch = t0.elapsed();
     let refine = async {
-        match progressive {
+        let started = std::time::Instant::now();
+        let out = match progressive {
             Some(p) => p.finish(refine_timeout).await,
             None => refine_dictation(&state, &samples, refine_lang, active.live_injection).await,
-        }
+        };
+        (out, started.elapsed())
+    };
+    let close = async {
+        let started = std::time::Instant::now();
+        let out = active.session.stop().await;
+        (out, started.elapsed())
     };
     // Close the WebSocket and return the accumulated final text, including
     // what earlier connections of this dictation heard (language switches).
-    let (stopped, refined) = tokio::join!(active.session.stop(), refine);
+    let ((stopped, t_close), (refined, t_refine)) = tokio::join!(close, refine);
     // Live heard nothing and no audio went missing: the recording is noise or
     // breath. The file model makes up words for such audio (2026-11-20 bench:
     // 21 words on 8 noise clips where live returned none), so keep it empty.
@@ -2153,6 +2176,19 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     if active.live_injection {
         local_api::record_utterance(&state.last_transcript, &text);
     }
+
+    // Where the wait at the end went (Henry, 2026-11-23: it felt very slow).
+    // One line per dictation in %APPDATA%\hebrew-dictation\timing.log.
+    log_stop_timing(&format!(
+        "audio {:.1}s | progressive {} | dispatch {:.2}s | close {:.2}s | refine {:.2}s | refined {} | total {:.2}s",
+        samples.len() as f32 / 16_000.0,
+        progressive.is_some(),
+        t_dispatch.as_secs_f32(),
+        t_close.as_secs_f32(),
+        t_refine.as_secs_f32(),
+        was_refined,
+        t0.elapsed().as_secs_f32(),
+    ));
 
     // Diagnostic opt-in (default off, see settings::AppSettings::debug_save_audio):
     // save this dictation's audio + raw transcript to disk for re-running against
@@ -2602,9 +2638,16 @@ async fn inject_text(app: AppHandle, text: String) -> Result<(), String> {
     // A synchronous command waiting on INJECTION_LOCK could deadlock it.
     let inject_app = app.clone();
     let inject_value = text.clone();
+    let inject_started = std::time::Instant::now();
     let result = tauri::async_runtime::spawn_blocking(move || {
         inject_text_defocused(&inject_app, &inject_value)
     }).await.unwrap_or_else(|e| Err(format!("ההזרקה נכשלה: {e}")));
+    log_stop_timing(&format!(
+        "inject {} chars {:.2}s ok={}",
+        text.chars().count(),
+        inject_started.elapsed().as_secs_f32(),
+        result.is_ok()
+    ));
     // Record regardless of injection outcome: the transcript was completed
     // (the user spoke it, Whisper/Deepgram transcribed it) whether or not the
     // OS-level clipboard-paste into the active field then succeeded. Matches
