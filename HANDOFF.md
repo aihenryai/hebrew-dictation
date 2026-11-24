@@ -1,5 +1,12 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-24 - end-of-dictation wait cut to the last part only (not released)
+
+- Henry: the wait at the end still felt very slow. New `%APPDATA%\hebrew-dictation\timing.log` (one line per dictation, plus one per `inject_text`) showed, on an 18.5 s dictation: dispatch drain 0.71 s, then max(live close 2.26 s, refine 1.17 s); typing 0.10 s.
+- `streaming.rs`: `ELEVENLABS_DRAIN` 2 s -> 0.8 s (total 2.6 s -> 2.0 s).
+- `lib.rs`: the refine pass gets mic chunks on its own channel (`ProgressiveFeed`, set by `set_dictation_callback`), so its last part is sent the moment the mic stops instead of after the live dispatch drains. The live dispatch and close run on a spawned task; when the refine succeeded and live already has text (`text_so_far`), the stop returns without waiting for the close (logged `close skipped`). Otherwise it waits and behaves as before. `mark_incomplete` removed: a failed dispatch no longer starves the refine pass.
+- Expected wait: mic stop plus the last part (about 1.3 s). Not yet measured on Henry's machine; read `timing.log` after his next dictations.
+
 ## 2026-11-20 - refine pass sent while talking; short wait at the end (not released)
 
 - Henry, with live typing off: the wait between the stop and the text was long. Measured: scribe_v3 takes about 0.25 s per second of audio (2 s for 8 s, 7 s for 30 s, 12-18 s for 60 s), FLAC upload does not help (server time). It also ran only after the live close's 2 s drain, and 60 s dictations could hit `refine_timeout` and fall back to live text.

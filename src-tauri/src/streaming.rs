@@ -438,6 +438,7 @@ fn spawn_receiver(
     })
 }
 
+#[derive(Default)]
 pub(crate) struct StreamingStop {
     pub text: String,
     pub warning: Option<String>,
@@ -677,6 +678,11 @@ impl StreamingSession {
 
     pub(crate) fn activity(&self) -> &AtomicU64 {
         &self.ctx.activity
+    }
+
+    /// The final text this connection has received so far, before `stop`.
+    pub(crate) async fn text_so_far(&self) -> String {
+        self.ctx.final_text.lock().await.trim().to_string()
     }
 
     /// Convert f32 samples (assumed 16kHz mono) to PCM16 LE bytes and send over

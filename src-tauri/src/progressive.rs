@@ -49,8 +49,6 @@ struct Inner {
     pending: Vec<f32>,
     parts: Vec<Part>,
     language: String,
-    /// False once some audio of the dictation did not reach `push`.
-    complete: bool,
 }
 
 pub(crate) struct ProgressiveRefine {
@@ -116,22 +114,9 @@ impl ProgressiveRefine {
                 pending: Vec::new(),
                 parts: Vec::new(),
                 language: language.to_string(),
-                complete: true,
             }),
             transcribe,
         })
-    }
-
-    /// Some audio was lost on the way (a failed dispatch): the parts no longer
-    /// cover the dictation, so the caller refines the whole recording instead.
-    pub(crate) fn mark_incomplete(&self) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.complete = false;
-        }
-    }
-
-    pub(crate) fn is_complete(&self) -> bool {
-        self.inner.lock().map(|g| g.complete).unwrap_or(false)
     }
 
     /// The language for parts sent from now on. A switch in the middle of a

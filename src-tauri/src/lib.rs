@@ -50,7 +50,55 @@ struct ActiveStreaming {
     language: String,
     /// The refine pass, sent part by part while the user talks. Only for
     /// dictations that type at the end (see `should_refine_dictation`).
-    progressive: Option<Arc<progressive::ProgressiveRefine>>,
+    progressive: Option<ProgressiveFeed>,
+}
+
+/// The refine pass gets the microphone audio on its own channel, not through
+/// the live connection's dispatch: that dispatch waits on the network, and at
+/// the stop it took 0.7 s to drain before the last part could even be sent
+/// (Henry's timing log, 2026-11-23). This channel drains at once.
+struct ProgressiveFeed {
+    refine: Arc<progressive::ProgressiveRefine>,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProgressiveFeed {
+    fn spawn(refine: Arc<progressive::ProgressiveRefine>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+        let r = refine.clone();
+        let task = tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                r.push(&chunk);
+            }
+        });
+        Self { refine, tx, task }
+    }
+
+    /// Every chunk the microphone delivered is pushed; the callback that held
+    /// the other sender must already be cleared.
+    async fn close(self) -> Arc<progressive::ProgressiveRefine> {
+        drop(self.tx);
+        let _ = self.task.await;
+        self.refine
+    }
+}
+
+/// Routes each microphone chunk to the live connection and, when there is
+/// one, to the refine pass.
+fn set_dictation_callback(
+    recorder: &audio::AudioRecorder,
+    audio_tx: &tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+    feed: Option<&ProgressiveFeed>,
+) {
+    let tx_for_cb = audio_tx.clone();
+    let feed_tx = feed.map(|f| f.tx.clone());
+    recorder.set_chunk_callback(move |chunk: &[f32]| {
+        let _ = tx_for_cb.send(chunk.to_vec());
+        if let Some(f) = &feed_tx {
+            let _ = f.send(chunk.to_vec());
+        }
+    });
 }
 
 /// The progressive refine pass for a new dictation, or None when the text is
@@ -1825,14 +1873,10 @@ fn spawn_audio_dispatch(
     session: Arc<streaming::StreamingSession>,
     mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<f32>>,
     app: AppHandle,
-    progressive: Option<Arc<progressive::ProgressiveRefine>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         while let Some(first) = audio_rx.recv().await {
             let chunk = take_dispatch_batch(first, &mut audio_rx);
-            if let Some(p) = &progressive {
-                p.push(&chunk);
-            }
             if let Err(e) = session.send_audio_pcm16(&chunk).await {
                 let _ = app.emit("audio-stream-error", &e);
                 return Err(e);
@@ -1893,15 +1937,15 @@ async fn start_streaming_transcription(
 
     // Channel to pipe audio chunks from the CPAL callback (sync) to an async dispatcher.
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+    // Before the recorder starts, so the refine pass gets the pre-roll too.
+    let progressive =
+        new_progressive_refine(&provider, &api_key, &lang, live_injection).map(ProgressiveFeed::spawn);
 
     // Attach the chunk callback BEFORE starting the recorder, so the very first CPAL
     // callback (which may fire ~10ms after start) already has somewhere to send audio.
     {
         let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        let tx_for_cb = audio_tx.clone();
-        recorder.set_chunk_callback(move |chunk: &[f32]| {
-            let _ = tx_for_cb.send(chunk.to_vec());
-        });
+        set_dictation_callback(&recorder, &audio_tx, progressive.as_ref());
     }
 
     // Start audio capture IMMEDIATELY — before opening the WebSocket. Audio chunks flow
@@ -1939,9 +1983,7 @@ async fn start_streaming_transcription(
         }
     };
 
-    let progressive = new_progressive_refine(&provider, &api_key, &lang, live_injection);
-    let dispatch_task =
-        spawn_audio_dispatch(session.clone(), audio_rx, app.clone(), progressive.clone());
+    let dispatch_task = spawn_audio_dispatch(session.clone(), audio_rx, app.clone());
 
     // Store the active session so stop_streaming_transcription can find it.
     *guard = Some(ActiveStreaming {
@@ -2012,18 +2054,13 @@ async fn switch_streaming_language(
                 return Err(e.to_string());
             }
         };
-        let tx_for_cb = audio_tx.clone();
-        // Replacing the callback drops its clone of the old sender.
-        recorder.set_chunk_callback(move |chunk: &[f32]| {
-            let _ = tx_for_cb.send(chunk.to_vec());
-        });
+        // Replacing the callback drops its clone of the old sender. The
+        // refine pass keeps its own channel across the switch.
+        set_dictation_callback(&recorder, &audio_tx, old.progressive.as_ref());
     }
 
     drop(old.audio_tx);
     let mut warning = finish_dispatch(&old.session, old.dispatch_task).await;
-    if let (Some(p), Some(_)) = (&old.progressive, &warning) {
-        p.mark_incomplete();
-    }
     let stopped = old.session.stop().await;
     let recovered =
         recover_streaming_leftover(&app, &state, &stopped.leftover, old.live_injection).await;
@@ -2035,10 +2072,9 @@ async fn switch_streaming_language(
     // Parts sent from here on may hold both languages; "auto" lets the file
     // model follow them, as the whole-recording pass did after a switch.
     if let Some(p) = &old.progressive {
-        p.set_language("auto");
+        p.refine.set_language("auto");
     }
-    let dispatch_task =
-        spawn_audio_dispatch(session.clone(), audio_rx, app.clone(), old.progressive.clone());
+    let dispatch_task = spawn_audio_dispatch(session.clone(), audio_rx, app.clone());
     *guard = Some(ActiveStreaming {
         session,
         audio_tx,
@@ -2109,40 +2145,53 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     } else {
         "auto"
     };
-    // Every queued chunk reaches the session, and the progressive refine pass.
-    let dispatch_warning = finish_dispatch(&active.session, active.dispatch_task).await;
-    // A dispatch that failed stopped feeding the progressive pass as well.
-    let progressive = active
-        .progressive
-        .as_ref()
-        .filter(|p| dispatch_warning.is_none() && p.is_complete());
-    // The live close and the refine pass run side by side: the close waits up
-    // to ELEVENLABS_DRAIN after the last commit, and the refine pass needs
-    // only the recorded audio. Most of that pass was sent while the user was
-    // talking; only the last part is left (Henry, 2026-11-20: the wait at the
-    // end of a dictation felt long).
-    let t_dispatch = t0.elapsed();
-    let refine = async {
-        let started = std::time::Instant::now();
-        let out = match progressive {
-            Some(p) => p.finish(refine_timeout).await,
-            None => refine_dictation(&state, &samples, refine_lang, active.live_injection).await,
-        };
-        (out, started.elapsed())
+    let t_mic = t0.elapsed();
+    // The refine pass has its own channel, which drains at once; the last
+    // part goes out right away, without waiting for the live connection.
+    let progressive = match active.progressive {
+        Some(feed) => Some(feed.close().await),
+        None => None,
     };
-    let close = async {
-        let started = std::time::Instant::now();
-        let out = active.session.stop().await;
-        (out, started.elapsed())
+    // The live connection finishes on its own task: its queued audio, then
+    // the close, which waits up to ELEVENLABS_DRAIN after the last commit.
+    let session = active.session.clone();
+    let dispatch_task = active.dispatch_task;
+    let mut close = tokio::spawn(async move {
+        let dispatch_warning = finish_dispatch(&session, dispatch_task).await;
+        let stopped = session.stop().await;
+        (dispatch_warning, stopped)
+    });
+    // Most of the refine pass was sent while the user was talking; only the
+    // last part is left (Henry, 2026-11-20: the wait at the end felt long).
+    let refine_started = std::time::Instant::now();
+    let refined = match &progressive {
+        Some(p) => p.finish(refine_timeout).await,
+        None => refine_dictation(&state, &samples, refine_lang, active.live_injection).await,
     };
-    // Close the WebSocket and return the accumulated final text, including
-    // what earlier connections of this dictation heard (language switches).
-    let ((stopped, t_close), (refined, t_refine)) = tokio::join!(close, refine);
+    let t_refine = refine_started.elapsed();
     // Live heard nothing and no audio went missing: the recording is noise or
     // breath. The file model makes up words for such audio (2026-11-20 bench:
     // 21 words on 8 noise clips where live returned none), so keep it empty.
-    let refined = refined
-        .filter(|_| live_heard_words(&active.carried_text, &stopped.text, stopped.leftover.len()));
+    // When live already heard words, the refined text is final and the close
+    // is left to finish in the background: its 1 s drain was the rest of the
+    // wait (Henry, 2026-11-24: shorten it as far as it goes).
+    let live_so_far = active.session.text_so_far().await;
+    let skip_close = refined.is_some()
+        && live_heard_words(&active.carried_text, &live_so_far, 0);
+    let (dispatch_warning, stopped, t_close) = if skip_close {
+        (None, streaming::StreamingStop::default(), None)
+    } else {
+        let waited = std::time::Instant::now();
+        let (w, s) = match (&mut close).await {
+            Ok(out) => out,
+            Err(e) => (Some(e.to_string()), streaming::StreamingStop::default()),
+        };
+        (w, s, Some(waited.elapsed()))
+    };
+    let refined = refined.filter(|_| {
+        skip_close
+            || live_heard_words(&active.carried_text, &stopped.text, stopped.leftover.len())
+    });
     // A refined text means the whole recording was transcribed again: the
     // leftover upload is not needed, and a warning about live audio that went
     // missing no longer applies.
@@ -2180,12 +2229,12 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // Where the wait at the end went (Henry, 2026-11-23: it felt very slow).
     // One line per dictation in %APPDATA%\hebrew-dictation\timing.log.
     log_stop_timing(&format!(
-        "audio {:.1}s | progressive {} | dispatch {:.2}s | close {:.2}s | refine {:.2}s | refined {} | total {:.2}s",
+        "audio {:.1}s | progressive {} | mic {:.2}s | refine {:.2}s | close {} | refined {} | total {:.2}s",
         samples.len() as f32 / 16_000.0,
         progressive.is_some(),
-        t_dispatch.as_secs_f32(),
-        t_close.as_secs_f32(),
+        t_mic.as_secs_f32(),
         t_refine.as_secs_f32(),
+        t_close.map_or("skipped".to_string(), |d| format!("+{:.2}s", d.as_secs_f32())),
         was_refined,
         t0.elapsed().as_secs_f32(),
     ));
