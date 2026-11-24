@@ -2111,10 +2111,14 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // of WASAPI-buffered audio is delivered via the callback into `audio_tx` before the
     // stream is dropped. clear_chunk_callback AFTER ensures nothing further is queued.
     // This prevents the "last words cut off" bug.
-    let samples = {
+    // Not converted to 16 kHz here: the progressive pass already has its audio,
+    // and converting a long recording took seconds of the wait.
+    let recording = {
         let mut recorder = state.recorder.lock().map_err(|e| e.to_string())?;
-        recorder.stop_recording().unwrap_or_default()
+        recorder.stop_recording_raw().ok()
     };
+    let audio_secs = recording.as_ref().map_or(0.0, |r| r.duration_secs());
+    let samples_16k = || recording.as_ref().map(|r| r.to_16k_mono()).unwrap_or_default();
     {
         let recorder = state.recorder.lock().map_err(|e| e.to_string())?;
         recorder.clear_chunk_callback();
@@ -2166,7 +2170,9 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     let refine_started = std::time::Instant::now();
     let refined = match &progressive {
         Some(p) => p.finish(refine_timeout).await,
-        None => refine_dictation(&state, &samples, refine_lang, active.live_injection).await,
+        // Live typing has nothing left to refine; skip the conversion.
+        None if active.live_injection => None,
+        None => refine_dictation(&state, &samples_16k(), refine_lang, active.live_injection).await,
     };
     let t_refine = refine_started.elapsed();
     // Live heard nothing and no audio went missing: the recording is noise or
@@ -2230,7 +2236,7 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // One line per dictation in %APPDATA%\hebrew-dictation\timing.log.
     log_stop_timing(&format!(
         "audio {:.1}s | progressive {} | mic {:.2}s | refine {:.2}s | close {} | refined {} | total {:.2}s",
-        samples.len() as f32 / 16_000.0,
+        audio_secs,
         progressive.is_some(),
         t_mic.as_secs_f32(),
         t_refine.as_secs_f32(),
@@ -2249,7 +2255,7 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
         .map(|s| s.debug_save_audio)
         .unwrap_or(false);
     if debug_save {
-        save_debug_sample(&samples, &text);
+        save_debug_sample(&samples_16k(), &text);
     }
 
     Ok(text)

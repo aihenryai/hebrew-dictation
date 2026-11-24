@@ -541,6 +541,11 @@ impl AudioRecorder {
     }
 
     pub fn stop_recording(&mut self) -> Result<Vec<f32>, String> {
+        Ok(self.stop_recording_raw()?.into_16k_mono())
+    }
+
+    /// Stops like `stop_recording`, without converting the audio yet.
+    pub fn stop_recording_raw(&mut self) -> Result<RawRecording, String> {
         {
             let mut recording = self.is_recording.lock().map_err(|e| e.to_string())?;
             *recording = false;
@@ -565,15 +570,11 @@ impl AudioRecorder {
         let raw_samples = self.samples.lock().map_err(|e| e.to_string())?.clone();
         let native_rate = *self.device_sample_rate.lock().map_err(|e| e.to_string())?;
         let native_channels = *self.device_channels.lock().map_err(|e| e.to_string())?;
-
-        let mono = mic_to_mono(&raw_samples, native_channels);
-
-        let target_rate = 16000u32;
-        if native_rate == target_rate {
-            Ok(mono)
-        } else {
-            Ok(resample(&mono, native_rate, target_rate))
-        }
+        Ok(RawRecording {
+            samples: raw_samples,
+            rate: native_rate,
+            channels: native_channels,
+        })
     }
 
     pub fn is_recording(&self) -> bool {
@@ -626,6 +627,35 @@ pub(crate) fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
 /// every channel carries the same signal (Henry's Intel array mic, measured
 /// 2026-11-20: four identical channels) this equals the plain average.
 /// System audio keeps `to_mono`: a quieter stereo side there is content.
+/// A stopped recording at the device's own rate and channels. Converting it
+/// to 16 kHz mono took 2-3 s for a one-to-two-minute dictation (Henry's timing
+/// log, 2026-11-24), so a caller that does not need the whole recording skips
+/// it.
+pub struct RawRecording {
+    samples: Vec<f32>,
+    rate: u32,
+    channels: u16,
+}
+
+impl RawRecording {
+    pub fn duration_secs(&self) -> f32 {
+        self.samples.len() as f32 / (self.rate.max(1) as f32 * self.channels.max(1) as f32)
+    }
+
+    pub fn into_16k_mono(self) -> Vec<f32> {
+        self.to_16k_mono()
+    }
+
+    pub fn to_16k_mono(&self) -> Vec<f32> {
+        let mono = mic_to_mono(&self.samples, self.channels);
+        if self.rate == 16000 {
+            mono
+        } else {
+            resample(&mono, self.rate, 16000)
+        }
+    }
+}
+
 pub(crate) fn mic_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     let ch = channels as usize;
     if ch <= 1 || samples.len() < ch {
