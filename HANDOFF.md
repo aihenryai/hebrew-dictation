@@ -4,6 +4,11 @@
 
 - Henry: the wait at the end still felt very slow. New `%APPDATA%\hebrew-dictation\timing.log` (one line per dictation, plus one per `inject_text`) showed, on an 18.5 s dictation: dispatch drain 0.71 s, then max(live close 2.26 s, refine 1.17 s); typing 0.10 s.
 - `streaming.rs`: `ELEVENLABS_DRAIN` 2 s -> 0.8 s (total 2.6 s -> 2.0 s).
+- 2026-11-25:
+  - Measured on 50cecc6: the mic step is now 0.03-0.12 s at any length. What is left is the last part's refine, 0-1.9 s.
+  - 5b6cc1f: one shared `dictation_client()` for dictation requests, plus a HEAD at dictation start (`warm_dictation_connection`). Every part used to open a new TLS connection, which cost 0.12-0.6 s by a curl probe.
+  - Installed; not measured yet.
+  - Henry: install tested builds without asking.
 - `lib.rs`: the refine pass gets mic chunks on its own channel (`ProgressiveFeed`, set by `set_dictation_callback`), so its last part is sent the moment the mic stops instead of after the live dispatch drains. The live dispatch and close run on a spawned task; when the refine succeeded and live already has text (`text_so_far`), the stop returns without waiting for the close (logged `close skipped`). Otherwise it waits and behaves as before. `mark_incomplete` removed: a failed dispatch no longer starves the refine pass.
 - Measured on Henry's machine (ec17fb9, 7 dictations): close always skipped, refine 0-1.06 s, but `mic` grew with length (0.23 s for 4 s, 2.02 s for 77 s, 3.26 s for 124 s): `stop_recording` converted the whole recording to 16 kHz mono.
 - Fix: `AudioRecorder::stop_recording_raw` returns a `RawRecording`; the stop converts only when the whole-recording refine or `debug_save_audio` needs it. Expected wait about 0.3 s plus the last part, whatever the length. Not yet measured.
