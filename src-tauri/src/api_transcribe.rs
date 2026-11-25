@@ -655,7 +655,7 @@ async fn deepgram_dictation_once(
         crate::dictionary::keyterm_params()
     );
 
-    let response = reqwest::Client::new()
+    let response = dictation_client()
         .post(&url)
         .header("Authorization", format!("Token {}", api_key))
         .header("Content-Type", "audio/wav")
@@ -916,6 +916,35 @@ pub(crate) async fn transcribe_deepgram_multichannel(
 // `en` as a secondary language made the mixed set worse (10.9%).
 
 const ELEVENLABS_STT_URL: &str = "https://api.elevenlabs.io/v1/speech-to-text";
+
+/// One client for the dictation requests, so its connections are reused. A
+/// new connection to ElevenLabs costs 0.12-0.6 s of TLS handshake (2026-11-25
+/// probe from Henry's machine), and every part of a dictation paid it, the
+/// last one included, while the user waited.
+pub(crate) fn dictation_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Opens the connection a dictation's parts will use, when the dictation
+/// starts, so even a short one (a single part, sent at the stop) finds it
+/// ready. An unauthenticated HEAD: no key sent, nothing billed.
+pub(crate) fn warm_dictation_connection(provider: &ApiProvider) {
+    let url = match provider {
+        ApiProvider::ElevenLabs => "https://api.elevenlabs.io/",
+        ApiProvider::Deepgram => "https://api.deepgram.com/",
+        _ => return,
+    };
+    tauri::async_runtime::spawn(async move {
+        let _ = dictation_client().head(url).timeout(Duration::from_secs(5)).send().await;
+    });
+}
 pub(crate) const ELEVENLABS_BATCH_MODEL: &str = "scribe_v3";
 
 /// Scribe language code for an app language setting.
@@ -1014,7 +1043,7 @@ async fn transcribe_elevenlabs_inner(
     language: &str,
 ) -> Result<String, ApiError> {
     let form = elevenlabs_form(upload_wav(samples), language)?;
-    let body = elevenlabs_post(&reqwest::Client::new(), form, api_key, Some(Duration::from_secs(30))).await?;
+    let body = elevenlabs_post(dictation_client(), form, api_key, Some(Duration::from_secs(30))).await?;
     Ok(body["text"].as_str().unwrap_or("").trim().to_string())
 }
 

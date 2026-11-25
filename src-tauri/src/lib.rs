@@ -113,6 +113,7 @@ fn new_progressive_refine(
     if !should_refine_dictation(provider, live_injection, 8_000) {
         return None;
     }
+    api_transcribe::warm_dictation_connection(provider);
     let provider = provider.clone();
     let key = key.to_string();
     let transcribe: progressive::Transcriber = Arc::new(move |part: Vec<f32>, lang: String| {
