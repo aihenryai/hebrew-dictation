@@ -2235,10 +2235,15 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
 
     // Where the wait at the end went (Henry, 2026-11-23: it felt very slow).
     // One line per dictation in %APPDATA%\hebrew-dictation\timing.log.
+    let tail = progressive.as_ref().map_or("-".to_string(), |p| {
+        let i = p.finish_info();
+        format!("{:.1}s{}", i.tail_secs, if i.early_used { " early" } else { "" })
+    });
     log_stop_timing(&format!(
-        "audio {:.1}s | progressive {} | mic {:.2}s | refine {:.2}s | close {} | refined {} | total {:.2}s",
+        "audio {:.1}s | progressive {} | tail {} | mic {:.2}s | refine {:.2}s | close {} | refined {} | total {:.2}s",
         audio_secs,
         progressive.is_some(),
+        tail,
         t_mic.as_secs_f32(),
         t_refine.as_secs_f32(),
         t_close.map_or("skipped".to_string(), |d| format!("+{:.2}s", d.as_secs_f32())),

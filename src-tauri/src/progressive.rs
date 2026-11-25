@@ -36,7 +36,30 @@ const QUIET_FLOOR: f32 = 0.002;
 /// A part whose peak stays under this is silence, and is not sent.
 const SILENT_PEAK: f32 = 0.005;
 
+/// The last part is sent ahead after this much quiet at its end (0.4 s).
+const EARLY_PAUSE_FRAMES: usize = 20;
+
 type Part = JoinHandle<Result<String, String>>;
+
+/// The last part, sent ahead at a pause before the stop. The file model takes
+/// about a quarter of a second per second of audio, so a tail of up to 6 s
+/// left 1-2 s of waiting after the key was released (timing.log, 2026-11-25).
+/// Sent at the first pause, it is usually done by the time the key comes up.
+/// If the user talks on, it is dropped and the audio stays in the tail.
+struct Early {
+    /// How much of `pending` it covers.
+    len: usize,
+    /// Where the speech in it ended, so the same pause is not sent twice.
+    speech_end: usize,
+    handle: Part,
+}
+
+/// What the stop found, for the timing log.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FinishInfo {
+    pub tail_secs: f32,
+    pub early_used: bool,
+}
 
 /// Sends one part to the file model and returns its text.
 pub(crate) type Transcriber = Arc<
@@ -49,6 +72,23 @@ struct Inner {
     pending: Vec<f32>,
     parts: Vec<Part>,
     language: String,
+    early: Option<Early>,
+    info: FinishInfo,
+}
+
+/// Where the speech in `audio` ends, if it ends in at least
+/// `EARLY_PAUSE_FRAMES` of quiet (a sample index), or None.
+fn speech_end_before_pause(audio: &[f32]) -> Option<usize> {
+    let rms: Vec<f32> = audio.chunks(FRAME).map(frame_rms).collect();
+    if rms.len() <= EARLY_PAUSE_FRAMES {
+        return None;
+    }
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let loud = sorted[sorted.len() * 9 / 10];
+    let quiet = (loud * QUIET_SHARE).max(QUIET_FLOOR);
+    let run = rms.iter().rev().take_while(|&&r| r < quiet).count();
+    (run >= EARLY_PAUSE_FRAMES && run < rms.len()).then(|| (rms.len() - run) * FRAME)
 }
 
 pub(crate) struct ProgressiveRefine {
@@ -114,6 +154,8 @@ impl ProgressiveRefine {
                 pending: Vec::new(),
                 parts: Vec::new(),
                 language: language.to_string(),
+                early: None,
+                info: FinishInfo::default(),
             }),
             transcribe,
         })
@@ -139,12 +181,43 @@ impl ProgressiveRefine {
         let Ok(mut g) = self.inner.lock() else { return };
         g.pending.extend_from_slice(chunk);
         while let Some(cut) = find_cut(&g.pending) {
+            // The early send covered audio that is now split differently.
+            if let Some(e) = g.early.take() {
+                e.handle.abort();
+            }
             let rest = g.pending.split_off(cut);
             let part = std::mem::replace(&mut g.pending, rest);
             let lang = g.language.clone();
             let handle = self.send(part, lang);
             g.parts.push(handle);
         }
+        // Send the last part ahead at a new pause. From MIN_PART on, the
+        // pause becomes a real cut 0.2 s later, which does the same.
+        if (RATE / 2..MIN_PART).contains(&g.pending.len())
+            && !crate::audio::is_effectively_silent(&g.pending, SILENT_PEAK)
+        {
+            if let Some(speech_end) = speech_end_before_pause(&g.pending) {
+                // The quiet level moves a little as audio comes in; within
+                // 0.1 s it is the same pause.
+                let known = g
+                    .early
+                    .as_ref()
+                    .is_some_and(|e| e.speech_end.abs_diff(speech_end) <= 5 * FRAME);
+                if !known {
+                    if let Some(e) = g.early.take() {
+                        e.handle.abort();
+                    }
+                    let lang = g.language.clone();
+                    let handle = self.send(g.pending.clone(), lang);
+                    g.early = Some(Early { len: g.pending.len(), speech_end, handle });
+                }
+            }
+        }
+    }
+
+    /// The tail length and whether the early send was used, at the last stop.
+    pub(crate) fn finish_info(&self) -> FinishInfo {
+        self.inner.lock().map(|g| g.info).unwrap_or_default()
     }
 
     /// Sends what is left and returns the text of the whole dictation, or None
@@ -157,11 +230,29 @@ impl ProgressiveRefine {
             let tail_len = tail.len();
             let lang = g.language.clone();
             let mut parts = std::mem::take(&mut g.parts);
-            // Under half a second at the end is breath or the key click.
-            if tail_len >= RATE / 2 {
-                parts.push(self.send(tail, lang));
+            let early = g.early.take();
+            let mut early_used = false;
+            // Nothing said after the early send: its text is the tail's.
+            match early {
+                Some(e)
+                    if e.len <= tail_len
+                        && crate::audio::is_effectively_silent(&tail[e.len..], SILENT_PEAK) =>
+                {
+                    parts.push(e.handle);
+                    early_used = true;
+                }
+                other => {
+                    if let Some(e) = other {
+                        e.handle.abort();
+                    }
+                    // Under half a second at the end is breath or the key click.
+                    if tail_len >= RATE / 2 {
+                        parts.push(self.send(tail, lang));
+                    }
+                }
             }
-            (parts, tail_len)
+            g.info = FinishInfo { tail_secs: tail_len as f32 / RATE as f32, early_used };
+            (parts, if early_used { 0 } else { tail_len })
         };
         let deadline = tokio::time::Instant::now() + timeout(tail_len);
         let mut texts = Vec::with_capacity(parts.len());
@@ -292,6 +383,40 @@ mod tests {
         p.push(&tone(0.4, 0.3));
         assert_eq!(p.finish(|_| std::time::Duration::from_secs(5)).await, None);
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pause_before_the_stop_sends_the_last_part_ahead() {
+        let (t, calls) = fake();
+        let p = ProgressiveRefine::new("he", t);
+        let mut a = tone(3.0, 0.3);
+        a.extend(quiet(0.8));
+        for c in a.chunks(160) {
+            p.push(c);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 1, "sent once at the pause");
+        let text = p.finish(|_| std::time::Duration::from_secs(5)).await;
+        assert_eq!(text.as_deref(), Some("חלק1"));
+        assert_eq!(calls.lock().unwrap().len(), 1, "nothing more sent at the stop");
+        assert!(p.finish_info().early_used);
+    }
+
+    #[tokio::test]
+    async fn talking_on_after_the_pause_sends_the_whole_tail() {
+        let (t, calls) = fake();
+        let p = ProgressiveRefine::new("he", t);
+        let mut a = tone(2.0, 0.3);
+        a.extend(quiet(0.5));
+        a.extend(tone(1.5, 0.3));
+        for c in a.chunks(160) {
+            p.push(c);
+        }
+        let text = p.finish(|_| std::time::Duration::from_secs(5)).await;
+        assert_eq!(text.as_deref(), Some("חלק2"));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].0, a.len(), "the tail holds all of it");
+        assert!(!p.finish_info().early_used);
     }
 
     #[tokio::test]
