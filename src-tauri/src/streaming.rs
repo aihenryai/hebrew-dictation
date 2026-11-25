@@ -63,6 +63,9 @@ struct Endpoint {
 /// socket, not the dictation.
 struct ReceiveContext {
     final_text: Arc<Mutex<String>>,
+    /// A non-empty partial arrived: the service heard words, even if none was
+    /// committed yet (one long sentence is committed only at the stop).
+    heard_partial: AtomicBool,
     app: Option<AppHandle>,
     inject_err_reported: InjectErrReported,
     language_switch_enabled: bool,
@@ -648,6 +651,7 @@ impl StreamingSession {
         let (writer, reader) = open(&endpoint).await?.split();
         let ctx = Arc::new(ReceiveContext {
             final_text: Arc::new(Mutex::new(String::new())),
+            heard_partial: AtomicBool::new(false),
             app,
             inject_err_reported: Arc::new(AtomicBool::new(false)),
             language_switch_enabled,
@@ -683,6 +687,11 @@ impl StreamingSession {
     /// The final text this connection has received so far, before `stop`.
     pub(crate) async fn text_so_far(&self) -> String {
         self.ctx.final_text.lock().await.trim().to_string()
+    }
+
+    /// The service sent a non-empty partial during this session.
+    pub(crate) fn heard_partial(&self) -> bool {
+        self.ctx.heard_partial.load(Ordering::SeqCst)
     }
 
     /// Convert f32 samples (assumed 16kHz mono) to PCM16 LE bytes and send over
@@ -992,6 +1001,9 @@ async fn handle_message(raw: &str, ctx: &ReceiveContext) {
     if transcript.is_empty() {
         return;
     }
+    if !is_final && transcript.chars().any(char::is_alphanumeric) {
+        ctx.heard_partial.store(true, Ordering::SeqCst);
+    }
 
     if is_final && language_switch_enabled {
         if let Some(target_lang) = detect_language_switch(transcript) {
@@ -1225,6 +1237,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(session.ctx.unacked().start, 160, "acknowledged up to the last word's end");
+        assert!(session.heard_partial(), "the partial before the commit counts as heard words");
         let started = std::time::Instant::now();
         let result = session.stop().await;
         service.abort();

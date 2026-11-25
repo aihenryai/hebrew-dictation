@@ -2182,9 +2182,12 @@ async fn stop_streaming_transcription(app: AppHandle, state: State<'_, AppState>
     // When live already heard words, the refined text is final and the close
     // is left to finish in the background: its 1 s drain was the rest of the
     // wait (Henry, 2026-11-24: shorten it as far as it goes).
+    // A partial counts too: one long sentence is committed only at the stop,
+    // and waiting for that commit was 1.3 s of the wait (2026-11-25 16:15).
     let live_so_far = active.session.text_so_far().await;
     let skip_close = refined.is_some()
-        && live_heard_words(&active.carried_text, &live_so_far, 0);
+        && (active.session.heard_partial()
+            || live_heard_words(&active.carried_text, &live_so_far, 0));
     let (dispatch_warning, stopped, t_close) = if skip_close {
         (None, streaming::StreamingStop::default(), None)
     } else {
