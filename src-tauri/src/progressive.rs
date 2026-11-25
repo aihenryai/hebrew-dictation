@@ -181,19 +181,33 @@ impl ProgressiveRefine {
         let Ok(mut g) = self.inner.lock() else { return };
         g.pending.extend_from_slice(chunk);
         while let Some(cut) = find_cut(&g.pending) {
-            // The early send covered audio that is now split differently.
-            if let Some(e) = g.early.take() {
-                e.handle.abort();
-            }
             let rest = g.pending.split_off(cut);
             let part = std::mem::replace(&mut g.pending, rest);
-            let lang = g.language.clone();
-            let handle = self.send(part, lang);
+            // The cut is in the pause the early send was made at: it already
+            // holds this part's words (what differs between them is quiet,
+            // and quiet adds no text), so it is not sent a second time.
+            let early = g.early.take();
+            let reuse = early.as_ref().is_some_and(|e| {
+                let (a, b) = (e.len.min(cut), e.len.max(cut));
+                let mut gap: Vec<f32> = part[a.min(part.len())..].to_vec();
+                gap.extend_from_slice(&g.pending[..(b - cut).min(g.pending.len())]);
+                gap.truncate(b - a);
+                crate::audio::is_effectively_silent(&gap, SILENT_PEAK)
+            });
+            let handle = match early {
+                Some(e) if reuse => e.handle,
+                other => {
+                    if let Some(e) = other {
+                        e.handle.abort();
+                    }
+                    let lang = g.language.clone();
+                    self.send(part, lang)
+                }
+            };
             g.parts.push(handle);
         }
-        // Send the last part ahead at a new pause. From MIN_PART on, the
-        // pause becomes a real cut 0.2 s later, which does the same.
-        if (RATE / 2..MIN_PART).contains(&g.pending.len())
+        // Send the last part ahead at a new pause.
+        if g.pending.len() >= RATE / 2
             && !crate::audio::is_effectively_silent(&g.pending, SILENT_PEAK)
         {
             if let Some(speech_end) = speech_end_before_pause(&g.pending) {
@@ -367,8 +381,25 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0].1, "he");
         assert_eq!(calls[2].1, "auto");
+        // Each sentence went out early, at its pause, so a few tenths of a
+        // second of that pause's quiet are sent twice; no speech is.
         let total: usize = calls.iter().map(|c| c.0).sum();
-        assert_eq!(total, a.len() + 2 * RATE, "no audio lost or repeated");
+        let extra = total - (a.len() + 2 * RATE);
+        assert!(extra <= 2 * RATE / 5, "only pause quiet repeated: {extra}");
+    }
+
+    #[tokio::test]
+    async fn a_cut_in_the_early_pause_reuses_the_early_answer() {
+        let (t, calls) = fake();
+        let p = ProgressiveRefine::new("he", t);
+        let mut a = tone(5.5, 0.3);
+        a.extend(quiet(1.2));
+        for c in a.chunks(160) {
+            p.push(c);
+        }
+        let text = p.finish(|_| std::time::Duration::from_secs(5)).await;
+        assert_eq!(text.as_deref(), Some("חלק1"));
+        assert_eq!(calls.lock().unwrap().len(), 1, "sent once");
     }
 
     #[tokio::test]
