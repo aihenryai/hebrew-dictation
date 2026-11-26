@@ -1,5 +1,13 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-26 - dictation works while the lecture recorder holds the mic (not released)
+
+- Henry could not dictate during lectures: `AI-Tools\lecture-recorder\lecture_capture.py` holds the mic in WASAPI exclusive mode (shared mode lets the Intel Smart Sound filter wipe his voice), so the app's open failed.
+- New `src-tauri/src/mic_yield.rs`: `Claim` writes `~/.lecture-recorder/mic-yield` (`{"pid", "at"}`) before the mic opens; when `current.json` exists (a recording runs) it waits up to 400 ms for `mic-yield.ack` with the same text. `audio.rs` retries a failed open 3 times, 300 ms apart, only while a recording runs. The claim is dropped after the stream, and the last one deletes the flag. Without `~/.lecture-recorder` (any other machine, macOS) it does nothing.
+- The recorder moves to shared mode on the same WAV while the flag is up (speech is still recorded, quieter) and back to exclusive after. A flag with a dead pid is deleted by the recorder.
+- Verified live: `cargo test --lib opens_mic_while_lecture_recorder_holds_it -- --ignored` against a running `lecture_capture.py`: opened in 232-310 ms, 2 s of 4-channel audio, flag removed, recorder back to exclusive, WAV length exact. Rust 277 passed. Release build installed 15:51.
+- Trap: don't run `rustfmt` on `audio.rs`; the file isn't rustfmt-clean and it rewrites ~270 unrelated lines.
+
 ## 2026-11-24 - end-of-dictation wait cut to the last part only (not released)
 
 - Henry: the wait at the end still felt very slow. New `%APPDATA%\hebrew-dictation\timing.log` (one line per dictation, plus one per `inject_text`) showed, on an 18.5 s dictation: dispatch drain 0.71 s, then max(live close 2.26 s, refine 1.17 s); typing 0.10 s.

@@ -264,71 +264,86 @@ impl AudioRecorder {
                 buffer_size: cpal::BufferSize::Default,
             };
 
-            let samples = samples_clone;
-            let is_recording = is_recording_clone;
-            let is_paused = is_paused_clone;
-            let chunk_callback = chunk_callback_clone;
-            // One resampler for the whole capture, so the 16 kHz stream is
-            // continuous across callbacks. Resampling each callback on its own
-            // dropped the fractional remainder of every block: with CoreAudio's
-            // 512-frame blocks at 48 kHz that is 2 samples lost per block, a
-            // click ~94 times a second that wrecked recognition on Macs
-            // (WASAPI's 480-frame blocks divide by 3 exactly, so Windows never
-            // showed it).
-            let mut stream_resampler = StreamResampler::new(native_rate, 16000);
+            // Ask Henry's lecture recorder to let go of its exclusive hold on the
+            // mic (see mic_yield.rs). Declared before the stream, so it is dropped
+            // after it and the recorder only takes the mic back once we closed it.
+            let claim = crate::mic_yield::Claim::new();
+            let mut attempt = 0;
+            let stream = loop {
+                let samples = samples_clone.clone();
+                let is_recording = is_recording_clone.clone();
+                let is_paused = is_paused_clone.clone();
+                let chunk_callback = chunk_callback_clone.clone();
+                let err_app_handle = err_app_handle.clone();
+                // One resampler for the whole capture, so the 16 kHz stream is
+                // continuous across callbacks. Resampling each callback on its own
+                // dropped the fractional remainder of every block: with CoreAudio's
+                // 512-frame blocks at 48 kHz that is 2 samples lost per block, a
+                // click ~94 times a second that wrecked recognition on Macs
+                // (WASAPI's 480-frame blocks divide by 3 exactly, so Windows never
+                // showed it).
+                let mut stream_resampler = StreamResampler::new(native_rate, 16000);
 
-            let stream = match device.build_input_stream(
-                &config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let is_rec = is_recording.lock().map(|r| *r).unwrap_or(false);
-                    let paused = is_paused.lock().map(|p| *p).unwrap_or(false);
+                let built = match device.build_input_stream(
+                    &config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let is_rec = is_recording.lock().map(|r| *r).unwrap_or(false);
+                        let paused = is_paused.lock().map(|p| *p).unwrap_or(false);
 
-                    // While paused, drop the audio — neither buffer nor stream callback.
-                    // VAD also skips pause time so the user can resume after a break.
-                    if paused {
+                        // While paused, drop the audio — neither buffer nor stream callback.
+                        // VAD also skips pause time so the user can resume after a break.
+                        if paused {
+                            return;
+                        }
+
+                        // Local-mode samples rely on is_recording for trimming the tail.
+                        if is_rec {
+                            if let Ok(mut s) = samples.lock() {
+                                s.extend_from_slice(data);
+                            }
+                        }
+
+                        // Streaming-mode: deliver tail audio even after is_recording=false so the
+                        // last ~10-30ms WASAPI buffer reaches Deepgram before the stream is dropped.
+                        let cb_opt = chunk_callback.lock().ok().and_then(|g| g.clone());
+                        if let Some(cb) = cb_opt {
+                            let mono = mic_to_mono(data, native_channels);
+                            let resampled = stream_resampler.process(&mono);
+                            if !resampled.is_empty() {
+                                cb(&resampled);
+                            }
+                        }
+                    },
+                    move |err| {
+                        // Surface it: this fires for device disconnects and format
+                        // changes mid-capture (e.g. a Bluetooth headset switching
+                        // profile), which otherwise present as a silent dead mic.
+                        eprintln!("Audio stream error: {}", err);
+                        if let Some(app) = &err_app_handle {
+                            let _ = app.emit("audio-stream-error", mic_stream_error_text(&err));
+                        }
+                    },
+                    None,
+                ) {
+                    Ok(s) => match s.play() {
+                        Ok(()) => Ok(s),
+                        Err(e) => Err(mic_open_error("להפעיל", &e.to_string())),
+                    },
+                    Err(e) => Err(mic_open_error("לפתוח", &e.to_string())),
+                };
+                match built {
+                    Ok(s) => break s,
+                    // The recorder may still be closing its exclusive stream.
+                    Err(_) if claim.recorder_active() && attempt < crate::mic_yield::RETRIES => {
+                        attempt += 1;
+                        std::thread::sleep(crate::mic_yield::RETRY_DELAY);
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
                         return;
                     }
-
-                    // Local-mode samples rely on is_recording for trimming the tail.
-                    if is_rec {
-                        if let Ok(mut s) = samples.lock() {
-                            s.extend_from_slice(data);
-                        }
-                    }
-
-                    // Streaming-mode: deliver tail audio even after is_recording=false so the
-                    // last ~10-30ms WASAPI buffer reaches Deepgram before the stream is dropped.
-                    let cb_opt = chunk_callback.lock().ok().and_then(|g| g.clone());
-                    if let Some(cb) = cb_opt {
-                        let mono = mic_to_mono(data, native_channels);
-                        let resampled = stream_resampler.process(&mono);
-                        if !resampled.is_empty() {
-                            cb(&resampled);
-                        }
-                    }
-                },
-                move |err| {
-                    // Surface it: this fires for device disconnects and format
-                    // changes mid-capture (e.g. a Bluetooth headset switching
-                    // profile), which otherwise present as a silent dead mic.
-                    eprintln!("Audio stream error: {}", err);
-                    if let Some(app) = &err_app_handle {
-                        let _ = app.emit("audio-stream-error", mic_stream_error_text(&err));
-                    }
-                },
-                None,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(mic_open_error("לפתוח", &e.to_string())));
-                    return;
                 }
             };
-
-            if let Err(e) = stream.play() {
-                let _ = ready_tx.send(Err(mic_open_error("להפעיל", &e.to_string())));
-                return;
-            }
 
             // Signal that the stream is ready
             let _ = ready_tx.send(Ok(()));
@@ -1157,5 +1172,25 @@ mod mix_to_mono_tests {
         assert!(mix_to_mono(&[], &[]).is_empty());
         // One side empty → the other is halved (0 + 0.5) * 0.5.
         assert_eq!(mix_to_mono(&[], &[0.5f32]), vec![0.25f32]);
+    }
+}
+
+#[cfg(test)]
+mod mic_yield_tests {
+    use super::AudioRecorder;
+
+    /// Live check on Henry's machine, run by hand while lecture_capture.py holds the mic in exclusive mode:
+    /// `cargo test --lib opens_mic_while_lecture_recorder_holds_it -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn opens_mic_while_lecture_recorder_holds_it() {
+        let mut r = AudioRecorder::new();
+        let t = std::time::Instant::now();
+        r.start_recording().expect("mic should open after the recorder yields");
+        println!("opened in {} ms", t.elapsed().as_millis());
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let raw = r.stop_recording_raw().unwrap();
+        println!("samples {} rate {} channels {}", raw.samples.len(), raw.rate, raw.channels);
+        assert!(!raw.samples.is_empty());
     }
 }

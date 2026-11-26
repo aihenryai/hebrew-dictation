@@ -11,6 +11,7 @@ mod injector;
 mod floating_window;
 mod hallucination;
 mod lang_switch;
+mod mic_yield;
 mod local_api;
 mod model;
 mod narration;
