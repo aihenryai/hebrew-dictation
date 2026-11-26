@@ -7,7 +7,7 @@
 //! The handshake is two files in `~/.lecture-recorder`:
 //! - `mic-yield` (`{"pid": .., "at": ..}`) exists while this app uses the mic. The recorder checks it every 100 ms,
 //!   closes its exclusive stream, keeps recording in shared mode, and writes `mic-yield.ack` with the same text.
-//! - We wait up to `WAIT` for that ack (only when a recording is running: `current.json` exists), and the caller
+//! - We wait up to `WAIT` for that ack (only when a capture is running: `mic-live` is fresh), and the caller
 //!   retries the open a few times in case the recorder was slow.
 //!
 //! The flag is removed when the last user of the mic stops (`Claim` is dropped after the stream). A flag left by a
@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WAIT: Duration = Duration::from_millis(400);
+const LIVE_FRESH: Duration = Duration::from_secs(6);
 pub(crate) const RETRY_DELAY: Duration = Duration::from_millis(300);
 pub(crate) const RETRIES: u32 = 3;
 
@@ -46,7 +47,14 @@ impl Claim {
             };
         };
         let _g = LOCK.lock();
-        let recording = dir.join("current.json").exists();
+        // `mic-live` is rewritten every 2 s by a running capture. `current.json` alone is not enough: it stays
+        // behind after a recorder crash and while the recording is being saved, and every dictation would then
+        // wait the full 400 ms for an ack that never comes.
+        let recording = std::fs::metadata(dir.join("mic-live"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < LIVE_FRESH);
         if HOLDERS.fetch_add(1, Ordering::SeqCst) > 0 {
             return Claim {
                 recording,
