@@ -1,5 +1,9 @@
 # Hebrew Dictation — Session Handoff
 
+## 2026-11-27 - v2.17.0 released (Henry: "כן, תשחרר")
+
+- Everything since v2.16.2: ElevenLabs Scribe, the refine pass and the option to type at the end, the progressive refine and the short wait at the stop (measured 0.03-0.09 s in 5 of 7 dictations), audio recovery after a dropped stream, Deepgram auto fixes, the lecture-recorder mic yield. Notes: `docs/releases/v2.17.0.md`.
+
 ## 2026-11-26 - dictation works while the lecture recorder holds the mic (not released)
 
 - Henry could not dictate during lectures: `AI-Tools\lecture-recorder\lecture_capture.py` holds the mic in WASAPI exclusive mode (shared mode lets the Intel Smart Sound filter wipe his voice), so the app's open failed.
